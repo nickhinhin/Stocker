@@ -1,13 +1,16 @@
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AreaChart from "./components/AreaChart";
 import BarChart from "./components/BarChart";
 import HeatmapGrid from "./components/HeatmapGrid";
 import MultiLineChart from "./components/MultiLineChart";
 import PieChart from "./components/PieChart";
+import PortfolioOverviewChart, { type PortfolioOverviewMetric } from "./components/PortfolioOverviewChart";
+import PriceChart, { PriceChartTradeMarker } from "./components/PriceChart";
 import {
   ChartRangePreset,
   type ChartSlice,
   calculateAssetAllocationSegments,
+  calculatePortfolioOverviewSeries,
   calculateCashBalances,
   calculateCurrencyExposureSegments,
   calculateDividendCalendarSeries,
@@ -26,13 +29,22 @@ import {
   calculateTransactionTypeSeries,
   getStockDateBounds,
 } from "./lib/calculations";
-import { parseInputByType } from "./lib/formatParser";
-import { EntityDataset, NormalizedTransaction, TxType, UserType } from "./types";
+import { buildDualFormatRecords, normalizeAiPayloadToEntities, parseInputByType } from "./lib/formatParser";
+import { fetchLocalStockData, normalizePortfolioWithAi } from "./lib/localFunctionApi";
+import stockerWordmark from "./assets/stocker-wordmark.png";
+import { EntityDataset, NormalizedTransaction, PricePoint, ProfitPoint, TxType, UserType } from "./types";
 
 type Screen = "choose" | "upload" | "dashboard";
 type DashboardTab = "dashboard" | "analysis" | "holdings" | "transactions" | "data" | "settings";
 type DateFilterPreset = "all" | "today" | "week" | "month" | "year" | "custom";
 type Locale = "en" | "zh-HK";
+type PortfolioLineId =
+  | "cashBalance"
+  | "stockMarketValue"
+  | "totalMarketValue"
+  | "totalProfit"
+  | "totalReturnPct"
+  | "totalCost";
 
 type TransactionTypeFilter = "all" | TxType;
 
@@ -60,6 +72,7 @@ interface WebSettings {
   enableAnimations: boolean;
   showCashInAllocation: boolean;
   defaultCurrency: string;
+  displayCurrency: string;
   defaultImportType: UserType;
   compactTables: boolean;
 }
@@ -73,8 +86,101 @@ interface PendingCashReview {
   editingTransactionId: string | null;
 }
 
+interface AiImportResponse {
+  normalized?: unknown;
+  warnings?: string[];
+  quota?: {
+    month: string;
+    used: number;
+    remaining: number;
+    limit: number;
+  };
+}
+
+interface ImportReviewSource {
+  rawText: string;
+  fileName: string;
+  preferredType: UserType;
+  localQuota: UploadQuotaSnapshot;
+  usedAi: boolean;
+  aiQuota?: AiImportResponse["quota"];
+}
+
+interface ImportReviewRow extends NormalizedTransaction {
+  portfolioId: string;
+  portfolioName: string;
+}
+
+interface ImportPortfolioOptions {
+  forceAi?: boolean;
+  userInstruction?: string;
+  currentNormalized?: string;
+}
+
 const STORAGE_KEY = "stocker-web-v2";
 const SETTINGS_STORAGE_KEY = "stocker-web-settings-v1";
+const STOCK_QUOTE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const MONTHLY_UPLOAD_LIMIT = 20;
+const UPLOAD_QUOTA_STORAGE_KEY = "stocker-web-upload-quota-v1";
+const STOCK_PRICE_TRANSACTION_TYPES = new Set<TxType>([
+  "BUY",
+  "SELL",
+  "DIVIDEND_CASH",
+  "DIVIDEND_SHARE",
+  "FEE",
+]);
+
+interface UploadQuotaSnapshot {
+  month: string;
+  used: number;
+  remaining: number;
+  limit: number;
+}
+
+function currentMonthKey(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function consumeLocalMonthlyUploadQuota(): UploadQuotaSnapshot {
+  const month = currentMonthKey();
+
+  try {
+    const raw = localStorage.getItem(UPLOAD_QUOTA_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as { month?: string; used?: number }) : null;
+    const sameMonth = parsed?.month === month;
+    const currentUsed = sameMonth ? Number(parsed?.used ?? 0) : 0;
+    if (currentUsed >= MONTHLY_UPLOAD_LIMIT) {
+      throw new Error(`Monthly upload limit reached (${MONTHLY_UPLOAD_LIMIT}).`);
+    }
+
+    const nextUsed = currentUsed + 1;
+    localStorage.setItem(
+      UPLOAD_QUOTA_STORAGE_KEY,
+      JSON.stringify({
+        month,
+        used: nextUsed,
+      }),
+    );
+
+    return {
+      month,
+      used: nextUsed,
+      remaining: Math.max(0, MONTHLY_UPLOAD_LIMIT - nextUsed),
+      limit: MONTHLY_UPLOAD_LIMIT,
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("Monthly upload limit reached")) {
+      throw error;
+    }
+    return {
+      month,
+      used: 0,
+      remaining: MONTHLY_UPLOAD_LIMIT,
+      limit: MONTHLY_UPLOAD_LIMIT,
+    };
+  }
+}
 
 function detectDefaultLocale(): Locale {
   if (typeof navigator !== "undefined") {
@@ -92,9 +198,24 @@ const DEFAULT_SETTINGS: WebSettings = {
   enableAnimations: true,
   showCashInAllocation: true,
   defaultCurrency: "USD",
+  displayCurrency: "AUTO",
   defaultImportType: "stockerpro",
   compactTables: false,
 };
+
+const COMMON_CURRENCY_CODES = [
+  "USD",
+  "HKD",
+  "TWD",
+  "JPY",
+  "EUR",
+  "GBP",
+  "CNY",
+  "CAD",
+  "AUD",
+  "SGD",
+  "CHF",
+];
 
 const TIME_RANGE_OPTIONS: { value: ChartRangePreset; label: string }[] = [
   { value: "1W", label: "1W" },
@@ -103,6 +224,15 @@ const TIME_RANGE_OPTIONS: { value: ChartRangePreset; label: string }[] = [
   { value: "10Y", label: "10Y" },
   { value: "ALL", label: "All" },
   { value: "CUSTOM", label: "Custom" },
+];
+
+const PORTFOLIO_LINE_OPTIONS: { value: PortfolioLineId; label: string; labelZh: string; color: string }[] = [
+  { value: "cashBalance", label: "Cash", labelZh: "現金", color: "#06B6D4" },
+  { value: "stockMarketValue", label: "Stock Market Value", labelZh: "股票市值", color: "#3B82F6" },
+  { value: "totalMarketValue", label: "Total Market Value", labelZh: "總市值", color: "#14B8A6" },
+  { value: "totalProfit", label: "Profit", labelZh: "收益", color: "#22A06B" },
+  { value: "totalReturnPct", label: "Return %", labelZh: "收益率", color: "#F59E0B" },
+  { value: "totalCost", label: "Cost", labelZh: "成本", color: "#64748B" },
 ];
 
 const TIME_RANGE_TITLES: Record<ChartRangePreset, string> = {
@@ -279,6 +409,44 @@ function formatCurrency(value: number, currency: string): string {
   }
 }
 
+function normalizeCurrencyCode(code: string | undefined | null): string {
+  return String(code ?? "")
+    .trim()
+    .toUpperCase();
+}
+
+function isValidCurrencyCode(code: string): boolean {
+  return /^[A-Z0-9]{2,8}$/.test(code);
+}
+
+function buildFxPairSymbol(fromCurrency: string, toCurrency: string): string {
+  return `${fromCurrency}${toCurrency}=X`;
+}
+
+function resolveFxRate(
+  quotePriceBySymbol: Record<string, number>,
+  fromCurrency: string,
+  toCurrency: string,
+): number | null {
+  if (fromCurrency === toCurrency) {
+    return 1;
+  }
+
+  const directSymbol = buildFxPairSymbol(fromCurrency, toCurrency);
+  const directRate = quotePriceBySymbol[directSymbol];
+  if (typeof directRate === "number" && Number.isFinite(directRate) && directRate > 0) {
+    return directRate;
+  }
+
+  const inverseSymbol = buildFxPairSymbol(toCurrency, fromCurrency);
+  const inverseRate = quotePriceBySymbol[inverseSymbol];
+  if (typeof inverseRate === "number" && Number.isFinite(inverseRate) && inverseRate > 0) {
+    return 1 / inverseRate;
+  }
+
+  return null;
+}
+
 function formatPercent(value: number): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
@@ -310,6 +478,96 @@ function parseDateInput(value: string): Date | undefined {
 function parseNumberish(value: string): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function scoreTextCandidate(text: string): number {
+  if (!text) {
+    return 0;
+  }
+
+  const trimmedLength = text.trim().length;
+  if (trimmedLength === 0) {
+    return 0;
+  }
+
+  let readableCount = 0;
+  let replacementCount = 0;
+  let nullCount = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 0) {
+      nullCount += 1;
+      continue;
+    }
+    if (code === 0xfffd) {
+      replacementCount += 1;
+      continue;
+    }
+    if (code === 9 || code === 10 || code === 13 || (code >= 32 && code <= 126) || code >= 160) {
+      readableCount += 1;
+    }
+  }
+
+  const safeLength = Math.max(1, text.length);
+  const readableRatio = readableCount / safeLength;
+  const replacementPenalty = replacementCount / safeLength;
+  const nullPenalty = nullCount / safeLength;
+  const lengthFactor = Math.min(1, trimmedLength / 200);
+
+  return Math.max(0, readableRatio - replacementPenalty * 1.6 - nullPenalty * 1.8) * lengthFactor;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+async function readFileContentForImport(file: File): Promise<string> {
+  const directText = await file.text();
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+
+  const decoders = ["utf-8", "utf-16le", "utf-16be", "windows-1252"];
+  const candidates = [directText];
+
+  decoders.forEach((encoding) => {
+    try {
+      const decoded = new TextDecoder(encoding, { fatal: false }).decode(bytes);
+      candidates.push(decoded);
+    } catch {
+      // Skip unsupported decoder.
+    }
+  });
+
+  let bestText = "";
+  let bestScore = 0;
+  candidates.forEach((candidate) => {
+    const score = scoreTextCandidate(candidate);
+    if (score > bestScore) {
+      bestScore = score;
+      bestText = candidate;
+    }
+  });
+
+  if (bestText.trim() && bestScore >= 0.18) {
+    return bestText;
+  }
+
+  const base64Sample = bytesToBase64(bytes.slice(0, Math.min(bytes.length, 80_000)));
+  return [
+    "[STOCKER_UNIVERSAL_IMPORT_BINARY]",
+    `fileName: ${file.name}`,
+    `mimeType: ${file.type || "application/octet-stream"}`,
+    `fileSize: ${file.size}`,
+    "base64Sample:",
+    base64Sample,
+  ].join("\n");
 }
 
 function loadWebSettings(): WebSettings {
@@ -435,6 +693,285 @@ function buildLatestPriceBySymbol(transactions: NormalizedTransaction[]): Record
   return result;
 }
 
+function isStockSymbolTransaction(tx: NormalizedTransaction): boolean {
+  if (!STOCK_PRICE_TRANSACTION_TYPES.has(tx.type)) {
+    return false;
+  }
+  const symbol = tx.symbol.trim().toUpperCase();
+  if (!symbol) {
+    return false;
+  }
+  return symbol !== tx.currency.trim().toUpperCase();
+}
+
+function collectPortfolioStockSymbols(entities: EntityDataset[]): string[] {
+  const symbols = new Set<string>();
+
+  entities.forEach((entity) => {
+    entity.transactions.forEach((tx) => {
+      if (isStockSymbolTransaction(tx)) {
+        symbols.add(tx.symbol.trim().toUpperCase());
+      }
+    });
+  });
+
+  return [...symbols].sort((a, b) => a.localeCompare(b));
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function parseQuoteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = Number(value.replace(/,/g, "").trim());
+    if (Number.isFinite(normalized) && normalized > 0) {
+      return normalized;
+    }
+    return null;
+  }
+
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const rawValue = parseQuoteNumber(record.raw);
+  if (rawValue) {
+    return rawValue;
+  }
+
+  return parseQuoteNumber(record.fmt);
+}
+
+function extractYahooQuotePriceMap(payload: unknown): Record<string, number> {
+  const payloadRecord = asRecord(payload);
+  const source = payloadRecord?.data ?? payload;
+  const sourceRecord = asRecord(source);
+  const quoteResponse = asRecord(sourceRecord?.quoteResponse);
+  const resultRows = quoteResponse?.result;
+  if (!Array.isArray(resultRows)) {
+    return {};
+  }
+
+  const priceBySymbol: Record<string, number> = {};
+  resultRows.forEach((row) => {
+    const quoteRow = asRecord(row);
+    if (!quoteRow) {
+      return;
+    }
+
+    const symbolRaw = quoteRow.symbol;
+    if (typeof symbolRaw !== "string" || !symbolRaw.trim()) {
+      return;
+    }
+    const symbol = symbolRaw.trim().toUpperCase();
+
+    const priceCandidates = [
+      quoteRow.regularMarketPrice,
+      quoteRow.postMarketPrice,
+      quoteRow.preMarketPrice,
+      quoteRow.ask,
+      quoteRow.bid,
+      quoteRow.regularMarketPreviousClose,
+    ];
+
+    for (const candidate of priceCandidates) {
+      const parsed = parseQuoteNumber(candidate);
+      if (parsed) {
+        priceBySymbol[symbol] = parsed;
+        break;
+      }
+    }
+  });
+
+  return priceBySymbol;
+}
+
+function extractYahooChartPriceSeries(payload: unknown): PricePoint[] {
+  const payloadRecord = asRecord(payload);
+  const source = payloadRecord?.data ?? payload;
+  const sourceRecord = asRecord(source);
+  const chart = asRecord(sourceRecord?.chart);
+  const results = chart?.result;
+  if (!Array.isArray(results) || results.length === 0) {
+    return [];
+  }
+
+  const firstResult = asRecord(results[0]);
+  if (!firstResult) {
+    return [];
+  }
+
+  const timestamps = Array.isArray(firstResult.timestamp) ? firstResult.timestamp : [];
+  const indicators = asRecord(firstResult.indicators);
+  const quoteRows = Array.isArray(indicators?.quote) ? indicators.quote : [];
+  const firstQuote = quoteRows.length > 0 ? asRecord(quoteRows[0]) : null;
+  const closeValues = Array.isArray(firstQuote?.close) ? firstQuote.close : [];
+
+  const adjustedRows = Array.isArray(indicators?.adjclose) ? indicators.adjclose : [];
+  const firstAdjusted = adjustedRows.length > 0 ? asRecord(adjustedRows[0]) : null;
+  const adjustedCloseValues = Array.isArray(firstAdjusted?.adjclose) ? firstAdjusted.adjclose : [];
+
+  const points: PricePoint[] = [];
+  for (let index = 0; index < timestamps.length; index += 1) {
+    const timestamp = Number(timestamps[index]);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) {
+      continue;
+    }
+
+    const closePrice = parseQuoteNumber(closeValues[index]) ?? parseQuoteNumber(adjustedCloseValues[index]);
+    if (!closePrice) {
+      continue;
+    }
+
+    points.push({
+      date: new Date(timestamp * 1000),
+      price: closePrice,
+    });
+  }
+
+  return points.sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+function resolveYahooChartRequest(preset: ChartRangePreset): { range: string; interval: string } {
+  if (preset === "1W") {
+    return { range: "7d", interval: "15m" };
+  }
+  if (preset === "1M") {
+    return { range: "1mo", interval: "1h" };
+  }
+  if (preset === "1Y") {
+    return { range: "1y", interval: "1d" };
+  }
+  if (preset === "10Y") {
+    return { range: "10y", interval: "1wk" };
+  }
+  if (preset === "ALL") {
+    return { range: "max", interval: "1mo" };
+  }
+  return { range: "max", interval: "1d" };
+}
+
+function filterPriceSeriesByCustomRange(
+  points: PricePoint[],
+  preset: ChartRangePreset,
+  customStart: string,
+  customEnd: string,
+): PricePoint[] {
+  if (preset !== "CUSTOM") {
+    return points;
+  }
+
+  const start = parseDateInput(customStart);
+  const end = parseDateInput(customEnd);
+  if (!start && !end) {
+    return points;
+  }
+
+  const startMs = start ? startOfDay(start).getTime() : Number.NEGATIVE_INFINITY;
+  const endMs = end ? startOfDay(end).getTime() + 86_399_999 : Number.POSITIVE_INFINITY;
+  return points.filter((point) => {
+    const time = point.date.getTime();
+    return time >= startMs && time <= endMs;
+  });
+}
+
+function buildFallbackPriceSeries(
+  transactions: NormalizedTransaction[],
+  symbol: string,
+): PricePoint[] {
+  return transactions
+    .filter((tx) => tx.symbol === symbol && tx.price > 0 && (tx.type === "BUY" || tx.type === "SELL"))
+    .map((tx) => ({
+      date: tx.date,
+      price: tx.price,
+    }))
+    .sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function calculateProfitSeriesFromPriceSeries(
+  priceSeries: PricePoint[],
+  transactions: NormalizedTransaction[],
+): ProfitPoint[] {
+  if (priceSeries.length === 0) {
+    return [];
+  }
+
+  const sortedPrices = [...priceSeries].sort((a, b) => a.date.getTime() - b.date.getTime());
+  const sortedTransactions = [...transactions].sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  let txIndex = 0;
+  const state = {
+    purchasedShares: 0,
+    soldShares: 0,
+    purchaseTotal: 0,
+    sellingTotal: 0,
+    dividends: 0,
+    fees: 0,
+  };
+
+  const series: ProfitPoint[] = [];
+
+  for (const pricePoint of sortedPrices) {
+    while (
+      txIndex < sortedTransactions.length &&
+      sortedTransactions[txIndex].date.getTime() <= pricePoint.date.getTime()
+    ) {
+      const tx = sortedTransactions[txIndex];
+
+      if (tx.type === "BUY" || tx.type === "DIVIDEND_SHARE") {
+        state.purchasedShares += tx.shares;
+        state.purchaseTotal += tx.shares * tx.price;
+        state.fees += tx.fee;
+      } else if (tx.type === "SELL") {
+        state.soldShares += tx.shares;
+        state.sellingTotal += tx.shares * tx.price;
+        state.fees += tx.fee;
+      } else if (tx.type === "DIVIDEND_CASH") {
+        state.dividends += tx.shares * tx.price;
+        state.fees += tx.fee;
+      } else if (tx.type === "FEE") {
+        state.fees += tx.shares * tx.price + tx.fee;
+      }
+
+      txIndex += 1;
+    }
+
+    const buyAvg = state.purchasedShares > 0 ? state.purchaseTotal / state.purchasedShares : 0;
+    const sellAvg = state.soldShares > 0 ? state.sellingTotal / state.soldShares : 0;
+    const matchedShares = Math.min(state.purchasedShares, state.soldShares);
+    const netTradeProfit = state.soldShares > 0 ? (sellAvg - buyAvg) * matchedShares : 0;
+    const realizedProfit = netTradeProfit + state.dividends - state.fees;
+    const activeShares = state.purchasedShares - state.soldShares;
+
+    let holdingProfit = 0;
+    if (activeShares > 0) {
+      holdingProfit = (pricePoint.price - buyAvg) * activeShares;
+    } else if (activeShares < 0) {
+      holdingProfit = (pricePoint.price - sellAvg) * activeShares;
+    }
+
+    series.push({
+      date: pricePoint.date,
+      profit: round2(realizedProfit + holdingProfit),
+    });
+  }
+
+  return series;
+}
+
 function isDateInPresetRange(
   date: Date,
   preset: DateFilterPreset,
@@ -538,6 +1075,63 @@ function deserializeEntities(raw: string): EntityDataset[] {
   });
 }
 
+function cloneEntitiesForReview(entities: EntityDataset[]): EntityDataset[] {
+  return entities.map((entity) => ({
+    ...entity,
+    latestPriceBySymbol: { ...entity.latestPriceBySymbol },
+    transactions: entity.transactions.map((tx) => ({
+      ...tx,
+      date: new Date(tx.date),
+    })),
+  }));
+}
+
+function normalizeReviewEntities(entities: EntityDataset[]): EntityDataset[] {
+  return entities
+    .map((entity, index) => {
+      const portfolioCurrency = normalizeCurrencyCode(entity.currency) || "USD";
+      const portfolioId = entity.id || `portfolio-${index + 1}`;
+      const portfolioName = entity.name.trim() || `Portfolio ${index + 1}`;
+
+      const transactions = entity.transactions
+        .map((tx, txIndex) => {
+          const date = Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date();
+          const type = tx.type;
+          const currency = normalizeCurrencyCode(tx.currency) || portfolioCurrency;
+          let symbol = tx.symbol.trim().toUpperCase();
+          if (shouldUseCurrencyAsSymbol(type) && !symbol) {
+            symbol = currency;
+          }
+          if (!symbol) {
+            return null;
+          }
+
+          return {
+            id: tx.id || `tx-${portfolioId}-${txIndex + 1}`,
+            date,
+            symbol,
+            type,
+            shares: Number.isFinite(tx.shares) ? tx.shares : 0,
+            price: Number.isFinite(tx.price) ? tx.price : 0,
+            fee: Number.isFinite(tx.fee) ? tx.fee : 0,
+            currency,
+            note: tx.note ?? "",
+          } as NormalizedTransaction;
+        })
+        .filter((tx): tx is NormalizedTransaction => Boolean(tx));
+
+      const sorted = sortTransactionsByDateAsc(transactions);
+      return {
+        id: portfolioId,
+        name: portfolioName,
+        currency: portfolioCurrency,
+        transactions: sorted,
+        latestPriceBySymbol: buildLatestPriceBySymbol(sorted),
+      };
+    })
+    .filter((entity) => entity.transactions.length > 0 || entity.name.trim().length > 0);
+}
+
 function buildDefaultDraft(portfolioId: string, currency: string): TransactionDraft {
   return {
     id: `tx-${Date.now()}`,
@@ -563,6 +1157,9 @@ export default function App(): JSX.Element {
   const [selectedRange, setSelectedRange] = useState<ChartRangePreset>("1Y");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
+  const [selectedPortfolioLineIds, setSelectedPortfolioLineIds] = useState<PortfolioLineId[]>(
+    () => PORTFOLIO_LINE_OPTIONS.map((option) => option.value),
+  );
 
   const [txTypeFilter, setTxTypeFilter] = useState<TransactionTypeFilter>("all");
   const [txDateFilter, setTxDateFilter] = useState<DateFilterPreset>("all");
@@ -586,10 +1183,33 @@ export default function App(): JSX.Element {
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [importStatusMessage, setImportStatusMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isImportReviewOpen, setImportReviewOpen] = useState(false);
+  const [importReviewEntities, setImportReviewEntities] = useState<EntityDataset[]>([]);
+  const [importReviewSource, setImportReviewSource] = useState<ImportReviewSource | null>(null);
+  const [importReviewFeedback, setImportReviewFeedback] = useState("");
+  const [importReviewError, setImportReviewError] = useState("");
+  const [isImportReviewAdjusting, setImportReviewAdjusting] = useState(false);
   const [dataImportType, setDataImportType] = useState<UserType>("stockerpro");
   const [settings, setSettings] = useState<WebSettings>(DEFAULT_SETTINGS);
   const [selectedStockDetailId, setSelectedStockDetailId] = useState<string | null>(null);
+  const [isQuoteSyncing, setQuoteSyncing] = useState(false);
+  const [quoteSyncError, setQuoteSyncError] = useState("");
+  const [quoteLastUpdatedAt, setQuoteLastUpdatedAt] = useState<Date | null>(null);
+  const [quoteSyncedCount, setQuoteSyncedCount] = useState(0);
+  const [fxRateByPair, setFxRateByPair] = useState<Record<string, number>>({});
+  const [fxSyncError, setFxSyncError] = useState("");
+  const [fxLastUpdatedAt, setFxLastUpdatedAt] = useState<Date | null>(null);
+  const [fxSyncedCount, setFxSyncedCount] = useState(0);
+  const [valuationRange, setValuationRange] = useState<ChartRangePreset>("1Y");
+  const [valuationCustomStart, setValuationCustomStart] = useState("");
+  const [valuationCustomEnd, setValuationCustomEnd] = useState("");
+  const [isValuationSyncing, setValuationSyncing] = useState(false);
+  const [valuationSyncError, setValuationSyncError] = useState("");
+  const [valuationLastUpdatedAt, setValuationLastUpdatedAt] = useState<Date | null>(null);
+  const [valuationSeriesCache, setValuationSeriesCache] = useState<Record<string, PricePoint[]>>({});
+  const quoteSyncInFlightRef = useRef(false);
 
   const isZh = settings.language === "zh-HK";
   const localeTag = isZh ? "zh-HK" : "en-US";
@@ -655,9 +1275,72 @@ export default function App(): JSX.Element {
     [filteredEntities],
   );
 
+  const normalizedDisplayCurrency = useMemo(() => {
+    const normalized = normalizeCurrencyCode(settings.displayCurrency);
+    return normalized || "AUTO";
+  }, [settings.displayCurrency]);
+
+  const displayCurrencyOptions = useMemo(() => {
+    const available = new Set<string>(COMMON_CURRENCY_CODES);
+    available.add(normalizeCurrencyCode(settings.defaultCurrency));
+    available.add(normalizedDisplayCurrency);
+    available.add(normalizeCurrencyCode(portfolioSummary.currency));
+
+    entities.forEach((entity) => {
+      available.add(normalizeCurrencyCode(entity.currency));
+      entity.transactions.forEach((tx) => {
+        available.add(normalizeCurrencyCode(tx.currency));
+      });
+    });
+
+    return [...available]
+      .filter((currency) => currency && currency !== "AUTO" && isValidCurrencyCode(currency))
+      .sort((a, b) => a.localeCompare(b));
+  }, [
+    entities,
+    normalizedDisplayCurrency,
+    portfolioSummary.currency,
+    settings.defaultCurrency,
+  ]);
+
+  const fxSourceCurrencies = useMemo(() => {
+    if (normalizedDisplayCurrency === "AUTO") {
+      return [];
+    }
+
+    const sourceSet = new Set<string>();
+    sourceSet.add(normalizeCurrencyCode(portfolioSummary.currency));
+    entities.forEach((entity) => {
+      sourceSet.add(normalizeCurrencyCode(entity.currency));
+      entity.transactions.forEach((tx) => {
+        sourceSet.add(normalizeCurrencyCode(tx.currency));
+      });
+    });
+
+    return [...sourceSet]
+      .filter(
+        (currency) =>
+          currency &&
+          currency !== normalizedDisplayCurrency &&
+          currency !== "AUTO" &&
+          isValidCurrencyCode(currency),
+      )
+      .sort((a, b) => a.localeCompare(b));
+  }, [entities, normalizedDisplayCurrency, portfolioSummary.currency]);
+
+  const fxSymbols = useMemo(
+    () => fxSourceCurrencies.map((sourceCurrency) => buildFxPairSymbol(sourceCurrency, normalizedDisplayCurrency)),
+    [fxSourceCurrencies, normalizedDisplayCurrency],
+  );
+
   const stockBreakdown = useMemo(
     () => calculateStockBreakdown(filteredEntities),
     [filteredEntities],
+  );
+
+  const portfolioStockSymbolKey = useMemo(
+    () => collectPortfolioStockSymbols(entities).join("|"),
+    [entities],
   );
 
   const stockLeaderboard = useMemo(
@@ -702,39 +1385,31 @@ export default function App(): JSX.Element {
     stockLeaderboard[0] ??
     null;
 
-  const selectedBounds = useMemo(() => {
-    if (!selectedStock) {
+  const portfolioBounds = useMemo(() => {
+    const sortedDates = filteredEntities
+      .flatMap((entity) => entity.transactions.map((tx) => startOfDay(tx.date)))
+      .filter((date) => Number.isFinite(date.getTime()))
+      .sort((a, b) => a.getTime() - b.getTime());
+
+    if (sortedDates.length === 0) {
       return null;
     }
-    return getStockDateBounds(filteredEntities, selectedStock.id);
-  }, [filteredEntities, selectedStock]);
 
-  const selectedSeries = useMemo(() => {
-    if (!selectedStock) {
-      return [];
-    }
-    return calculateSeriesForStock(filteredEntities, selectedStock.id, {
-      preset: selectedRange,
-      startDate: selectedRange === "CUSTOM" ? parseDateInput(customStart) : undefined,
-      endDate: selectedRange === "CUSTOM" ? parseDateInput(customEnd) : undefined,
-    });
-  }, [customEnd, customStart, filteredEntities, selectedRange, selectedStock]);
+    const firstDate = sortedDates[0];
+    const firstModernDate = sortedDates.find((date) => date.getFullYear() > 1970);
+    const gapYears = firstModernDate
+      ? (firstModernDate.getTime() - firstDate.getTime()) / (86_400_000 * 365.25)
+      : 0;
+    const minDate =
+      firstModernDate && firstDate.getFullYear() <= 1970 && gapYears >= 20
+        ? firstModernDate
+        : firstDate;
 
-  const rangeProfit = useMemo(() => {
-    if (selectedSeries.length === 0) {
-      return 0;
-    }
-    const first = selectedSeries[0].profit;
-    const last = selectedSeries[selectedSeries.length - 1].profit;
-    return last - first;
-  }, [selectedSeries]);
-
-  const rangeProfitPct = useMemo(() => {
-    if (!selectedStock || selectedStock.totalCost === 0) {
-      return 0;
-    }
-    return (rangeProfit / selectedStock.totalCost) * 100;
-  }, [rangeProfit, selectedStock]);
+    return {
+      minDate,
+      maxDate: startOfDay(new Date()),
+    };
+  }, [filteredEntities]);
 
   const allTransactions = useMemo(() => {
     const rows: TransactionRow[] = [];
@@ -782,6 +1457,25 @@ export default function App(): JSX.Element {
     [filteredTransactions],
   );
 
+  const importReviewRows = useMemo(() => {
+    const rows: ImportReviewRow[] = [];
+    importReviewEntities.forEach((entity) => {
+      entity.transactions.forEach((tx) => {
+        rows.push({
+          ...tx,
+          portfolioId: entity.id,
+          portfolioName: entity.name,
+        });
+      });
+    });
+    return rows.sort((a, b) => a.date.getTime() - b.date.getTime());
+  }, [importReviewEntities]);
+
+  const importReviewTxCount = useMemo(
+    () => importReviewRows.length,
+    [importReviewRows],
+  );
+
   const currentRange = useMemo(
     () => ({
       preset: selectedRange,
@@ -794,6 +1488,14 @@ export default function App(): JSX.Element {
   const portfolioProfitSeries = useMemo(
     () => calculatePortfolioProfitSeries(filteredEntities, currentRange),
     [currentRange, filteredEntities],
+  );
+  const portfolioOverviewSeries = useMemo(
+    () => calculatePortfolioOverviewSeries(filteredEntities, currentRange),
+    [currentRange, filteredEntities],
+  );
+  const portfolioOverviewLatest = useMemo(
+    () => portfolioOverviewSeries[portfolioOverviewSeries.length - 1] ?? null,
+    [portfolioOverviewSeries],
   );
   const assetAllocation = useMemo(
     () => calculateAssetAllocationSegments(filteredEntities),
@@ -906,12 +1608,14 @@ export default function App(): JSX.Element {
     return stockBreakdown.find((item) => item.id === selectedStockDetailId) ?? null;
   }, [selectedStockDetailId, stockBreakdown]);
 
-  const stockDetailSeries = useMemo(() => {
-    if (!stockDetail) {
-      return [];
-    }
-    return calculateSeriesForStock(filteredEntities, stockDetail.id, currentRange);
-  }, [currentRange, filteredEntities, stockDetail]);
+  const stockDetailRange = useMemo(
+    () => ({
+      preset: valuationRange,
+      startDate: valuationRange === "CUSTOM" ? parseDateInput(valuationCustomStart) : undefined,
+      endDate: valuationRange === "CUSTOM" ? parseDateInput(valuationCustomEnd) : undefined,
+    }),
+    [valuationCustomEnd, valuationCustomStart, valuationRange],
+  );
 
   const stockDetailTransactions = useMemo(() => {
     if (!stockDetail) {
@@ -920,13 +1624,486 @@ export default function App(): JSX.Element {
     return allTransactions.filter((tx) => tx.symbol === stockDetail.symbol);
   }, [allTransactions, stockDetail]);
 
+  const stockDetailBounds = useMemo(() => {
+    if (!stockDetail) {
+      return null;
+    }
+    return getStockDateBounds(filteredEntities, stockDetail.id);
+  }, [filteredEntities, stockDetail]);
+
+  const valuationCacheKey = useMemo(() => {
+    if (!stockDetail) {
+      return "";
+    }
+    const customStartKey = valuationRange === "CUSTOM" ? valuationCustomStart || "none" : "range";
+    const customEndKey = valuationRange === "CUSTOM" ? valuationCustomEnd || "none" : "range";
+    return [
+      stockDetail.symbol.toUpperCase(),
+      valuationRange,
+      customStartKey,
+      customEndKey,
+    ].join("|");
+  }, [stockDetail, valuationCustomEnd, valuationCustomStart, valuationRange]);
+
+  const stockDetailValuationSeries = useMemo(() => {
+    if (!stockDetail) {
+      return [];
+    }
+    const cached = valuationCacheKey ? valuationSeriesCache[valuationCacheKey] : undefined;
+    if (cached && cached.length > 0) {
+      return cached;
+    }
+    if (!valuationSyncError) {
+      return [];
+    }
+    return filterPriceSeriesByCustomRange(
+      buildFallbackPriceSeries(stockDetailTransactions, stockDetail.symbol),
+      valuationRange,
+      valuationCustomStart,
+      valuationCustomEnd,
+    );
+  }, [
+    stockDetail,
+    stockDetailTransactions,
+    valuationCacheKey,
+    valuationCustomEnd,
+    valuationCustomStart,
+    valuationSyncError,
+    valuationRange,
+    valuationSeriesCache,
+  ]);
+
+  const stockDetailValuationChangePct = useMemo(() => {
+    if (stockDetailValuationSeries.length < 2) {
+      return 0;
+    }
+    const first = stockDetailValuationSeries[0].price;
+    const last = stockDetailValuationSeries[stockDetailValuationSeries.length - 1].price;
+    if (first <= 0) {
+      return 0;
+    }
+    return ((last - first) / first) * 100;
+  }, [stockDetailValuationSeries]);
+
+  const stockDetailSeries = useMemo(() => {
+    if (!stockDetail) {
+      return [];
+    }
+    if (stockDetailValuationSeries.length > 0) {
+      return calculateProfitSeriesFromPriceSeries(stockDetailValuationSeries, stockDetailTransactions);
+    }
+    return calculateSeriesForStock(filteredEntities, stockDetail.id, stockDetailRange);
+  }, [
+    filteredEntities,
+    stockDetail,
+    stockDetailRange,
+    stockDetailTransactions,
+    stockDetailValuationSeries,
+  ]);
+
+  const stockDetailTradeMarkers = useMemo(() => {
+    const timeline = [
+      ...stockDetailValuationSeries.map((item) => item.date.getTime()),
+      ...stockDetailSeries.map((item) => item.date.getTime()),
+    ];
+    const minTime = timeline.length > 0 ? Math.min(...timeline) : Number.NEGATIVE_INFINITY;
+    const maxTime = timeline.length > 0 ? Math.max(...timeline) : Number.POSITIVE_INFINITY;
+
+    return stockDetailTransactions
+      .filter((tx) => {
+        if (tx.type !== "BUY" && tx.type !== "SELL") {
+          return false;
+        }
+        const time = tx.date.getTime();
+        return time >= minTime && time <= maxTime;
+      })
+      .map((tx): PriceChartTradeMarker => ({
+        id: tx.id,
+        date: tx.date,
+        type: tx.type === "BUY" ? "BUY" : "SELL",
+        shares: tx.shares,
+        price: tx.price,
+      }))
+      .sort((a, b) => a.date.getTime() - b.date.getTime());
+  }, [stockDetailSeries, stockDetailTransactions, stockDetailValuationSeries]);
+
+  const stockDetailLivePrice = useMemo(() => {
+    if (!stockDetail) {
+      return 0;
+    }
+
+    for (const entity of entities) {
+      const livePrice = entity.latestPriceBySymbol[stockDetail.symbol];
+      if (typeof livePrice === "number" && Number.isFinite(livePrice) && livePrice > 0) {
+        return livePrice;
+      }
+    }
+
+    return stockDetail.lastPrice;
+  }, [entities, stockDetail]);
+
+  const refreshPortfolioQuotes = useCallback(
+    async (trigger: "auto" | "manual" = "manual"): Promise<void> => {
+      if (screen !== "dashboard") {
+        return;
+      }
+
+      const stockSymbols = portfolioStockSymbolKey ? portfolioStockSymbolKey.split("|") : [];
+      const requestSymbols = [...new Set([...stockSymbols, ...fxSymbols])];
+      if (requestSymbols.length === 0) {
+        if (trigger === "manual") {
+          setQuoteSyncError(
+            isZh
+              ? "目前未有可更新股價或匯率資料。"
+              : "No stock symbols or FX pairs to refresh right now.",
+          );
+        }
+        return;
+      }
+
+      if (quoteSyncInFlightRef.current) {
+        return;
+      }
+
+      quoteSyncInFlightRef.current = true;
+      setQuoteSyncing(true);
+      if (trigger === "manual") {
+        setQuoteSyncError("");
+      }
+
+      try {
+        const rawResponse = await fetchLocalStockData<unknown>({
+          type: "query",
+          symbol: requestSymbols.join(","),
+        });
+
+        const latestPriceMap = extractYahooQuotePriceMap(rawResponse);
+        const syncedSymbols = Object.keys(latestPriceMap).filter((symbol) => {
+          const value = latestPriceMap[symbol];
+          return typeof value === "number" && Number.isFinite(value) && value > 0;
+        });
+        if (syncedSymbols.length === 0) {
+          throw new Error(
+            isZh
+              ? "報價服務未回傳有效股價資料。"
+              : "No valid price returned from quote service.",
+          );
+        }
+
+        setEntities((previous) =>
+          previous.map((entity) => {
+            const entitySymbols = new Set<string>();
+            entity.transactions.forEach((tx) => {
+              if (isStockSymbolTransaction(tx)) {
+                entitySymbols.add(tx.symbol.toUpperCase());
+              }
+            });
+
+            if (entitySymbols.size === 0) {
+              return entity;
+            }
+
+            let changed = false;
+            const nextLatestPriceBySymbol = { ...entity.latestPriceBySymbol };
+            entitySymbols.forEach((symbol) => {
+              const latestPrice = latestPriceMap[symbol];
+              if (
+                typeof latestPrice === "number" &&
+                Number.isFinite(latestPrice) &&
+                latestPrice > 0 &&
+                nextLatestPriceBySymbol[symbol] !== latestPrice
+              ) {
+                nextLatestPriceBySymbol[symbol] = latestPrice;
+                changed = true;
+              }
+            });
+
+            return changed ? { ...entity, latestPriceBySymbol: nextLatestPriceBySymbol } : entity;
+          }),
+        );
+
+        const syncedStockCount = stockSymbols.filter((symbol) =>
+          Object.prototype.hasOwnProperty.call(latestPriceMap, symbol),
+        ).length;
+        setQuoteSyncedCount(syncedStockCount);
+        setQuoteLastUpdatedAt(new Date());
+        setQuoteSyncError("");
+
+        if (normalizedDisplayCurrency === "AUTO") {
+          setFxRateByPair({});
+          setFxSyncedCount(0);
+          setFxLastUpdatedAt(null);
+          setFxSyncError("");
+        } else if (fxSourceCurrencies.length === 0) {
+          setFxRateByPair({});
+          setFxSyncedCount(0);
+          setFxLastUpdatedAt(new Date());
+          setFxSyncError("");
+        } else {
+          const nextFxRates: Record<string, number> = {};
+          const missingCurrencies: string[] = [];
+
+          fxSourceCurrencies.forEach((sourceCurrency) => {
+            const rate = resolveFxRate(latestPriceMap, sourceCurrency, normalizedDisplayCurrency);
+            if (rate && Number.isFinite(rate) && rate > 0) {
+              nextFxRates[`${sourceCurrency}->${normalizedDisplayCurrency}`] = rate;
+              return;
+            }
+            missingCurrencies.push(sourceCurrency);
+          });
+
+          setFxRateByPair(nextFxRates);
+          setFxSyncedCount(Object.keys(nextFxRates).length);
+          setFxLastUpdatedAt(new Date());
+          setFxSyncError(
+            missingCurrencies.length > 0
+              ? isZh
+                ? `以下貨幣暫時未能換算：${missingCurrencies.join(", ")}。`
+                : `Unable to convert these currencies for now: ${missingCurrencies.join(", ")}.`
+              : "",
+          );
+        }
+      } catch (error) {
+        setQuoteSyncError(
+          error instanceof Error
+            ? error.message
+            : isZh
+              ? "更新股票報價失敗。"
+              : "Failed to refresh stock quotes.",
+        );
+        if (normalizedDisplayCurrency !== "AUTO") {
+          setFxSyncError(
+            error instanceof Error
+              ? error.message
+              : isZh
+                ? "更新匯率失敗。"
+                : "Failed to refresh FX rates.",
+          );
+        }
+      } finally {
+        quoteSyncInFlightRef.current = false;
+        setQuoteSyncing(false);
+      }
+    },
+    [fxSourceCurrencies, fxSymbols, isZh, normalizedDisplayCurrency, portfolioStockSymbolKey, screen],
+  );
+
+  const refreshValuationChart = useCallback(
+    async (trigger: "auto" | "manual" = "manual"): Promise<void> => {
+      if (!stockDetail) {
+        return;
+      }
+
+      const symbol = stockDetail.symbol.trim().toUpperCase();
+      if (!symbol) {
+        return;
+      }
+
+      setValuationSyncing(true);
+      if (trigger === "manual") {
+        setValuationSyncError("");
+      }
+
+      try {
+        const request = resolveYahooChartRequest(valuationRange);
+        const payload = await fetchLocalStockData<unknown>({
+          type: "chart",
+          symbol,
+          range: request.range,
+          interval: request.interval,
+        });
+
+        const parsed = extractYahooChartPriceSeries(payload);
+        const filtered = filterPriceSeriesByCustomRange(
+          parsed,
+          valuationRange,
+          valuationCustomStart,
+          valuationCustomEnd,
+        );
+
+        const fallback = filterPriceSeriesByCustomRange(
+          buildFallbackPriceSeries(stockDetailTransactions, symbol),
+          valuationRange,
+          valuationCustomStart,
+          valuationCustomEnd,
+        );
+        const series = filtered.length > 0 ? filtered : fallback;
+
+        setValuationSeriesCache((previous) => ({
+          ...previous,
+          [valuationCacheKey]: series,
+        }));
+        setValuationLastUpdatedAt(new Date());
+        setValuationSyncError(
+          series.length === 0
+            ? t("No valuation data returned for this stock.", "此股票未有可用估價圖資料。")
+            : "",
+        );
+      } catch (error) {
+        setValuationSeriesCache((previous) => ({
+          ...previous,
+          [valuationCacheKey]:
+            previous[valuationCacheKey] ??
+            filterPriceSeriesByCustomRange(
+              buildFallbackPriceSeries(stockDetailTransactions, symbol),
+              valuationRange,
+              valuationCustomStart,
+              valuationCustomEnd,
+            ),
+        }));
+        setValuationSyncError(
+          error instanceof Error
+            ? error.message
+            : t("Failed to refresh valuation chart.", "更新估價圖失敗。"),
+        );
+      } finally {
+        setValuationSyncing(false);
+      }
+    },
+    [
+      stockDetail,
+      stockDetailTransactions,
+      t,
+      valuationCacheKey,
+      valuationCustomEnd,
+      valuationCustomStart,
+      valuationRange,
+    ],
+  );
+
+  const quoteStatusText = useMemo(() => {
+    if (!portfolioStockSymbolKey && fxSymbols.length === 0) {
+      return t("No stocks available for quote sync.", "目前冇可同步股價嘅股票。");
+    }
+    if (isQuoteSyncing) {
+      return t("Syncing latest stock quotes...", "正在同步最新股票報價...");
+    }
+    if (quoteSyncError) {
+      return quoteSyncError;
+    }
+    if (!quoteLastUpdatedAt) {
+      return t("Waiting for first quote sync.", "等待首次股價同步。");
+    }
+    const agoText = formatAgo(quoteLastUpdatedAt, settings.language);
+    return isZh
+      ? `上次更新：${agoText}（${quoteSyncedCount} 隻）`
+      : `Last update: ${agoText} (${quoteSyncedCount} symbols)`;
+  }, [
+    isQuoteSyncing,
+    isZh,
+    fxSymbols.length,
+    portfolioStockSymbolKey,
+    quoteLastUpdatedAt,
+    quoteSyncedCount,
+    quoteSyncError,
+    settings.language,
+    t,
+  ]);
+
+  const valuationStatusText = useMemo(() => {
+    if (!stockDetail) {
+      return "";
+    }
+    if (isValuationSyncing) {
+      return t("Loading valuation chart...", "正在載入估價圖...");
+    }
+    if (valuationSyncError) {
+      return valuationSyncError;
+    }
+    if (!valuationLastUpdatedAt) {
+      return t("Waiting for valuation chart data.", "等待估價圖資料。");
+    }
+    const agoText = formatAgo(valuationLastUpdatedAt, settings.language);
+    return isZh ? `估價圖更新：${agoText}` : `Valuation chart update: ${agoText}`;
+  }, [isValuationSyncing, isZh, settings.language, stockDetail, t, valuationLastUpdatedAt, valuationSyncError]);
+
+  const displayCurrencyStatusText = useMemo(() => {
+    if (normalizedDisplayCurrency === "AUTO") {
+      return t(
+        "Showing original currency from each record.",
+        "目前顯示每筆資料原本貨幣。",
+      );
+    }
+    if (isQuoteSyncing && fxSourceCurrencies.length > 0) {
+      return t("Syncing FX conversion rates...", "正在同步匯率...");
+    }
+    if (fxSyncError) {
+      return fxSyncError;
+    }
+    if (fxSourceCurrencies.length === 0) {
+      return t("No conversion needed for current data.", "目前資料唔需要換算。");
+    }
+    if (!fxLastUpdatedAt) {
+      return t("Waiting for first FX sync.", "等待首次匯率同步。");
+    }
+    const agoText = formatAgo(fxLastUpdatedAt, settings.language);
+    return isZh
+      ? `顯示貨幣：${normalizedDisplayCurrency}（${agoText}，${fxSyncedCount} 組匯率）`
+      : `Display currency: ${normalizedDisplayCurrency} (${agoText}, ${fxSyncedCount} FX pairs)`;
+  }, [
+    fxLastUpdatedAt,
+    fxSourceCurrencies.length,
+    fxSyncedCount,
+    fxSyncError,
+    isQuoteSyncing,
+    isZh,
+    normalizedDisplayCurrency,
+    settings.language,
+    t,
+  ]);
+
   const tableDensityClass = settings.compactTables ? "table-compact" : "";
 
-  const displayMoney = (value: number, currency: string): string =>
-    settings.showObscure ? "••••" : formatCurrency(value, currency);
+  const displayMoney = (value: number, currency: string): string => {
+    if (settings.showObscure) {
+      return "••••";
+    }
+
+    const sourceCurrency = normalizeCurrencyCode(currency) || "USD";
+    if (normalizedDisplayCurrency === "AUTO" || sourceCurrency === normalizedDisplayCurrency) {
+      return formatCurrency(value, sourceCurrency);
+    }
+
+    const fxRate = fxRateByPair[`${sourceCurrency}->${normalizedDisplayCurrency}`];
+    if (typeof fxRate === "number" && Number.isFinite(fxRate) && fxRate > 0) {
+      return formatCurrency(value * fxRate, normalizedDisplayCurrency);
+    }
+
+    return formatCurrency(value, sourceCurrency);
+  };
 
   const displayPercent = (value: number): string =>
     settings.showObscure ? "•••%" : formatPercent(value);
+
+  const portfolioOverviewMetrics: PortfolioOverviewMetric[] = PORTFOLIO_LINE_OPTIONS
+    .filter((option) => selectedPortfolioLineIds.includes(option.value))
+    .map((option) => ({
+      id: option.value,
+      label: isZh ? option.labelZh : option.label,
+      color: option.color,
+      getValue: (point) => {
+        if (option.value === "cashBalance") {
+          return point.cashBalance;
+        }
+        if (option.value === "stockMarketValue") {
+          return point.stockMarketValue;
+        }
+        if (option.value === "totalMarketValue") {
+          return point.totalMarketValue;
+        }
+        if (option.value === "totalProfit") {
+          return point.totalProfit;
+        }
+        if (option.value === "totalReturnPct") {
+          return point.totalReturnPct;
+        }
+        return point.totalCost;
+      },
+      formatValue: (value: number) =>
+        option.value === "totalReturnPct"
+          ? displayPercent(value)
+          : displayMoney(value, portfolioSummary.currency),
+    }));
 
   const formatPieMoneyValue = (value: number): string =>
     displayMoney(value, portfolioSummary.currency);
@@ -952,6 +2129,35 @@ export default function App(): JSX.Element {
   }, [selectedStockDetailId, stockLeaderboard]);
 
   useEffect(() => {
+    if (!stockDetail) {
+      return;
+    }
+
+    if (stockDetailBounds) {
+      setValuationCustomStart(toDateInputValue(stockDetailBounds.minDate));
+      setValuationCustomEnd(toDateInputValue(stockDetailBounds.maxDate));
+    } else {
+      setValuationCustomStart("");
+      setValuationCustomEnd("");
+    }
+    setValuationRange("1Y");
+    setValuationSyncError("");
+  }, [stockDetail, stockDetailBounds]);
+
+  useEffect(() => {
+    if (!stockDetail || !valuationCacheKey) {
+      return;
+    }
+    if (isValuationSyncing) {
+      return;
+    }
+    if (valuationSeriesCache[valuationCacheKey]) {
+      return;
+    }
+    void refreshValuationChart("auto");
+  }, [isValuationSyncing, refreshValuationChart, stockDetail, valuationCacheKey, valuationSeriesCache]);
+
+  useEffect(() => {
     if (selectedPortfolioId === "all") {
       return;
     }
@@ -961,25 +2167,125 @@ export default function App(): JSX.Element {
   }, [entities, selectedPortfolioId]);
 
   useEffect(() => {
-    if (!selectedStock) {
+    if (!portfolioBounds) {
       setCustomStart("");
       setCustomEnd("");
       return;
     }
 
-    const bounds = getStockDateBounds(filteredEntities, selectedStock.id);
-    if (!bounds) {
-      setCustomStart("");
-      setCustomEnd("");
+    setCustomStart(toDateInputValue(portfolioBounds.minDate));
+    setCustomEnd(toDateInputValue(portfolioBounds.maxDate));
+  }, [portfolioBounds]);
+
+  useEffect(() => {
+    if (normalizedDisplayCurrency !== "AUTO") {
+      return;
+    }
+    setFxRateByPair({});
+    setFxSyncError("");
+    setFxLastUpdatedAt(null);
+    setFxSyncedCount(0);
+  }, [normalizedDisplayCurrency]);
+
+  useEffect(() => {
+    if (screen !== "dashboard") {
+      return;
+    }
+    if (!portfolioStockSymbolKey && fxSymbols.length === 0) {
       return;
     }
 
-    setCustomStart(toDateInputValue(bounds.minDate));
-    setCustomEnd(toDateInputValue(bounds.maxDate));
-  }, [filteredEntities, selectedStock]);
+    void refreshPortfolioQuotes("auto");
+    const intervalId = window.setInterval(() => {
+      void refreshPortfolioQuotes("auto");
+    }, STOCK_QUOTE_SYNC_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [fxSymbols.length, portfolioStockSymbolKey, refreshPortfolioQuotes, screen]);
+
+  const applyImportedEntities = useCallback((parsed: EntityDataset[]): void => {
+    setEntities(parsed);
+    setSelectedPortfolioId("all");
+    setSelectedStockId("");
+    setSelectedRange("1Y");
+    setScreen("dashboard");
+  }, []);
+
+  const openImportReview = useCallback((parsed: EntityDataset[], source: ImportReviewSource): void => {
+    setImportReviewEntities(cloneEntitiesForReview(parsed));
+    setImportReviewSource(source);
+    setImportReviewFeedback("");
+    setImportReviewError("");
+    setImportReviewOpen(true);
+  }, []);
+
+  const closeImportReview = useCallback((): void => {
+    setImportReviewOpen(false);
+    setImportReviewEntities([]);
+    setImportReviewSource(null);
+    setImportReviewFeedback("");
+    setImportReviewError("");
+    setImportReviewAdjusting(false);
+  }, []);
+
+  const importPortfolioFromAnyFormat = useCallback(
+    async (
+      content: string,
+      preferredType: UserType,
+      fileName: string,
+      options?: ImportPortfolioOptions,
+    ): Promise<{ entities: EntityDataset[]; usedAi: boolean; quota?: AiImportResponse["quota"] }> => {
+      const forceAi = options?.forceAi === true;
+      if (!forceAi) {
+        const fallbackType: UserType = preferredType === "stockerx" ? "stockerpro" : "stockerx";
+        const tryTypes: UserType[] = preferredType === fallbackType
+          ? [preferredType]
+          : [preferredType, fallbackType];
+
+        for (const candidateType of tryTypes) {
+          try {
+            const parsed = await parseInputByType(content, candidateType);
+            if (parsed.length > 0) {
+              return {
+                entities: parsed,
+                usedAi: false,
+              };
+            }
+          } catch {
+            // Keep trying other parsers, then fallback to AI normalization.
+          }
+        }
+      }
+
+      const aiPayload = await normalizePortfolioWithAi<AiImportResponse>({
+        rawText: content,
+        fileName,
+        hintType: preferredType === "new" ? "unknown" : preferredType,
+        userInstruction: options?.userInstruction,
+        currentNormalized: options?.currentNormalized,
+      });
+      const normalized = normalizeAiPayloadToEntities(aiPayload.normalized ?? {});
+      if (normalized.length === 0) {
+        throw new Error(
+          t(
+            "AI could not normalize this file into a usable portfolio.",
+            "AI 未能把此檔案轉成可用投資組合。",
+          ),
+        );
+      }
+
+      return {
+        entities: normalized,
+        usedAi: true,
+        quota: aiPayload.quota,
+      };
+    },
+    [t],
+  );
 
   const selectUserType = async (type: UserType): Promise<void> => {
     setErrorMessage("");
+    setImportStatusMessage("");
     setUserType(type);
 
     if (type === "new") {
@@ -1009,19 +2315,26 @@ export default function App(): JSX.Element {
     const file = event.target.files[0];
     setLoading(true);
     setErrorMessage("");
+    setImportStatusMessage("");
 
     try {
-      const content = await file.text();
-      const parsed = await parseInputByType(content, userType);
-      if (parsed.length === 0) {
-        throw new Error(t("No portfolios/stocker entries found in this file.", "檔案內未找到任何組合資料。"));
-      }
-
-      setEntities(parsed);
-      setSelectedPortfolioId("all");
-      setSelectedStockId("");
-      setSelectedRange("1Y");
-      setScreen("dashboard");
+      const localQuota = consumeLocalMonthlyUploadQuota();
+      const content = await readFileContentForImport(file);
+      const imported = await importPortfolioFromAnyFormat(content, userType, file.name);
+      openImportReview(imported.entities, {
+        rawText: content,
+        fileName: file.name,
+        preferredType: userType,
+        localQuota,
+        usedAi: imported.usedAi,
+        aiQuota: imported.quota,
+      });
+      setImportStatusMessage(
+        t(
+          "Import parsed. Please review transactions and confirm.",
+          "匯入內容已解析。請先檢查交易並確認。",
+        ),
+      );
     } catch (error) {
       const message =
         error instanceof Error
@@ -1042,18 +2355,26 @@ export default function App(): JSX.Element {
     const file = event.target.files[0];
     setLoading(true);
     setErrorMessage("");
+    setImportStatusMessage("");
 
     try {
-      const content = await file.text();
-      const parsed = await parseInputByType(content, dataImportType);
-      if (parsed.length === 0) {
-        throw new Error(t("No portfolios/stocker entries found in this file.", "檔案內未找到任何組合資料。"));
-      }
-      setEntities(parsed);
-      setSelectedPortfolioId("all");
-      setSelectedStockId("");
-      setSelectedRange("1Y");
-      setScreen("dashboard");
+      const localQuota = consumeLocalMonthlyUploadQuota();
+      const content = await readFileContentForImport(file);
+      const imported = await importPortfolioFromAnyFormat(content, dataImportType, file.name);
+      openImportReview(imported.entities, {
+        rawText: content,
+        fileName: file.name,
+        preferredType: dataImportType,
+        localQuota,
+        usedAi: imported.usedAi,
+        aiQuota: imported.quota,
+      });
+      setImportStatusMessage(
+        t(
+          "Import parsed. Please review transactions and confirm.",
+          "匯入內容已解析。請先檢查交易並確認。",
+        ),
+      );
     } catch (error) {
       const message =
         error instanceof Error
@@ -1066,8 +2387,10 @@ export default function App(): JSX.Element {
     }
   };
 
-  const minCustomDate = selectedBounds ? toDateInputValue(selectedBounds.minDate) : "";
-  const maxCustomDate = selectedBounds ? toDateInputValue(selectedBounds.maxDate) : "";
+  const minCustomDate = portfolioBounds ? toDateInputValue(portfolioBounds.minDate) : "";
+  const maxCustomDate = portfolioBounds ? toDateInputValue(portfolioBounds.maxDate) : "";
+  const minValuationCustomDate = stockDetailBounds ? toDateInputValue(stockDetailBounds.minDate) : "";
+  const maxValuationCustomDate = stockDetailBounds ? toDateInputValue(stockDetailBounds.maxDate) : "";
 
   const onCustomStartChange = (event: ChangeEvent<HTMLInputElement>): void => {
     const nextStart = event.target.value;
@@ -1084,6 +2407,232 @@ export default function App(): JSX.Element {
       setCustomStart(nextEnd);
     }
   };
+
+  const togglePortfolioLine = (lineId: PortfolioLineId): void => {
+    setSelectedPortfolioLineIds((previous) => {
+      if (previous.includes(lineId)) {
+        if (previous.length <= 1) {
+          return previous;
+        }
+        return previous.filter((item) => item !== lineId);
+      }
+      return [...previous, lineId];
+    });
+  };
+
+  const onValuationCustomStartChange = (event: ChangeEvent<HTMLInputElement>): void => {
+    const nextStart = event.target.value;
+    setValuationCustomStart(nextStart);
+    if (valuationCustomEnd && nextStart && nextStart > valuationCustomEnd) {
+      setValuationCustomEnd(nextStart);
+    }
+  };
+
+  const onValuationCustomEndChange = (event: ChangeEvent<HTMLInputElement>): void => {
+    const nextEnd = event.target.value;
+    setValuationCustomEnd(nextEnd);
+    if (valuationCustomStart && nextEnd && nextEnd < valuationCustomStart) {
+      setValuationCustomStart(nextEnd);
+    }
+  };
+
+  const updateImportReviewTransaction = useCallback(
+    (
+      portfolioId: string,
+      transactionId: string,
+      updater: (transaction: NormalizedTransaction) => NormalizedTransaction,
+    ): void => {
+      setImportReviewEntities((previous) =>
+        previous.map((entity) => {
+          if (entity.id !== portfolioId) {
+            return entity;
+          }
+
+          const nextTransactions = entity.transactions.map((tx) =>
+            tx.id === transactionId ? updater(tx) : tx,
+          );
+          return {
+            ...entity,
+            transactions: sortTransactionsByDateAsc(nextTransactions),
+            latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+          };
+        }),
+      );
+    },
+    [],
+  );
+
+  const moveImportReviewTransaction = useCallback(
+    (sourcePortfolioId: string, targetPortfolioId: string, transactionId: string): void => {
+      if (sourcePortfolioId === targetPortfolioId) {
+        return;
+      }
+
+      setImportReviewEntities((previous) => {
+        const source = previous.find((entity) => entity.id === sourcePortfolioId);
+        const target = previous.find((entity) => entity.id === targetPortfolioId);
+        if (!source || !target) {
+          return previous;
+        }
+
+        const moving = source.transactions.find((tx) => tx.id === transactionId);
+        if (!moving) {
+          return previous;
+        }
+
+        return previous.map((entity) => {
+          if (entity.id === sourcePortfolioId) {
+            const nextTransactions = entity.transactions.filter((tx) => tx.id !== transactionId);
+            return {
+              ...entity,
+              transactions: nextTransactions,
+              latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+            };
+          }
+
+          if (entity.id === targetPortfolioId) {
+            const txWithTargetCurrency = {
+              ...moving,
+              currency: moving.currency || entity.currency,
+            };
+            const nextTransactions = sortTransactionsByDateAsc([
+              ...entity.transactions,
+              txWithTargetCurrency,
+            ]);
+            return {
+              ...entity,
+              transactions: nextTransactions,
+              latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+            };
+          }
+
+          return entity;
+        });
+      });
+    },
+    [],
+  );
+
+  const deleteImportReviewTransaction = useCallback((portfolioId: string, transactionId: string): void => {
+    setImportReviewEntities((previous) =>
+      previous.map((entity) => {
+        if (entity.id !== portfolioId) {
+          return entity;
+        }
+        const nextTransactions = entity.transactions.filter((tx) => tx.id !== transactionId);
+        return {
+          ...entity,
+          transactions: nextTransactions,
+          latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+        };
+      }),
+    );
+  }, []);
+
+  const confirmImportReview = useCallback((): void => {
+    if (!importReviewSource) {
+      closeImportReview();
+      return;
+    }
+
+    const normalized = normalizeReviewEntities(importReviewEntities);
+    if (normalized.length === 0 || normalized.every((entity) => entity.transactions.length === 0)) {
+      setImportReviewError(
+        t(
+          "No valid transactions left. Please edit at least one row before confirming.",
+          "目前沒有有效交易，請先編輯至少一筆交易再確認。",
+        ),
+      );
+      return;
+    }
+
+    applyImportedEntities(normalized);
+    if (importReviewSource.usedAi) {
+      const remaining = importReviewSource.aiQuota?.remaining;
+      setImportStatusMessage(
+        typeof remaining === "number"
+          ? t(
+              `Imported via AI normalization. Remaining AI imports this month: ${remaining}.`,
+              `已透過 AI 轉換匯入。本月 AI 匯入剩餘：${remaining} 次。`,
+            )
+          : t("Imported via AI normalization fallback.", "已透過 AI 轉換備援成功匯入。"),
+      );
+    } else {
+      setImportStatusMessage(
+        t(
+          `Import successful. Remaining uploads this month: ${importReviewSource.localQuota.remaining}.`,
+          `匯入成功。本月剩餘上傳次數：${importReviewSource.localQuota.remaining} 次。`,
+        ),
+      );
+    }
+    closeImportReview();
+  }, [applyImportedEntities, closeImportReview, importReviewEntities, importReviewSource, t]);
+
+  const adjustImportReviewWithPrompt = useCallback(async (): Promise<void> => {
+    if (!importReviewSource) {
+      return;
+    }
+
+    const feedback = importReviewFeedback.trim();
+    if (!feedback) {
+      setImportReviewError(
+        t(
+          "Please type what we misunderstood before adjusting.",
+          "請先輸入我哋誤解咗咩欄位，再進行調整。",
+        ),
+      );
+      return;
+    }
+
+    setImportReviewAdjusting(true);
+    setImportReviewError("");
+
+    try {
+      const imported = await importPortfolioFromAnyFormat(
+        importReviewSource.rawText,
+        importReviewSource.preferredType,
+        importReviewSource.fileName,
+        {
+          forceAi: true,
+          userInstruction: feedback,
+          currentNormalized: serializeEntities(importReviewEntities),
+        },
+      );
+      if (imported.entities.length === 0) {
+        throw new Error(
+          t(
+            "AI returned empty result. Please refine your prompt and try again.",
+            "AI 返回空結果，請補充提示再試一次。",
+          ),
+        );
+      }
+
+      setImportReviewEntities(cloneEntitiesForReview(imported.entities));
+      setImportReviewSource((previous) =>
+        previous
+          ? {
+              ...previous,
+              usedAi: true,
+              aiQuota: imported.quota ?? previous.aiQuota,
+            }
+          : previous,
+      );
+      setImportStatusMessage(
+        t(
+          "Adjusted with AI. Please review the updated transactions and confirm import.",
+          "已用 AI 調整。請檢查更新後交易，再確認匯入。",
+        ),
+      );
+    } catch (error) {
+      setImportReviewError(
+        error instanceof Error
+          ? error.message
+          : t("Unable to adjust now. Please try again.", "暫時無法調整，請稍後再試。"),
+      );
+    } finally {
+      setImportReviewAdjusting(false);
+    }
+  }, [importPortfolioFromAnyFormat, importReviewEntities, importReviewFeedback, importReviewSource, t]);
 
   const openCreateTransaction = (): void => {
     if (entities.length === 0) {
@@ -1308,7 +2857,7 @@ export default function App(): JSX.Element {
     }
 
     const currencyInput =
-      window.prompt(t("Display currency (e.g. USD)", "顯示貨幣（例如 USD）"), settings.defaultCurrency) ??
+      window.prompt(t("Portfolio currency (e.g. USD)", "組合貨幣（例如 USD）"), settings.defaultCurrency) ??
       settings.defaultCurrency;
     const currency = currencyInput.trim().toUpperCase() || "USD";
     const id = `portfolio-${Date.now()}`;
@@ -1374,15 +2923,40 @@ export default function App(): JSX.Element {
     setSelectedPortfolioId("all");
   };
 
-  const exportWebJson = (): void => {
-    const payload = serializeEntities(entities);
-    const blob = new Blob([payload], { type: "application/json" });
+  const dualFormatRecords = useMemo(() => {
+    if (entities.length === 0) {
+      return null;
+    }
+    return buildDualFormatRecords(entities);
+  }, [entities]);
+
+  const exportTextFile = (content: string, fileName: string, mimeType = "application/json"): void => {
+    const blob = new Blob([content], { type: `${mimeType}; charset=utf-8` });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `stocker-web-export-${Date.now()}.json`;
+    anchor.download = fileName;
     anchor.click();
     URL.revokeObjectURL(url);
+  };
+
+  const exportWebJson = (): void => {
+    const payload = serializeEntities(entities);
+    exportTextFile(payload, `stocker-web-export-${Date.now()}.json`);
+  };
+
+  const exportStockerProJson = (): void => {
+    if (!dualFormatRecords) {
+      return;
+    }
+    exportTextFile(dualFormatRecords.stockerProJson, `stocker-pro-export-${Date.now()}.json`);
+  };
+
+  const exportStockerXJson = (): void => {
+    if (!dualFormatRecords) {
+      return;
+    }
+    exportTextFile(dualFormatRecords.stockerXJson, `stocker-x-export-${Date.now()}.json`);
   };
 
   const clearAllData = (): void => {
@@ -1395,6 +2969,7 @@ export default function App(): JSX.Element {
     setSelectedPortfolioId("all");
     setSelectedStockId("");
     setScreen("choose");
+    setImportStatusMessage("");
     localStorage.removeItem(STORAGE_KEY);
   };
 
@@ -1423,14 +2998,22 @@ export default function App(): JSX.Element {
       className={`app-shell ${settings.enableAnimations ? "" : "reduced-motion"} ${tableDensityClass}`.trim()}
     >
       <header className="top-header">
-        <div className="brand">Stocker Web</div>
-        <button
-          type="button"
-          className="secondary-btn lang-btn"
-          onClick={() => updateSetting("language", settings.language === "zh-HK" ? "en" : "zh-HK")}
-        >
-          {settings.language === "zh-HK" ? "English" : "繁中"}
-        </button>
+        <div className="header-left">
+          <img className="brand-wordmark" src={stockerWordmark} alt="Stocker" />
+        </div>
+
+        <label className="header-search" aria-label={t("Header Search", "頂部搜尋")}>
+          <span className="search-icon" aria-hidden="true">
+            ⌕
+          </span>
+          <input
+            type="search"
+            placeholder={t("Search (⌘K)", "搜尋 (⌘K)")}
+            onFocus={() => setMenuOpen(false)}
+          />
+          <kbd>⌘K</kbd>
+        </label>
+
         <nav className={`header-nav ${menuOpen ? "open" : ""}`}>
           <button
             type="button"
@@ -1475,6 +3058,20 @@ export default function App(): JSX.Element {
             {t("Settings", "設定")}
           </button>
         </nav>
+
+        <div className="header-tools">
+          <button
+            type="button"
+            className="secondary-btn lang-btn"
+            onClick={() => updateSetting("language", settings.language === "zh-HK" ? "en" : "zh-HK")}
+          >
+            {settings.language === "zh-HK" ? "English" : "繁中"}
+          </button>
+          <button type="button" className="header-cta-btn" onClick={() => changeTab("transactions")}>
+            {t("Add Trade", "新增交易")}
+          </button>
+        </div>
+
         <button
           className="menu-btn"
           type="button"
@@ -1515,15 +3112,16 @@ export default function App(): JSX.Element {
           <h1>
             {t("Upload", "上傳")} {userType === "stockerx" ? "StockerX" : "Stocker Pro"} {t("File", "檔案")}
           </h1>
-          <p className="entry-subtitle">{t("Supports your exported RTF/JSON test file.", "支援匯出的 RTF/JSON 測試檔。")}</p>
+          <p className="entry-subtitle">{t("Supports importing files in any format.", "支援任何格式檔案匯入。")}</p>
           <label className="upload-box">
-            <input type="file" onChange={onFileChange} accept=".rtf,.json,.txt" />
+            <input type="file" onChange={onFileChange} accept="*/*" />
             <span>{loading ? t("Reading file...", "正在讀取檔案...") : t("Choose file", "選擇檔案")}</span>
           </label>
           <button type="button" className="back-link" onClick={() => setScreen("choose")}>
             {t("Back", "返回")}
           </button>
           {errorMessage && <div className="error-text">{errorMessage}</div>}
+          {importStatusMessage && <div className="success-text">{importStatusMessage}</div>}
         </main>
       )}
 
@@ -1548,129 +3146,164 @@ export default function App(): JSX.Element {
               <strong>{displayMoney(portfolioSummary.dailyProfit, portfolioSummary.currency)}</strong>
               <small>{displayPercent(portfolioSummary.dailyProfitPct)}</small>
             </div>
+            <div className="summary-card summary-card-currency">
+              <span>{t("Display Currency", "顯示貨幣")}</span>
+              <select
+                value={normalizedDisplayCurrency}
+                onChange={(event) =>
+                  updateSetting("displayCurrency", normalizeCurrencyCode(event.target.value) || "AUTO")
+                }
+              >
+                <option value="AUTO">{t("Auto (Original)", "自動（原貨幣）")}</option>
+                {displayCurrencyOptions.map((currency) => (
+                  <option key={currency} value={currency}>
+                    {currency}
+                  </option>
+                ))}
+              </select>
+              <small className={`summary-card-note ${fxSyncError ? "negative" : ""}`}>
+                {displayCurrencyStatusText}
+              </small>
+            </div>
           </section>
 
           {activeTab === "dashboard" && (
             <section className="dashboard-grid">
               <section className="chart-panel">
-                {selectedStock ? (
-                  <>
-                    <div className="panel-head">
-                      <div>
-                        <p className="panel-label">{selectedStock.currency}</p>
-                        <h2>
-                          {selectedStock.symbol} - {rangeTitle(selectedRange)} {t("Profit / Loss", "盈虧")}
-                        </h2>
-                      </div>
-                      <div className={`metric-badge ${rangeProfit >= 0 ? "positive" : "negative"}`}>
-                        <strong>{displayMoney(rangeProfit, selectedStock.currency)}</strong>
-                        <span>{displayPercent(rangeProfitPct)}</span>
-                      </div>
-                    </div>
-
-                    <div className="portfolio-switcher-wrap">
-                      <div className="portfolio-switcher-title">{t("Portfolio Filter", "組合篩選")}</div>
-                      <div className="portfolio-switcher">
-                        <button
-                          type="button"
-                          className={`portfolio-pill ${selectedPortfolioId === "all" ? "active" : ""}`}
-                          onClick={() => setSelectedPortfolioId("all")}
-                        >
-                          {t("All", "全部")}
-                        </button>
-                        {entities.map((entity) => (
-                          <button
-                            type="button"
-                            key={entity.id}
-                            className={`portfolio-pill ${selectedPortfolioId === entity.id ? "active" : ""}`}
-                            onClick={() => setSelectedPortfolioId(entity.id)}
-                          >
-                            {entity.name}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="time-range-wrap">
-                      <div className="portfolio-switcher-title">{t("P/L Time Range", "盈虧時間範圍")}</div>
-                      <div className="portfolio-switcher">
-                        {TIME_RANGE_OPTIONS.map((option) => (
-                          <button
-                            key={option.value}
-                            type="button"
-                            className={`portfolio-pill ${selectedRange === option.value ? "active" : ""}`}
-                            onClick={() => setSelectedRange(option.value)}
-                          >
-                            {isZh && option.value === "ALL"
-                              ? "全部"
-                              : isZh && option.value === "CUSTOM"
-                                ? "自選"
-                                : option.label}
-                          </button>
-                        ))}
-                      </div>
-                      {selectedRange === "CUSTOM" && (
-                        <div className="custom-range-inputs">
-                          <label>
-                            <span>{t("From", "由")}</span>
-                            <input
-                              type="date"
-                              value={customStart}
-                              min={minCustomDate}
-                              max={customEnd || maxCustomDate}
-                              onChange={onCustomStartChange}
-                            />
-                          </label>
-                          <label>
-                            <span>{t("To", "至")}</span>
-                            <input
-                              type="date"
-                              value={customEnd}
-                              min={customStart || minCustomDate}
-                              max={maxCustomDate}
-                              onChange={onCustomEndChange}
-                            />
-                          </label>
-                        </div>
-                      )}
-                    </div>
-
-                    <AreaChart points={selectedSeries} label={`${selectedStock.symbol} profit chart`} />
-
-                    <div className="portfolio-distribution-wrap">
-                      <PieChart
-                        segments={stockDistribution}
-                        title={t("Stock Distribution", "股票分佈")}
-                        itemLabel={t("Stock", "股票")}
-                        valueLabel={t("Value", "金額")}
-                        weightLabel={t("Weight", "比例")}
-                        valueFormatter={formatPieMoneyValue}
-                      />
-                      <div className="sub-distribution-grid">
-                        <PieChart
-                          segments={stockCountryDistribution}
-                          title={t("Country Distribution", "國家分佈")}
-                          itemLabel={t("Country", "國家")}
-                          valueLabel={t("Value", "金額")}
-                          weightLabel={t("Weight", "比例")}
-                          valueFormatter={formatPieMoneyValue}
-                        />
-                        <PieChart
-                          segments={stockCategoryDistribution}
-                          title={t("Category Distribution", "種類分佈")}
-                          itemLabel={t("Category", "種類")}
-                          valueLabel={t("Value", "金額")}
-                          weightLabel={t("Weight", "比例")}
-                          valueFormatter={formatPieMoneyValue}
-                        />
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="chart-empty">
-                    <span>{t("No stock data yet. Import a file to see stock performance.", "暫時未有股票資料，請先匯入檔案。")}</span>
+                <div className="panel-head">
+                  <div>
+                    <p className="panel-label">{t("Portfolio Overview", "組合總覽")}</p>
+                    <h2>{rangeTitle(selectedRange)} {t("Assets + Return + Profit", "總資產 + 收益率 + 收益")}</h2>
                   </div>
-                )}
+                  <div
+                    className={`metric-badge ${(portfolioOverviewLatest?.totalProfit ?? 0) >= 0 ? "positive" : "negative"}`}
+                  >
+                    <strong>{displayMoney(portfolioOverviewLatest?.totalProfit ?? 0, portfolioSummary.currency)}</strong>
+                    <span>{displayPercent(portfolioOverviewLatest?.totalReturnPct ?? 0)}</span>
+                  </div>
+                </div>
+
+                <div className="portfolio-switcher-wrap">
+                  <div className="portfolio-switcher-title">{t("Portfolio Filter", "組合篩選")}</div>
+                  <div className="portfolio-switcher">
+                    <button
+                      type="button"
+                      className={`portfolio-pill ${selectedPortfolioId === "all" ? "active" : ""}`}
+                      onClick={() => setSelectedPortfolioId("all")}
+                    >
+                      {t("All", "全部")}
+                    </button>
+                    {entities.map((entity) => (
+                      <button
+                        type="button"
+                        key={entity.id}
+                        className={`portfolio-pill ${selectedPortfolioId === entity.id ? "active" : ""}`}
+                        onClick={() => setSelectedPortfolioId(entity.id)}
+                      >
+                        {entity.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="time-range-wrap">
+                  <div className="portfolio-switcher-title">{t("P/L Time Range", "盈虧時間範圍")}</div>
+                  <div className="portfolio-switcher">
+                    {TIME_RANGE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={`portfolio-pill ${selectedRange === option.value ? "active" : ""}`}
+                        onClick={() => setSelectedRange(option.value)}
+                      >
+                        {isZh && option.value === "ALL"
+                          ? "全部"
+                          : isZh && option.value === "CUSTOM"
+                            ? "自選"
+                            : option.label}
+                      </button>
+                    ))}
+                  </div>
+                  {selectedRange === "CUSTOM" && (
+                    <div className="custom-range-inputs">
+                      <label>
+                        <span>{t("From", "由")}</span>
+                        <input
+                          type="date"
+                          value={customStart}
+                          min={minCustomDate}
+                          max={customEnd || maxCustomDate}
+                          onChange={onCustomStartChange}
+                        />
+                      </label>
+                      <label>
+                        <span>{t("To", "至")}</span>
+                        <input
+                          type="date"
+                          value={customEnd}
+                          min={customStart || minCustomDate}
+                          max={maxCustomDate}
+                          onChange={onCustomEndChange}
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
+
+                <div className="line-filter-wrap">
+                  <div className="portfolio-switcher-title">{t("Chart Lines", "圖表線條")}</div>
+                  <div className="portfolio-switcher">
+                    {PORTFOLIO_LINE_OPTIONS.map((option) => {
+                      const active = selectedPortfolioLineIds.includes(option.value);
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={`portfolio-pill line-pill ${active ? "active" : ""}`}
+                          onClick={() => togglePortfolioLine(option.value)}
+                        >
+                          <span className="line-pill-dot" style={{ background: option.color }} />
+                          <span>{isZh ? option.labelZh : option.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <PortfolioOverviewChart
+                  points={portfolioOverviewSeries}
+                  metrics={portfolioOverviewMetrics}
+                  noDataLabel={t("No portfolio data yet.", "暫時未有組合資料。")}
+                />
+
+                <div className="portfolio-distribution-wrap">
+                  <PieChart
+                    segments={stockDistribution}
+                    title={t("Stock Distribution", "股票分佈")}
+                    itemLabel={t("Stock", "股票")}
+                    valueLabel={t("Value", "金額")}
+                    weightLabel={t("Weight", "比例")}
+                    valueFormatter={formatPieMoneyValue}
+                  />
+                  <div className="sub-distribution-grid">
+                    <PieChart
+                      segments={stockCountryDistribution}
+                      title={t("Country Distribution", "國家分佈")}
+                      itemLabel={t("Country", "國家")}
+                      valueLabel={t("Value", "金額")}
+                      weightLabel={t("Weight", "比例")}
+                      valueFormatter={formatPieMoneyValue}
+                    />
+                    <PieChart
+                      segments={stockCategoryDistribution}
+                      title={t("Category Distribution", "種類分佈")}
+                      itemLabel={t("Category", "種類")}
+                      valueLabel={t("Value", "金額")}
+                      weightLabel={t("Weight", "比例")}
+                      valueFormatter={formatPieMoneyValue}
+                    />
+                  </div>
+                </div>
               </section>
 
               <section className="performance-panel" id="performance">
@@ -1713,13 +3346,24 @@ export default function App(): JSX.Element {
                 </div>
                 {selectedStock && (
                   <div className="performance-actions">
-                    <button
-                      type="button"
-                      className="secondary-btn"
-                      onClick={() => setSelectedStockDetailId(selectedStock.id)}
-                    >
-                      {t("Open", "開啟")} {selectedStock.symbol} {t("Detail", "詳情")}
-                    </button>
+                    <div className="performance-action-buttons">
+                      <button
+                        type="button"
+                        className="secondary-btn"
+                        onClick={() => setSelectedStockDetailId(selectedStock.id)}
+                      >
+                        {t("Open", "開啟")} {selectedStock.symbol} {t("Detail", "詳情")}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-btn"
+                        onClick={() => void refreshPortfolioQuotes("manual")}
+                        disabled={isQuoteSyncing || !portfolioStockSymbolKey}
+                      >
+                        {isQuoteSyncing ? t("Syncing...", "同步中...") : t("Check Stock Price", "查看股價")}
+                      </button>
+                    </div>
+                    <p className={`quote-sync-note ${quoteSyncError ? "error" : ""}`}>{quoteStatusText}</p>
                   </div>
                 )}
               </section>
@@ -2249,7 +3893,7 @@ export default function App(): JSX.Element {
                     <input
                       type="file"
                       onChange={onDataImportFileChange}
-                      accept=".rtf,.json,.txt"
+                      accept="*/*"
                     />
                     <span>{loading ? t("Importing...", "正在匯入...") : t("Import and Replace Data", "匯入並覆蓋資料")}</span>
                   </label>
@@ -2261,6 +3905,24 @@ export default function App(): JSX.Element {
                     disabled={entities.length === 0}
                   >
                     {t("Export Web JSON", "匯出 Web JSON")}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={exportStockerProJson}
+                    disabled={!dualFormatRecords}
+                  >
+                    {t("Export Stocker Pro JSON", "匯出 Stocker Pro JSON")}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={exportStockerXJson}
+                    disabled={!dualFormatRecords}
+                  >
+                    {t("Export StockerX JSON", "匯出 StockerX JSON")}
                   </button>
 
                   <button type="button" className="secondary-btn" onClick={() => setScreen("choose")}>
@@ -2278,6 +3940,13 @@ export default function App(): JSX.Element {
                 </div>
 
                 {errorMessage && <div className="error-text">{errorMessage}</div>}
+                {importStatusMessage && <div className="success-text">{importStatusMessage}</div>}
+                <p className="settings-hint">
+                  {t(
+                    "Each client can upload up to 20 files per month. AI normalization fallback is also quota-protected server-side.",
+                    "每個客戶端每月最多可上傳 20 個檔案，AI 轉換備援亦有伺服器配額保護。",
+                  )}
+                </p>
               </section>
             </section>
           )}
@@ -2369,6 +4038,22 @@ export default function App(): JSX.Element {
                     />
                   </label>
                   <label>
+                    {t("Display Currency", "顯示貨幣")}
+                    <select
+                      value={normalizedDisplayCurrency}
+                      onChange={(event) =>
+                        updateSetting("displayCurrency", normalizeCurrencyCode(event.target.value) || "AUTO")
+                      }
+                    >
+                      <option value="AUTO">{t("Auto (Original)", "自動（原貨幣）")}</option>
+                      {displayCurrencyOptions.map((currency) => (
+                        <option key={currency} value={currency}>
+                          {currency}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
                     {t("Default Import Type", "預設匯入類型")}
                     <select
                       value={settings.defaultImportType}
@@ -2389,6 +4074,7 @@ export default function App(): JSX.Element {
                     "以上預設只會儲存在瀏覽器，本版本尚未連接 Firebase。",
                   )}
                 </p>
+                <p className={`settings-hint ${fxSyncError ? "negative" : ""}`}>{displayCurrencyStatusText}</p>
                 <div className="settings-actions">
                   <button type="button" className="secondary-btn" onClick={resetSettings}>
                     {t("Reset To Default", "重設為預設")}
@@ -2408,6 +4094,253 @@ export default function App(): JSX.Element {
         </main>
       )}
 
+      {isImportReviewOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={closeImportReview}>
+          <div
+            className="modal-card import-review-modal"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="panel-head slim">
+              <h3>{t("Review Imported Transactions", "檢查匯入交易")}</h3>
+              <div className="import-review-head-actions">
+                <button type="button" className="secondary-btn" onClick={closeImportReview}>
+                  {t("Cancel", "取消")}
+                </button>
+                <button type="button" className="primary-btn" onClick={confirmImportReview}>
+                  {t("Confirm Import", "確認匯入")}
+                </button>
+              </div>
+            </div>
+
+            <div className="import-review-summary">
+              <div className="import-review-summary-item">
+                <span>{t("Portfolios", "組合數")}</span>
+                <strong>{importReviewEntities.length}</strong>
+              </div>
+              <div className="import-review-summary-item">
+                <span>{t("Transactions", "交易數")}</span>
+                <strong>{importReviewTxCount}</strong>
+              </div>
+              <div className="import-review-summary-item">
+                <span>{t("Source File", "來源檔案")}</span>
+                <strong>{importReviewSource?.fileName ?? "-"}</strong>
+              </div>
+              <div className="import-review-summary-item">
+                <span>{t("AI Quota", "AI 配額")}</span>
+                <strong>
+                  {typeof importReviewSource?.aiQuota?.remaining === "number"
+                    ? t(
+                        `${importReviewSource.aiQuota.remaining} left`,
+                        `剩餘 ${importReviewSource.aiQuota.remaining} 次`,
+                      )
+                    : t("Not used", "未使用")}
+                </strong>
+              </div>
+            </div>
+
+            <p className="settings-hint">
+              {t(
+                "Please verify and edit any row before confirming import.",
+                "請先檢查並可直接編輯每筆資料，確認後才會正式匯入。",
+              )}
+            </p>
+
+            <div className="table-scroll import-review-table">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>{t("Portfolio", "組合")}</th>
+                    <th>{t("Date", "日期")}</th>
+                    <th>{t("Type", "類型")}</th>
+                    <th>{t("Symbol", "代號")}</th>
+                    <th>{t("Shares / Amount", "股數 / 金額")}</th>
+                    <th>{t("Price", "價格")}</th>
+                    <th>{t("Fee", "費用")}</th>
+                    <th>{t("Currency", "貨幣")}</th>
+                    <th>{t("Note", "備註")}</th>
+                    <th>{t("Action", "動作")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {importReviewRows.map((row) => (
+                    <tr key={`${row.portfolioId}-${row.id}`}>
+                      <td>
+                        <select
+                          value={row.portfolioId}
+                          onChange={(event) =>
+                            moveImportReviewTransaction(row.portfolioId, event.target.value, row.id)
+                          }
+                        >
+                          {importReviewEntities.map((entity) => (
+                            <option key={entity.id} value={entity.id}>
+                              {entity.name}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          type="date"
+                          value={toDateInputValue(row.date)}
+                          onChange={(event) => {
+                            const parsed = parseDateInput(event.target.value);
+                            if (!parsed) {
+                              return;
+                            }
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              date: parsed,
+                            }));
+                          }}
+                        />
+                      </td>
+                      <td>
+                        <select
+                          value={row.type}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              type: event.target.value as TxType,
+                            }))
+                          }
+                        >
+                          {TRANSACTION_TYPE_OPTIONS.filter((item) => item.value !== "all").map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          value={row.symbol}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              symbol: event.target.value.toUpperCase().trim(),
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          step="0.0001"
+                          value={row.shares}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              shares: parseNumberish(event.target.value),
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          step="0.0001"
+                          value={row.price}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              price: parseNumberish(event.target.value),
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          step="0.0001"
+                          value={row.fee}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              fee: parseNumberish(event.target.value),
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          value={row.currency}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              currency: event.target.value.toUpperCase().trim(),
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          value={row.note ?? ""}
+                          onChange={(event) =>
+                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
+                              ...tx,
+                              note: event.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="text-btn danger"
+                          onClick={() => deleteImportReviewTransaction(row.portfolioId, row.id)}
+                        >
+                          {t("Delete", "刪除")}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {importReviewRows.length === 0 && (
+                    <tr>
+                      <td colSpan={10} className="empty-cell">
+                        {t("No imported transactions.", "沒有可匯入交易。")}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="import-review-feedback">
+              <label className="full-width">
+                {t(
+                  "If you think we misunderstand some columns, type here. We will adjust now.",
+                  "如果你覺得我哋誤解咗某啲欄位，請喺呢度輸入，我哋會即時調整。",
+                )}
+                <textarea
+                  value={importReviewFeedback}
+                  onChange={(event) => setImportReviewFeedback(event.target.value)}
+                  placeholder={t(
+                    "Example: Column A is trade amount, not shares. Column B is total value in HKD.",
+                    "例如：A 欄係交易總額唔係股數；B 欄係港幣總值。",
+                  )}
+                />
+              </label>
+              <div className="import-review-feedback-actions">
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => void adjustImportReviewWithPrompt()}
+                  disabled={isImportReviewAdjusting || !importReviewFeedback.trim()}
+                >
+                  {isImportReviewAdjusting
+                    ? t("Adjusting...", "調整中...")
+                    : t("Adjust With Prompt", "用提示即時調整")}
+                </button>
+              </div>
+            </div>
+
+            {importReviewError && <div className="error-text">{importReviewError}</div>}
+          </div>
+        </div>
+      )}
+
       {stockDetail && (
         <div className="modal-backdrop" role="presentation" onClick={() => setSelectedStockDetailId(null)}>
           <div
@@ -2420,15 +4353,41 @@ export default function App(): JSX.Element {
               <h3>
                 {stockDetail.symbol} {t("Detail", "詳情")}
               </h3>
-              <button type="button" className="secondary-btn" onClick={() => setSelectedStockDetailId(null)}>
-                {t("Close", "關閉")}
-              </button>
+              <div className="stock-detail-head-actions">
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => void refreshPortfolioQuotes("manual")}
+                  disabled={isQuoteSyncing || !portfolioStockSymbolKey}
+                >
+                  {isQuoteSyncing ? t("Syncing...", "同步中...") : t("Check Stock Price", "查看股價")}
+                </button>
+                <button type="button" className="secondary-btn" onClick={() => setSelectedStockDetailId(null)}>
+                  {t("Close", "關閉")}
+                </button>
+              </div>
             </div>
 
             <div className="stock-detail-metrics">
               <div>
                 <span>{t("Current Shares", "目前股數")}</span>
                 <strong>{stockDetail.activeShares.toFixed(4)}</strong>
+              </div>
+              <div>
+                <span>{t("Live Price", "即時股價")}</span>
+                <strong>{displayMoney(stockDetailLivePrice, stockDetail.currency)}</strong>
+              </div>
+              <div>
+                <span>{t("Quote Updated", "報價更新")}</span>
+                <strong className={quoteSyncError ? "negative" : ""}>
+                  {isQuoteSyncing
+                    ? t("Syncing now", "正在同步")
+                    : quoteLastUpdatedAt
+                      ? isZh
+                        ? `${formatAgo(quoteLastUpdatedAt, settings.language)}`
+                        : formatAgo(quoteLastUpdatedAt, settings.language)
+                      : t("Not synced", "未同步")}
+                </strong>
               </div>
               <div>
                 <span>{t("Market Value", "市值")}</span>
@@ -2456,7 +4415,77 @@ export default function App(): JSX.Element {
               </div>
             </div>
 
-            <AreaChart points={stockDetailSeries} label={`${stockDetail.symbol} detail chart`} />
+            <p className={`quote-sync-note ${quoteSyncError ? "error" : ""}`}>{quoteStatusText}</p>
+
+            <section className="valuation-chart-panel">
+              <div className="panel-head slim">
+                <h3>{t("Price + Profit + Trades", "股價 + 收益 + 交易點")}</h3>
+                <div className={`row-right ${stockDetailValuationChangePct >= 0 ? "positive" : "negative"}`}>
+                  <strong>{displayPercent(stockDetailValuationChangePct)}</strong>
+                </div>
+              </div>
+              <div className="portfolio-switcher">
+                {TIME_RANGE_OPTIONS.map((option) => (
+                  <button
+                    key={`valuation-${option.value}`}
+                    type="button"
+                    className={`portfolio-pill ${valuationRange === option.value ? "active" : ""}`}
+                    onClick={() => setValuationRange(option.value)}
+                  >
+                    {isZh && option.value === "ALL"
+                      ? "全部"
+                      : isZh && option.value === "CUSTOM"
+                        ? "自選"
+                        : option.label}
+                  </button>
+                ))}
+              </div>
+              {valuationRange === "CUSTOM" && (
+                <div className="custom-range-inputs">
+                  <label>
+                    <span>{t("From", "由")}</span>
+                    <input
+                      type="date"
+                      value={valuationCustomStart}
+                      min={minValuationCustomDate}
+                      max={valuationCustomEnd || maxValuationCustomDate}
+                      onChange={onValuationCustomStartChange}
+                    />
+                  </label>
+                  <label>
+                    <span>{t("To", "至")}</span>
+                    <input
+                      type="date"
+                      value={valuationCustomEnd}
+                      min={valuationCustomStart || minValuationCustomDate}
+                      max={maxValuationCustomDate}
+                      onChange={onValuationCustomEndChange}
+                    />
+                  </label>
+                </div>
+              )}
+              <div className="valuation-chart-actions">
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => void refreshValuationChart("manual")}
+                  disabled={isValuationSyncing}
+                >
+                  {isValuationSyncing ? t("Loading...", "載入中...") : t("Refresh Valuation", "更新估價圖")}
+                </button>
+              </div>
+              <PriceChart
+                points={stockDetailValuationSeries}
+                profitPoints={stockDetailSeries}
+                tradeMarkers={stockDetailTradeMarkers}
+                label={`${stockDetail.symbol} valuation + profit chart`}
+                valueLabel={t("Price", "價格")}
+                valueFormatter={(value) => displayMoney(value, stockDetail.currency)}
+                profitLabel={t("Profit", "收益")}
+                profitFormatter={(value) => displayMoney(value, stockDetail.currency)}
+              />
+              <p className={`quote-sync-note ${valuationSyncError ? "error" : ""}`}>{valuationStatusText}</p>
+            </section>
 
             <div className="table-scroll">
               <table className="data-table">

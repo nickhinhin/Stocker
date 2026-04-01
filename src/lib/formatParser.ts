@@ -392,6 +392,270 @@ function normalizeStockerProObject(data: UnknownRecord): EntityDataset[] {
   });
 }
 
+function asRecord(value: unknown): UnknownRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as UnknownRecord;
+}
+
+function normalizeCurrency(value: unknown, fallback = "USD"): string {
+  const normalized = String(value ?? "")
+    .trim()
+    .toUpperCase();
+  return normalized || fallback;
+}
+
+function encodeStored(value: number): number {
+  return Math.round(toNumber(value) * 100_000_000_000_000);
+}
+
+function normalizeAiTransaction(
+  txRaw: unknown,
+  portfolioCurrency: string,
+  portfolioId: string,
+  txIndex: number,
+  latestPriceMap: Record<string, { price: number; date: number }>,
+): NormalizedTransaction | null {
+  const tx = asRecord(txRaw);
+  if (!tx) {
+    return null;
+  }
+
+  const typeText = String(tx.type ?? tx.transactionType ?? tx.action ?? "")
+    .trim()
+    .toUpperCase();
+  const type: TxType = SUPPORTED_TX_TYPES.has(typeText as TxType)
+    ? (typeText as TxType)
+    : "CASH";
+
+  const currency = normalizeCurrency(tx.currency ?? tx.currencyType, portfolioCurrency);
+  let symbol = normalizeSymbol(tx.symbol ?? tx.ticker ?? tx.assetSymbol);
+  if (!symbol && ["CASH", "CASH_CONVERT", "FEE", "INTEREST"].includes(type)) {
+    symbol = currency;
+  }
+  if (!symbol) {
+    return null;
+  }
+
+  const date = parseDateLike(tx.date ?? tx.datetime ?? tx.time ?? tx.timestamp);
+  const shares = toNumber(
+    tx.shares ?? tx.quantity ?? tx.units ?? tx.size ?? tx.numberOfShares ?? tx.amount ?? 0,
+  );
+  const price = toNumber(tx.price ?? tx.unitPrice ?? tx.avgPrice ?? tx.costPrice ?? 0);
+  const fee = toNumber(tx.fee ?? tx.commission ?? tx.serviceFee ?? 0);
+  const note = String(tx.note ?? tx.memo ?? tx.remark ?? "").trim();
+
+  if (symbol !== currency && price > 0) {
+    pushLatestPrice(latestPriceMap, symbol, price, date);
+  }
+
+  return {
+    id: createTransactionId("ai", [portfolioId, txIndex, symbol, type, date.toISOString(), shares, price, fee]),
+    date,
+    symbol,
+    type,
+    shares,
+    price,
+    fee,
+    currency,
+    note,
+  };
+}
+
+export function normalizeAiPayloadToEntities(payload: unknown): EntityDataset[] {
+  const root = asRecord(payload);
+  if (!root) {
+    return [];
+  }
+
+  const portfolios = Array.isArray(root.portfolios) ? root.portfolios : [];
+
+  return portfolios
+    .map((portfolioRaw, index) => {
+      const portfolio = asRecord(portfolioRaw);
+      if (!portfolio) {
+        return null;
+      }
+
+      const id = String(portfolio.id ?? `ai-portfolio-${index + 1}`);
+      const name = String(portfolio.name ?? `AI Portfolio ${index + 1}`);
+      const currency = normalizeCurrency(portfolio.currency ?? portfolio.currencyType, "USD");
+      const latestPriceMap: Record<string, { price: number; date: number }> = {};
+      const txRows = Array.isArray(portfolio.transactions) ? portfolio.transactions : [];
+
+      const mappedTransactions = txRows
+        .map((txRaw, txIndex) => normalizeAiTransaction(txRaw, currency, id, txIndex, latestPriceMap))
+        .filter((tx): tx is NormalizedTransaction => Boolean(tx));
+
+      return {
+        id,
+        name,
+        currency,
+        transactions: sortByDateAsc(mappedTransactions),
+        latestPriceBySymbol: unwrapLatestPriceMap(latestPriceMap),
+      } as EntityDataset;
+    })
+    .filter((entity): entity is EntityDataset => Boolean(entity));
+}
+
+function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
+  const portfolioIdByEntityId = new Map<string, number>();
+  const portfolios = entities.map((entity, index) => {
+    const numericId = index + 1;
+    portfolioIdByEntityId.set(entity.id, numericId);
+    return {
+      id: numericId,
+      name: entity.name,
+      displayCurrencyType: normalizeCurrency(entity.currency, "USD"),
+    };
+  });
+
+  let transactionId = 1;
+  const assetTransactions: UnknownRecord[] = [];
+  entities.forEach((entity) => {
+    const portfolioId = portfolioIdByEntityId.get(entity.id) ?? 1;
+    const sorted = sortByDateAsc(entity.transactions);
+
+    sorted.forEach((tx) => {
+      const date = tx.date;
+      const time =
+        date.getHours() * 3_600_000 +
+        date.getMinutes() * 60_000 +
+        date.getSeconds() * 1_000 +
+        date.getMilliseconds();
+      const type: TxType = SUPPORTED_TX_TYPES.has(tx.type) ? tx.type : "CASH";
+      const currency = normalizeCurrency(tx.currency, normalizeCurrency(entity.currency, "USD"));
+      const symbol = normalizeSymbol(tx.symbol) || currency;
+      const isCashType = type === "CASH" || type === "CASH_CONVERT" || type === "INTEREST";
+
+      assetTransactions.push({
+        id: transactionId,
+        currencyType: currency,
+        assetType: isCashType ? "CASH" : "STOCK",
+        symbol,
+        year: date.getFullYear(),
+        month: date.getMonth() + 1,
+        day: date.getDate(),
+        time,
+        type,
+        _numberOfShares: encodeStored(tx.shares),
+        _price: encodeStored(tx.price),
+        _fee: encodeStored(tx.fee),
+        tags: null,
+        note: tx.note ?? "",
+        positionId: null,
+        portfolioId,
+        region: "OTHERS",
+        isAutoDividend: null,
+        exDividendDate: null,
+      });
+
+      transactionId += 1;
+    });
+  });
+
+  let marketPriceId = 1;
+  const manualMarketPrice: UnknownRecord[] = [];
+  entities.forEach((entity) => {
+    const portfolioId = portfolioIdByEntityId.get(entity.id) ?? 1;
+    Object.entries(entity.latestPriceBySymbol).forEach(([symbol, price]) => {
+      if (!symbol || !Number.isFinite(price) || price <= 0) {
+        return;
+      }
+      manualMarketPrice.push({
+        id: marketPriceId,
+        portfolioId,
+        symbol,
+        _price: encodeStored(price),
+      });
+      marketPriceId += 1;
+    });
+  });
+
+  return {
+    portfolios,
+    assetTransactions,
+    manualMarketPrice,
+  };
+}
+
+function buildStockerXExportObject(entities: EntityDataset[]): UnknownRecord[] {
+  return entities.map((entity, index) => {
+    const stocks: UnknownRecord[] = [];
+    const dividends: UnknownRecord[] = [];
+    const fees: UnknownRecord[] = [];
+
+    sortByDateAsc(entity.transactions).forEach((tx) => {
+      const currency = normalizeCurrency(tx.currency, normalizeCurrency(entity.currency, "USD"));
+      const symbol = normalizeSymbol(tx.symbol) || currency;
+      const isoDate = tx.date.toISOString();
+
+      if (tx.type === "BUY" || tx.type === "SELL" || tx.type === "DIVIDEND_SHARE") {
+        stocks.push({
+          stockSymbol: symbol,
+          date: isoDate,
+          numberOfShares: tx.shares,
+          priceRaw: tx.price,
+          price: tx.price,
+          feeRaw: tx.fee,
+          fee: tx.fee,
+          currencyType: currency,
+          transaction: tx.type === "SELL" ? "SELL" : "BUY",
+          note: tx.note ?? "",
+        });
+        return;
+      }
+
+      if (tx.type === "DIVIDEND_CASH") {
+        const amount = tx.shares * tx.price;
+        dividends.push({
+          stockSymbol: symbol,
+          date: isoDate,
+          amountRaw: amount,
+          amount,
+          feeRaw: tx.fee,
+          fee: tx.fee,
+          currencyType: currency,
+          note: tx.note ?? "",
+        });
+        return;
+      }
+
+      const cashValue = tx.shares * tx.price;
+      fees.push({
+        stockSymbol: symbol,
+        date: isoDate,
+        amount: cashValue,
+        fee: tx.fee,
+        currencyType: currency,
+        note: `${tx.type}${tx.note ? ` | ${tx.note}` : ""}`,
+      });
+    });
+
+    return {
+      key: entity.id || `stockerx-${index + 1}`,
+      name: entity.name || `Stocker ${index + 1}`,
+      currencyType: normalizeCurrency(entity.currency, "USD"),
+      stocks,
+      dividends,
+      fees,
+    };
+  });
+}
+
+export interface DualFormatRecords {
+  stockerProJson: string;
+  stockerXJson: string;
+}
+
+export function buildDualFormatRecords(entities: EntityDataset[]): DualFormatRecords {
+  return {
+    stockerProJson: JSON.stringify(buildStockerProExportObject(entities), null, 2),
+    stockerXJson: JSON.stringify(buildStockerXExportObject(entities), null, 2),
+  };
+}
+
 export async function parseInputByType(raw: string, type: UserType): Promise<EntityDataset[]> {
   if (type === "new") {
     return [

@@ -80,6 +80,17 @@ export interface RebalanceSuggestion {
   currency: string;
 }
 
+export interface PortfolioOverviewPoint {
+  date: Date;
+  cashBalance: number;
+  stockMarketValue: number;
+  totalMarketValue: number;
+  totalCost: number;
+  totalAssets: number;
+  totalProfit: number;
+  totalReturnPct: number;
+}
+
 interface DateBounds {
   minDate: Date;
   maxDate: Date;
@@ -167,6 +178,30 @@ function daysBetweenInclusive(start: Date, end: Date): number {
   return Math.floor(diff / 86_400_000) + 1;
 }
 
+function resolveDisplayMinDate(dates: Date[]): Date | null {
+  const sorted = dates
+    .map((date) => startOfDay(date))
+    .filter((date) => Number.isFinite(date.getTime()))
+    .sort((a, b) => a.getTime() - b.getTime());
+
+  if (sorted.length === 0) {
+    return null;
+  }
+
+  const firstDate = sorted[0];
+  const firstModernDate = sorted.find((date) => date.getFullYear() > 1970);
+  if (!firstModernDate) {
+    return firstDate;
+  }
+
+  const gapYears = (firstModernDate.getTime() - firstDate.getTime()) / (86_400_000 * 365.25);
+  if (firstDate.getFullYear() <= 1970 && gapYears >= 20) {
+    return firstModernDate;
+  }
+
+  return firstDate;
+}
+
 export function calculateCostWithVirtualCash(transactions: NormalizedTransaction[]): number {
   const sorted = sortByDateAsc(transactions);
   let cost = 0;
@@ -230,14 +265,17 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
         group.latestPrice = tx.price;
         group.latestPriceDate = tx.date.getTime();
       }
-
-      if (group.latestPrice === 0) {
-        const fallback = entity.latestPriceBySymbol[tx.symbol];
-        if (fallback && fallback > 0) {
-          group.latestPrice = fallback;
-        }
-      }
     });
+  });
+
+  groups.forEach((group) => {
+    for (const entity of entities) {
+      const fallbackPrice = entity.latestPriceBySymbol[group.symbol];
+      if (fallbackPrice && fallbackPrice > 0) {
+        group.latestPrice = fallbackPrice;
+        break;
+      }
+    }
   });
 
   return [...groups.values()].map((group) => ({
@@ -308,7 +346,10 @@ function evaluateStockAtDate(
     state.soldShares > 0 ? (sellAvg - buyAvg) * matchedShares : 0;
 
   const activeShares = state.purchasedShares - state.soldShares;
-  const marketPrice = state.lastPrice || group.latestPrice || buyAvg || 0;
+  const isTodayPoint = startOfDay(date).getTime() >= startOfDay(new Date()).getTime();
+  const marketPrice = isTodayPoint && group.latestPrice > 0
+    ? group.latestPrice
+    : (state.lastPrice || group.latestPrice || buyAvg || 0);
 
   let holdingProfit = 0;
   if (activeShares > 0) {
@@ -571,6 +612,26 @@ export function calculateCashBalances(entities: EntityDataset[]): CashBalance[] 
   return [...balances.entries()]
     .map(([currency, balance]) => ({ currency, balance: round2(balance) }))
     .sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance));
+}
+
+function calculateCashBalancesAtDate(
+  entities: EntityDataset[],
+  date: Date,
+): Map<string, number> {
+  const balances = new Map<string, number>();
+  const endTime = date.getTime();
+
+  entities.forEach((entity) => {
+    entity.transactions.forEach((tx) => {
+      if (tx.date.getTime() > endTime) {
+        return;
+      }
+      const current = balances.get(tx.currency) ?? 0;
+      balances.set(tx.currency, round2(current + getTransactionCashDelta(tx)));
+    });
+  });
+
+  return balances;
 }
 
 export function calculatePortfolioSummary(entities: EntityDataset[]): PortfolioSummary {
@@ -898,10 +959,12 @@ export function calculatePortfolioProfitSeries(
     return [];
   }
 
-  const minDate = groups.reduce((min, group) => {
-    const groupMin = group.transactions[0]?.date ?? min;
-    return groupMin.getTime() < min.getTime() ? groupMin : min;
-  }, groups[0].transactions[0].date);
+  const minDate = resolveDisplayMinDate(
+    groups.flatMap((group) => group.transactions.map((tx) => tx.date)),
+  );
+  if (!minDate) {
+    return [];
+  }
 
   const { start, end } = resolveDateRange(startOfDay(minDate), range);
   const totalDays = daysBetweenInclusive(start, end);
@@ -926,6 +989,107 @@ export function calculatePortfolioProfitSeries(
       total += evaluateStockAtDate(group, end).totalProfit;
     });
     points.push({ date: new Date(end), profit: round2(total) });
+  }
+
+  return points;
+}
+
+export function calculatePortfolioOverviewSeries(
+  entities: EntityDataset[],
+  range: ChartRange,
+): PortfolioOverviewPoint[] {
+  const allTransactions = getAllTransactions(entities);
+  if (allTransactions.length === 0) {
+    return [];
+  }
+
+  const groups = collectStockGroups(entities);
+  const summaryCurrency = entities[0]?.currency ?? "USD";
+  const minDate = resolveDisplayMinDate(allTransactions.map((tx) => tx.date));
+  if (!minDate) {
+    return [];
+  }
+  const fundingTransactions = allTransactions.filter((tx) => tx.type === "CASH");
+  let fundingIndex = 0;
+  let cumulativeFunding = 0;
+
+  const resolveFundingCostAtTime = (targetTime: number): number => {
+    while (
+      fundingIndex < fundingTransactions.length &&
+      fundingTransactions[fundingIndex].date.getTime() <= targetTime
+    ) {
+      const tx = fundingTransactions[fundingIndex];
+      cumulativeFunding += tx.shares * tx.price - tx.fee;
+      fundingIndex += 1;
+    }
+    return round2(cumulativeFunding);
+  };
+
+  const { start, end } = resolveDateRange(startOfDay(minDate), range);
+  const totalDays = daysBetweenInclusive(start, end);
+  const targetPoints = getTargetPointCount(range.preset, totalDays);
+  const stepDays = Math.max(1, Math.ceil(totalDays / targetPoints));
+
+  const points: PortfolioOverviewPoint[] = [];
+  let cursor = new Date(start);
+
+  while (cursor.getTime() <= end.getTime()) {
+    const totalCost = resolveFundingCostAtTime(cursor.getTime());
+    let totalProfit = 0;
+    let stockMarketValue = 0;
+
+    groups.forEach((group) => {
+      const metrics = evaluateStockAtDate(group, cursor);
+      totalProfit += metrics.totalProfit;
+      stockMarketValue += metrics.marketValue;
+    });
+
+    const cashBalances = calculateCashBalancesAtDate(entities, cursor);
+    const fallbackCash = [...cashBalances.values()][0] ?? 0;
+    const cashBalance = cashBalances.get(summaryCurrency) ?? fallbackCash;
+    const totalAssets = round2(stockMarketValue + cashBalance);
+    const totalReturnPct = totalCost > 0 ? round2((totalProfit / totalCost) * 100) : 0;
+
+    points.push({
+      date: new Date(cursor),
+      cashBalance: round2(cashBalance),
+      stockMarketValue: round2(stockMarketValue),
+      totalMarketValue: totalAssets,
+      totalCost,
+      totalAssets,
+      totalProfit: round2(totalProfit),
+      totalReturnPct,
+    });
+    cursor = addDays(cursor, stepDays);
+  }
+
+  if (points.length === 0 || points[points.length - 1].date.getTime() !== end.getTime()) {
+    const totalCost = resolveFundingCostAtTime(end.getTime());
+    let totalProfit = 0;
+    let stockMarketValue = 0;
+
+    groups.forEach((group) => {
+      const metrics = evaluateStockAtDate(group, end);
+      totalProfit += metrics.totalProfit;
+      stockMarketValue += metrics.marketValue;
+    });
+
+    const cashBalances = calculateCashBalancesAtDate(entities, end);
+    const fallbackCash = [...cashBalances.values()][0] ?? 0;
+    const cashBalance = cashBalances.get(summaryCurrency) ?? fallbackCash;
+    const totalAssets = round2(stockMarketValue + cashBalance);
+    const totalReturnPct = totalCost > 0 ? round2((totalProfit / totalCost) * 100) : 0;
+
+    points.push({
+      date: new Date(end),
+      cashBalance: round2(cashBalance),
+      stockMarketValue: round2(stockMarketValue),
+      totalMarketValue: totalAssets,
+      totalCost,
+      totalAssets,
+      totalProfit: round2(totalProfit),
+      totalReturnPct,
+    });
   }
 
   return points;

@@ -54,6 +54,11 @@ export interface ProfitPoint {
   profit: number;
 }
 
+export interface PricePoint {
+  date: Date;
+  price: number;
+}
+
 export interface StockBreakdown {
   id: string;
   symbol: string;
