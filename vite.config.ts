@@ -7,6 +7,8 @@ const OPENAI_MAX_INPUT_CHARS = 120_000;
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5173",
   "http://localhost:5173",
+  "http://127.0.0.1:4173",
+  "http://localhost:4173",
   "https://stockerwebpro.nanistudio.org",
 ];
 
@@ -77,8 +79,14 @@ function isLocalTestingOrigin(origin: string): boolean {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return false;
     }
-    const hostname = parsed.hostname.toLowerCase();
+    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
     if (hostname === "localhost" || hostname === "127.0.0.1") {
+      return true;
+    }
+    if (hostname === "::1" || hostname === "0.0.0.0") {
+      return true;
+    }
+    if (hostname.endsWith(".local")) {
       return true;
     }
     return isPrivateIpv4Hostname(hostname);
@@ -111,6 +119,20 @@ function resolveRequestOrigin(request: any): string {
   } catch {
     return "";
   }
+}
+
+function resolveRequestHostOrigin(request: any): string {
+  const hostHeader = String(request.headers["x-forwarded-host"] ?? request.headers.host ?? "").trim();
+  if (!hostHeader) {
+    return "";
+  }
+
+  const forwardedProto = String(request.headers["x-forwarded-proto"] ?? "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const protocol = forwardedProto === "https" ? "https" : "http";
+  return `${protocol}://${hostHeader}`;
 }
 
 function applyCorsHeaders(response: any, origin: string): void {
@@ -410,7 +432,9 @@ function localFunctionPlugin() {
     }
 
     const origin = resolveRequestOrigin(request);
-    const originAllowed = isAllowedOrigin(origin, allowedOrigins, allowPrivateTestingOrigins);
+    const hostOrigin = resolveRequestHostOrigin(request);
+    const requestOrigin = origin || hostOrigin;
+    const originAllowed = isAllowedOrigin(requestOrigin, allowedOrigins, allowPrivateTestingOrigins);
 
     if (request.method === "OPTIONS") {
       if (!originAllowed) {
@@ -419,13 +443,13 @@ function localFunctionPlugin() {
         return;
       }
       response.statusCode = 204;
-      applyCorsHeaders(response, origin);
+      applyCorsHeaders(response, requestOrigin);
       response.end();
       return;
     }
 
     if (request.method !== "POST") {
-      sendJson(response, 405, {error: "Method not allowed."}, originAllowed ? origin : undefined);
+      sendJson(response, 405, {error: "Method not allowed."}, originAllowed ? requestOrigin : undefined);
       return;
     }
 
@@ -436,13 +460,13 @@ function localFunctionPlugin() {
 
     const appHeader = String(request.headers["x-stocker-app"] ?? "").trim();
     if (appHeader !== "stocker-web") {
-      sendJson(response, 403, {error: "Missing or invalid app identity header."}, origin);
+      sendJson(response, 403, {error: "Missing or invalid app identity header."}, requestOrigin);
       return;
     }
 
     const clientHeader = String(request.headers["x-stocker-client"] ?? "").trim();
     if (!clientHeader || clientHeader.length < 8 || clientHeader.length > 200) {
-      sendJson(response, 403, {error: "Missing or invalid client identity header."}, origin);
+      sendJson(response, 403, {error: "Missing or invalid client identity header."}, requestOrigin);
       return;
     }
 
@@ -450,7 +474,7 @@ function localFunctionPlugin() {
     try {
       body = await readRequestJson(request);
     } catch (error) {
-      sendJson(response, 400, {error: (error as Error).message}, origin);
+      sendJson(response, 400, {error: (error as Error).message}, requestOrigin);
       return;
     }
 
@@ -458,8 +482,17 @@ function localFunctionPlugin() {
       requestPath === "/api/local-functions/normalize-portfolio"
         ? "normalize"
         : String(body.type ?? "unknown").trim().toLowerCase();
+    const requestSymbol = String(body.symbol ?? "").trim().toUpperCase();
+    const requestRange = String(body.range ?? "").trim().toLowerCase();
+    const requestInterval = String(body.interval ?? "").trim().toLowerCase();
+    const rateLimitScope =
+      requestType === "chart"
+        ? `chart:${requestSymbol}:${requestRange}:${requestInterval}`
+        : requestType === "query"
+          ? `query:${requestSymbol}`
+          : requestType;
     const now = Date.now();
-    const rateLimitKey = `${origin || "unknown-origin"}:${requestPath}:${requestType}`;
+    const rateLimitKey = `${requestOrigin || "unknown-origin"}:${requestPath}:${rateLimitScope}`;
     const lastCallAt = lastCallAtByOrigin.get(rateLimitKey) ?? 0;
     if (now - lastCallAt < RATE_LIMIT_WINDOW_MS) {
       const retryAfterSeconds = Math.ceil((RATE_LIMIT_WINDOW_MS - (now - lastCallAt)) / 1000);
@@ -467,7 +500,7 @@ function localFunctionPlugin() {
         response,
         429,
         {error: `Too many requests. Retry after ${retryAfterSeconds} seconds.`},
-        origin,
+        requestOrigin,
       );
       return;
     }
@@ -480,30 +513,30 @@ function localFunctionPlugin() {
             response,
             500,
             {error: "Server missing STOCKER_AI_API_KEY. Add it to .env.local and restart."},
-            origin,
+            requestOrigin,
           );
           return;
         }
 
         let quota;
         try {
-          quota = consumeMonthlyAiUploadQuota(`${origin}:${clientHeader}`);
+          quota = consumeMonthlyAiUploadQuota(`${requestOrigin}:${clientHeader}`);
         } catch (error) {
-          sendJson(response, 429, {error: (error as Error).message}, origin);
+          sendJson(response, 429, {error: (error as Error).message}, requestOrigin);
           return;
         }
 
         const normalized = await normalizePortfolioWithOpenAi(body);
-        sendJson(response, 200, {data: {normalized, quota}}, origin);
+        sendJson(response, 200, {data: {normalized, quota}}, requestOrigin);
         return;
       }
 
       const data = requestPath === "/api/local-functions/fetch-stock-data"
         ? await fetchYahooData(body)
         : await fetchCryptoData(body);
-      sendJson(response, 200, {data}, origin);
+      sendJson(response, 200, {data}, requestOrigin);
     } catch (error) {
-      sendJson(response, 500, {error: (error as Error).message}, origin);
+      sendJson(response, 500, {error: (error as Error).message}, requestOrigin);
     }
   };
 

@@ -3,6 +3,7 @@ import {
   EntityDataset,
   NormalizedTransaction,
   PortfolioSummary,
+  PricePoint,
   ProfitPoint,
   StockBreakdown,
   StockMetrics,
@@ -106,6 +107,11 @@ interface StockEvaluation {
   totalFee: number;
   marketPrice: number;
   marketValue: number;
+}
+
+interface StockEvaluationOptions {
+  useLatestPriceOnToday?: boolean;
+  historicalPriceBySymbol?: Record<string, PricePoint[]>;
 }
 
 const STOCK_RELEVANT_TYPES = new Set([
@@ -284,10 +290,34 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
   }));
 }
 
+function resolveHistoricalPriceAtDate(
+  series: PricePoint[] | undefined,
+  date: Date,
+): number | null {
+  if (!series || series.length === 0) {
+    return null;
+  }
+
+  const targetTime = date.getTime();
+  for (let index = series.length - 1; index >= 0; index -= 1) {
+    const point = series[index];
+    if (point.date.getTime() > targetTime) {
+      continue;
+    }
+    if (Number.isFinite(point.price) && point.price > 0) {
+      return point.price;
+    }
+  }
+
+  return null;
+}
+
 function evaluateStockAtDate(
   group: StockGroup,
   date: Date,
+  options: StockEvaluationOptions = {},
 ): StockEvaluation {
+  const { useLatestPriceOnToday = true, historicalPriceBySymbol } = options;
   const state: SymbolAccumulator = {
     purchasedShares: 0,
     soldShares: 0,
@@ -347,9 +377,15 @@ function evaluateStockAtDate(
 
   const activeShares = state.purchasedShares - state.soldShares;
   const isTodayPoint = startOfDay(date).getTime() >= startOfDay(new Date()).getTime();
-  const marketPrice = isTodayPoint && group.latestPrice > 0
-    ? group.latestPrice
-    : (state.lastPrice || group.latestPrice || buyAvg || 0);
+  const historicalPrice = resolveHistoricalPriceAtDate(
+    historicalPriceBySymbol?.[group.symbol],
+    date,
+  );
+  const marketPrice = historicalPrice ?? (
+    useLatestPriceOnToday && isTodayPoint && group.latestPrice > 0
+      ? group.latestPrice
+      : (state.lastPrice || group.latestPrice || buyAvg || 0)
+  );
 
   let holdingProfit = 0;
   if (activeShares > 0) {
@@ -881,6 +917,7 @@ export function calculateTransactionHeatmap(
 export function calculateNormalizedCompareSeries(
   entities: EntityDataset[],
   range: ChartRange,
+  historicalPriceBySymbol?: Record<string, PricePoint[]>,
   limit = 3,
 ): CompareLineSeries[] {
   const breakdown = calculateStockBreakdown(entities)
@@ -889,7 +926,7 @@ export function calculateNormalizedCompareSeries(
     .slice(0, limit);
 
   return breakdown.map((item, index) => {
-    const series = calculateSeriesForStock(entities, item.id, range);
+    const series = calculateSeriesForStock(entities, item.id, range, historicalPriceBySymbol);
     if (series.length === 0) {
       return {
         id: item.id,
@@ -953,6 +990,7 @@ export function calculateInsightMetrics(entities: EntityDataset[]): InsightMetri
 export function calculatePortfolioProfitSeries(
   entities: EntityDataset[],
   range: ChartRange,
+  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): ProfitPoint[] {
   const groups = collectStockGroups(entities);
   if (groups.length === 0) {
@@ -977,7 +1015,10 @@ export function calculatePortfolioProfitSeries(
   while (cursor.getTime() <= end.getTime()) {
     let total = 0;
     groups.forEach((group) => {
-      total += evaluateStockAtDate(group, cursor).totalProfit;
+      total += evaluateStockAtDate(group, cursor, {
+        useLatestPriceOnToday: false,
+        historicalPriceBySymbol,
+      }).totalProfit;
     });
     points.push({ date: new Date(cursor), profit: round2(total) });
     cursor = addDays(cursor, stepDays);
@@ -986,7 +1027,10 @@ export function calculatePortfolioProfitSeries(
   if (points.length === 0 || points[points.length - 1].date.getTime() !== end.getTime()) {
     let total = 0;
     groups.forEach((group) => {
-      total += evaluateStockAtDate(group, end).totalProfit;
+      total += evaluateStockAtDate(group, end, {
+        useLatestPriceOnToday: false,
+        historicalPriceBySymbol,
+      }).totalProfit;
     });
     points.push({ date: new Date(end), profit: round2(total) });
   }
@@ -997,6 +1041,7 @@ export function calculatePortfolioProfitSeries(
 export function calculatePortfolioOverviewSeries(
   entities: EntityDataset[],
   range: ChartRange,
+  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): PortfolioOverviewPoint[] {
   const allTransactions = getAllTransactions(entities);
   if (allTransactions.length === 0) {
@@ -1039,7 +1084,10 @@ export function calculatePortfolioOverviewSeries(
     let stockMarketValue = 0;
 
     groups.forEach((group) => {
-      const metrics = evaluateStockAtDate(group, cursor);
+      const metrics = evaluateStockAtDate(group, cursor, {
+        useLatestPriceOnToday: false,
+        historicalPriceBySymbol,
+      });
       totalProfit += metrics.totalProfit;
       stockMarketValue += metrics.marketValue;
     });
@@ -1069,7 +1117,10 @@ export function calculatePortfolioOverviewSeries(
     let stockMarketValue = 0;
 
     groups.forEach((group) => {
-      const metrics = evaluateStockAtDate(group, end);
+      const metrics = evaluateStockAtDate(group, end, {
+        useLatestPriceOnToday: false,
+        historicalPriceBySymbol,
+      });
       totalProfit += metrics.totalProfit;
       stockMarketValue += metrics.marketValue;
     });
@@ -1098,8 +1149,9 @@ export function calculatePortfolioOverviewSeries(
 export function calculateDrawdownSeries(
   entities: EntityDataset[],
   range: ChartRange,
+  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): ChartBarDatum[] {
-  const series = calculatePortfolioProfitSeries(entities, range);
+  const series = calculatePortfolioProfitSeries(entities, range, historicalPriceBySymbol);
   if (series.length === 0) {
     return [];
   }
@@ -1195,6 +1247,7 @@ export function calculateSeriesForStock(
   entities: EntityDataset[],
   stockId: string,
   range: ChartRange,
+  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): ProfitPoint[] {
   const target = collectStockGroups(entities).find((group) => group.id === stockId);
   if (!target) {
@@ -1217,13 +1270,19 @@ export function calculateSeriesForStock(
 
   while (cursor.getTime() <= end.getTime()) {
     const pointDate = new Date(cursor);
-    const { totalProfit } = evaluateStockAtDate(target, pointDate);
+    const { totalProfit } = evaluateStockAtDate(target, pointDate, {
+      useLatestPriceOnToday: false,
+      historicalPriceBySymbol,
+    });
     points.push({ date: pointDate, profit: totalProfit });
     cursor = addDays(cursor, stepDays);
   }
 
   if (points.length === 0 || points[points.length - 1].date.getTime() !== end.getTime()) {
-    const { totalProfit } = evaluateStockAtDate(target, end);
+    const { totalProfit } = evaluateStockAtDate(target, end, {
+      useLatestPriceOnToday: false,
+      historicalPriceBySymbol,
+    });
     points.push({ date: new Date(end), profit: totalProfit });
   }
 

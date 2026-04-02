@@ -66,6 +66,12 @@ interface TransactionDraft {
   note: string;
 }
 
+interface HeaderStockSearchItem {
+  id: string;
+  symbol: string;
+  currency: string;
+}
+
 interface WebSettings {
   language: Locale;
   showObscure: boolean;
@@ -227,12 +233,10 @@ const TIME_RANGE_OPTIONS: { value: ChartRangePreset; label: string }[] = [
 ];
 
 const PORTFOLIO_LINE_OPTIONS: { value: PortfolioLineId; label: string; labelZh: string; color: string }[] = [
-  { value: "cashBalance", label: "Cash", labelZh: "現金", color: "#06B6D4" },
   { value: "stockMarketValue", label: "Stock Market Value", labelZh: "股票市值", color: "#3B82F6" },
   { value: "totalMarketValue", label: "Total Market Value", labelZh: "總市值", color: "#14B8A6" },
   { value: "totalProfit", label: "Profit", labelZh: "收益", color: "#22A06B" },
   { value: "totalReturnPct", label: "Return %", labelZh: "收益率", color: "#F59E0B" },
-  { value: "totalCost", label: "Cost", labelZh: "成本", color: "#64748B" },
 ];
 
 const TIME_RANGE_TITLES: Record<ChartRangePreset, string> = {
@@ -603,36 +607,6 @@ function formatAgo(date: Date, locale: Locale = "en"): string {
   return locale === "zh-HK" ? `${diffDays}日前` : `${diffDays}d ago`;
 }
 
-function projectYearsToGoal(
-  currentValue: number,
-  monthlyContribution: number,
-  annualReturnPct: number,
-  targetValue: number,
-): number | null {
-  if (targetValue <= currentValue) {
-    return 0;
-  }
-  if (monthlyContribution <= 0 && annualReturnPct <= 0) {
-    return null;
-  }
-
-  const monthlyRate = annualReturnPct / 100 / 12;
-  let value = currentValue;
-  let months = 0;
-
-  while (value < targetValue && months < 1200) {
-    value *= 1 + monthlyRate;
-    value += monthlyContribution;
-    months += 1;
-  }
-
-  if (value < targetValue) {
-    return null;
-  }
-
-  return Math.round((months / 12) * 10) / 10;
-}
-
 function startOfDay(date: Date): Date {
   const next = new Date(date);
   next.setHours(0, 0, 0, 0);
@@ -749,6 +723,21 @@ function parseQuoteNumber(value: unknown): number | null {
   }
 
   return parseQuoteNumber(record.fmt);
+}
+
+function isOriginRestrictionErrorMessage(message: string): boolean {
+  return message.toLowerCase().includes("restricted to allowed stocker origins");
+}
+
+function normalizeLocalApiErrorMessage(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : fallback;
+  if (!message) {
+    return fallback;
+  }
+  if (isOriginRestrictionErrorMessage(message)) {
+    return "";
+  }
+  return message;
 }
 
 function extractYahooQuotePriceMap(payload: unknown): Record<string, number> {
@@ -1170,10 +1159,6 @@ export default function App(): JSX.Element {
   const [holdingSearch, setHoldingSearch] = useState("");
   const [holdingSort, setHoldingSort] = useState<"marketValue" | "profit" | "symbol">("marketValue");
 
-  const [goalTarget, setGoalTarget] = useState("1000000");
-  const [goalMonthlyContribution, setGoalMonthlyContribution] = useState("1000");
-  const [goalReturnPct, setGoalReturnPct] = useState("8");
-
   const [isTxModalOpen, setTxModalOpen] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<TransactionRow | null>(null);
   const [draft, setDraft] = useState<TransactionDraft>(buildDefaultDraft("", "USD"));
@@ -1182,6 +1167,7 @@ export default function App(): JSX.Element {
   const [pendingCashAmount, setPendingCashAmount] = useState("");
 
   const [menuOpen, setMenuOpen] = useState(false);
+  const [headerSearchKeyword, setHeaderSearchKeyword] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [importStatusMessage, setImportStatusMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1209,7 +1195,9 @@ export default function App(): JSX.Element {
   const [valuationSyncError, setValuationSyncError] = useState("");
   const [valuationLastUpdatedAt, setValuationLastUpdatedAt] = useState<Date | null>(null);
   const [valuationSeriesCache, setValuationSeriesCache] = useState<Record<string, PricePoint[]>>({});
+  const [portfolioHistoryBySymbol, setPortfolioHistoryBySymbol] = useState<Record<string, PricePoint[]>>({});
   const quoteSyncInFlightRef = useRef(false);
+  const portfolioHistoryRequestSeqRef = useRef(0);
 
   const isZh = settings.language === "zh-HK";
   const localeTag = isZh ? "zh-HK" : "en-US";
@@ -1342,11 +1330,32 @@ export default function App(): JSX.Element {
     () => collectPortfolioStockSymbols(entities).join("|"),
     [entities],
   );
+  const filteredPortfolioStockSymbolKey = useMemo(
+    () => collectPortfolioStockSymbols(filteredEntities).join("|"),
+    [filteredEntities],
+  );
 
   const stockLeaderboard = useMemo(
     () => [...stockBreakdown].sort((a, b) => b.totalProfit - a.totalProfit),
     [stockBreakdown],
   );
+
+  const headerStockSearchResults = useMemo<HeaderStockSearchItem[]>(() => {
+    const keyword = headerSearchKeyword.trim().toUpperCase();
+    if (!keyword) {
+      return [];
+    }
+
+    return stockBreakdown
+      .filter((item) => item.symbol.includes(keyword) || item.currency.includes(keyword))
+      .sort((a, b) => Math.abs(b.marketValue) - Math.abs(a.marketValue))
+      .slice(0, 8)
+      .map((item) => ({
+        id: item.id,
+        symbol: item.symbol,
+        currency: item.currency,
+      }));
+  }, [headerSearchKeyword, stockBreakdown]);
 
   const holdingStocks = useMemo(
     () => stockBreakdown.filter((item) => item.activeShares !== 0),
@@ -1486,12 +1495,12 @@ export default function App(): JSX.Element {
   );
 
   const portfolioProfitSeries = useMemo(
-    () => calculatePortfolioProfitSeries(filteredEntities, currentRange),
-    [currentRange, filteredEntities],
+    () => calculatePortfolioProfitSeries(filteredEntities, currentRange, portfolioHistoryBySymbol),
+    [currentRange, filteredEntities, portfolioHistoryBySymbol],
   );
   const portfolioOverviewSeries = useMemo(
-    () => calculatePortfolioOverviewSeries(filteredEntities, currentRange),
-    [currentRange, filteredEntities],
+    () => calculatePortfolioOverviewSeries(filteredEntities, currentRange, portfolioHistoryBySymbol),
+    [currentRange, filteredEntities, portfolioHistoryBySymbol],
   );
   const portfolioOverviewLatest = useMemo(
     () => portfolioOverviewSeries[portfolioOverviewSeries.length - 1] ?? null,
@@ -1522,8 +1531,8 @@ export default function App(): JSX.Element {
     [filteredEntities],
   );
   const compareSeries = useMemo(
-    () => calculateNormalizedCompareSeries(filteredEntities, currentRange, 4),
-    [currentRange, filteredEntities],
+    () => calculateNormalizedCompareSeries(filteredEntities, currentRange, portfolioHistoryBySymbol, 4),
+    [currentRange, filteredEntities, portfolioHistoryBySymbol],
   );
   const transactionHeatmap = useMemo(
     () => calculateTransactionHeatmap(filteredEntities),
@@ -1534,8 +1543,8 @@ export default function App(): JSX.Element {
     [filteredEntities],
   );
   const drawdownSeries = useMemo(
-    () => calculateDrawdownSeries(filteredEntities, currentRange),
-    [currentRange, filteredEntities],
+    () => calculateDrawdownSeries(filteredEntities, currentRange, portfolioHistoryBySymbol),
+    [currentRange, filteredEntities, portfolioHistoryBySymbol],
   );
   const dividendCalendarSeries = useMemo(
     () => calculateDividendCalendarSeries(filteredEntities),
@@ -1544,17 +1553,6 @@ export default function App(): JSX.Element {
   const rebalanceSuggestions = useMemo(
     () => calculateRebalanceSuggestions(filteredEntities, 6),
     [filteredEntities],
-  );
-
-  const goalYears = useMemo(
-    () =>
-      projectYearsToGoal(
-        portfolioSummary.totalAssets,
-        parseNumberish(goalMonthlyContribution),
-        parseNumberish(goalReturnPct),
-        parseNumberish(goalTarget),
-      ),
-    [goalMonthlyContribution, goalReturnPct, goalTarget, portfolioSummary.totalAssets],
   );
 
   const visibleAssetAllocation = useMemo(() => {
@@ -1864,21 +1862,9 @@ export default function App(): JSX.Element {
           );
         }
       } catch (error) {
-        setQuoteSyncError(
-          error instanceof Error
-            ? error.message
-            : isZh
-              ? "更新股票報價失敗。"
-              : "Failed to refresh stock quotes.",
-        );
+        setQuoteSyncError(normalizeLocalApiErrorMessage(error, "Failed to refresh stock quotes."));
         if (normalizedDisplayCurrency !== "AUTO") {
-          setFxSyncError(
-            error instanceof Error
-              ? error.message
-              : isZh
-                ? "更新匯率失敗。"
-                : "Failed to refresh FX rates.",
-          );
+          setFxSyncError(normalizeLocalApiErrorMessage(error, "Failed to refresh FX rates."));
         }
       } finally {
         quoteSyncInFlightRef.current = false;
@@ -1951,11 +1937,7 @@ export default function App(): JSX.Element {
               valuationCustomEnd,
             ),
         }));
-        setValuationSyncError(
-          error instanceof Error
-            ? error.message
-            : t("Failed to refresh valuation chart.", "更新估價圖失敗。"),
-        );
+        setValuationSyncError(normalizeLocalApiErrorMessage(error, "Failed to refresh valuation chart."));
       } finally {
         setValuationSyncing(false);
       }
@@ -1970,6 +1952,58 @@ export default function App(): JSX.Element {
       valuationRange,
     ],
   );
+
+  const refreshPortfolioHistorySeries = useCallback(async (): Promise<void> => {
+    if (screen !== "dashboard") {
+      return;
+    }
+
+    const symbols = filteredPortfolioStockSymbolKey
+      ? filteredPortfolioStockSymbolKey.split("|").filter(Boolean)
+      : [];
+    if (symbols.length === 0) {
+      setPortfolioHistoryBySymbol({});
+      return;
+    }
+
+    const requestSeq = portfolioHistoryRequestSeqRef.current + 1;
+    portfolioHistoryRequestSeqRef.current = requestSeq;
+
+    const request = resolveYahooChartRequest(currentRange.preset);
+    const nextHistoryBySymbol: Record<string, PricePoint[]> = {};
+
+    for (const symbol of symbols) {
+      try {
+        const payload = await fetchLocalStockData<unknown>({
+          type: "chart",
+          symbol,
+          range: request.range,
+          interval: request.interval,
+        });
+        const parsed = extractYahooChartPriceSeries(payload);
+        const filtered = filterPriceSeriesByCustomRange(
+          parsed,
+          currentRange.preset,
+          customStart,
+          customEnd,
+        );
+        if (filtered.length > 0) {
+          nextHistoryBySymbol[symbol] = filtered;
+        }
+      } catch {
+        // Keep fallback behavior from transaction-derived prices when historical fetch is unavailable.
+      }
+    }
+
+    if (portfolioHistoryRequestSeqRef.current !== requestSeq) {
+      return;
+    }
+    setPortfolioHistoryBySymbol(nextHistoryBySymbol);
+  }, [currentRange.preset, customEnd, customStart, filteredPortfolioStockSymbolKey, screen]);
+
+  useEffect(() => {
+    void refreshPortfolioHistorySeries();
+  }, [refreshPortfolioHistorySeries]);
 
   const quoteStatusText = useMemo(() => {
     if (!portfolioStockSymbolKey && fxSymbols.length === 0) {
@@ -2993,6 +3027,14 @@ export default function App(): JSX.Element {
     setMenuOpen(false);
   };
 
+  const jumpToSearchedStock = (stockId: string): void => {
+    setSelectedStockId(stockId);
+    setSelectedStockDetailId(stockId);
+    setScreen("dashboard");
+    setActiveTab("dashboard");
+    setMenuOpen(false);
+  };
+
   return (
     <div
       className={`app-shell ${settings.enableAnimations ? "" : "reduced-motion"} ${tableDensityClass}`.trim()}
@@ -3009,7 +3051,20 @@ export default function App(): JSX.Element {
           <input
             type="search"
             placeholder={t("Search (⌘K)", "搜尋 (⌘K)")}
+            value={headerSearchKeyword}
             onFocus={() => setMenuOpen(false)}
+            onChange={(event) => setHeaderSearchKeyword(event.target.value.toUpperCase())}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") {
+                return;
+              }
+              const firstMatch = headerStockSearchResults[0];
+              if (!firstMatch) {
+                return;
+              }
+              event.preventDefault();
+              jumpToSearchedStock(firstMatch.id);
+            }}
           />
           <kbd>⌘K</kbd>
         </label>
@@ -3521,46 +3576,7 @@ export default function App(): JSX.Element {
                     </tbody>
                   </table>
                 </div>
-              </section>
-
-              <section className="table-panel">
-                <div className="panel-head slim">
-                  <h3>{t("Portfolio Goal Simulator", "資產目標模擬器")}</h3>
-                </div>
-                <div className="goal-sim-grid">
-                  <label>
-                    {t("Target Asset", "目標資產")}
-                    <input
-                      value={goalTarget}
-                      onChange={(event) => setGoalTarget(event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    {t("Monthly Contribution", "每月供款")}
-                    <input
-                      value={goalMonthlyContribution}
-                      onChange={(event) => setGoalMonthlyContribution(event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    {t("Expected Return % (Annual)", "預期年回報率%")}
-                    <input
-                      value={goalReturnPct}
-                      onChange={(event) => setGoalReturnPct(event.target.value)}
-                    />
-                  </label>
-                  <div className="goal-result">
-                    {goalYears === null ? (
-                      <strong>{t("Cannot reach target with current settings", "以目前設定未能達標")}</strong>
-                    ) : (
-                      <strong>
-                        {t("Estimated time:", "預計時間：")} {goalYears} {t("years", "年")}
-                      </strong>
-                    )}
-                  </div>
-                </div>
-              </section>
-            </section>
+              </section>`n            </section>
           )}
 
           {activeTab === "holdings" && (
@@ -3593,7 +3609,7 @@ export default function App(): JSX.Element {
                   </label>
                 </div>
                 <div className="table-scroll">
-                  <table className="data-table">
+                  <table className="data-table holdings-table">
                     <thead>
                       <tr>
                         <th>{t("Symbol", "代號")}</th>
@@ -3634,7 +3650,7 @@ export default function App(): JSX.Element {
                   <h3>{t("Closed Stocks", "已平倉股票")} ({displayedClosedStocks.length})</h3>
                 </div>
                 <div className="table-scroll">
-                  <table className="data-table">
+                  <table className="data-table holdings-table">
                     <thead>
                       <tr>
                         <th>{t("Symbol", "代號")}</th>

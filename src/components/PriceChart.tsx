@@ -1,4 +1,4 @@
-import { MouseEvent, useMemo, useRef, useState } from "react";
+import { MouseEvent, useId, useMemo, useRef, useState } from "react";
 import { PricePoint, ProfitPoint } from "../types";
 
 export interface PriceChartTradeMarker {
@@ -66,6 +66,7 @@ export default function PriceChart({
   profitFormatter = formatProfitFallback,
 }: PriceChartProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null);
+  const gradientId = useId();
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number; lines: string[] } | null>(null);
   const width = 900;
@@ -103,6 +104,7 @@ export default function PriceChart({
     ...normalizedProfit.map((item) => item.date.getTime()),
     ...normalizedTrades.map((item) => item.date.getTime()),
   ];
+  const totalTimelineCount = Math.max(2, normalized.length || normalizedProfit.length);
   const minDate = Math.min(...allTimelinePoints);
   const maxDate = Math.max(...allTimelinePoints);
   const xRange = Math.max(1, maxDate - minDate);
@@ -266,13 +268,13 @@ export default function PriceChart({
         onMouseMove={updateHoverFromXAxis}
       >
         <defs>
-          <linearGradient id="valuationAreaGradient" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="rgba(59, 130, 246, 0.32)" />
             <stop offset="100%" stopColor="rgba(59, 130, 246, 0.04)" />
           </linearGradient>
         </defs>
 
-        {projectedPrice.length > 1 && <path d={areaPath} fill="url(#valuationAreaGradient)" />}
+        {projectedPrice.length > 1 && <path d={areaPath} fill={`url(#${gradientId})`} />}
         {projectedPrice.length > 1 && (
           <path d={linePath} fill="none" stroke="#3b82f6" strokeWidth="2.8" strokeLinecap="round" />
         )}
@@ -325,9 +327,9 @@ export default function PriceChart({
           </g>
         ))}
 
-        {buildTickIndexes(Math.max(2, normalized.length || normalizedProfit.length)).map((index, tickIndex, tickArray) => {
-          const tickRate = tickArray.length > 1 ? index / (tickArray.length - 1) : 0;
-          const tickDate = new Date(minDate + xRange * tickRate);
+        {buildTickIndexes(totalTimelineCount).map((index, tickIndex) => {
+          const tickRate = totalTimelineCount > 1 ? index / Math.max(1, totalTimelineCount - 1) : 0;
+          const tickDate = new Date(minDate + xRange * Math.max(0, Math.min(1, tickRate)));
           const x = mapXByDate(tickDate);
           return (
             <g key={`tick-${tickIndex}`}>
