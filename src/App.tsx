@@ -1,4 +1,7 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
+import { doc, getDoc, onSnapshot, runTransaction, serverTimestamp } from "firebase/firestore";
+import { deflate, inflate } from "pako";
 import AreaChart from "./components/AreaChart";
 import BarChart from "./components/BarChart";
 import HeatmapGrid from "./components/HeatmapGrid";
@@ -7,6 +10,7 @@ import PieChart from "./components/PieChart";
 import PortfolioOverviewChart, { type PortfolioOverviewMetric } from "./components/PortfolioOverviewChart";
 import PriceChart, { PriceChartTradeMarker } from "./components/PriceChart";
 import {
+  type CalculationConversionOptions,
   ChartRangePreset,
   type ChartSlice,
   calculateAssetAllocationSegments,
@@ -17,8 +21,11 @@ import {
   calculateDrawdownSeries,
   calculateInsightMetrics,
   calculateMonthlyCashFlowSeries,
+  calculateMonthlyFeeSeries,
+  calculateMonthlyBuySeries,
+  calculateMonthlyProfitSeries,
   calculateMonthlyDividendSeries,
-  calculateMonthlyTransactionCountSeries,
+  calculateMonthlySellSeries,
   calculateNormalizedCompareSeries,
   calculatePortfolioSummary,
   calculatePortfolioProfitSeries,
@@ -26,10 +33,10 @@ import {
   calculateSeriesForStock,
   calculateStockBreakdown,
   calculateTransactionHeatmap,
-  calculateTransactionTypeSeries,
   getStockDateBounds,
 } from "./lib/calculations";
 import { buildDualFormatRecords, normalizeAiPayloadToEntities, parseInputByType } from "./lib/formatParser";
+import { firebaseAuth, firebaseDatabaseCollection, firestoreDb, googleProvider } from "./lib/firebaseClient";
 import { fetchLocalStockData, normalizePortfolioWithAi } from "./lib/localFunctionApi";
 import stockerWordmark from "./assets/stocker-wordmark.png";
 import { EntityDataset, NormalizedTransaction, PricePoint, ProfitPoint, TxType, UserType } from "./types";
@@ -38,15 +45,23 @@ type Screen = "choose" | "upload" | "dashboard";
 type DashboardTab = "dashboard" | "analysis" | "holdings" | "transactions" | "data" | "settings";
 type DateFilterPreset = "all" | "today" | "week" | "month" | "year" | "custom";
 type Locale = "en" | "zh-HK";
-type PortfolioLineId =
-  | "cashBalance"
-  | "stockMarketValue"
-  | "totalMarketValue"
-  | "totalProfit"
-  | "totalReturnPct"
-  | "totalCost";
+type PortfolioLineId = "totalMarketValue" | "totalProfit" | "totalReturnPct";
 
 type TransactionTypeFilter = "all" | TxType;
+type TransactionDistrict =
+  | "US"
+  | "HK"
+  | "CRYPTO"
+  | "TW"
+  | "TWO"
+  | "SZ"
+  | "JP"
+  | "CN"
+  | "UK"
+  | "CA"
+  | "AU"
+  | "SG"
+  | "OTHER";
 
 interface TransactionRow extends NormalizedTransaction {
   portfolioId: string;
@@ -58,18 +73,13 @@ interface TransactionDraft {
   portfolioId: string;
   date: string;
   type: TxType;
+  district: TransactionDistrict;
   symbol: string;
   shares: string;
   price: string;
   fee: string;
   currency: string;
   note: string;
-}
-
-interface HeaderStockSearchItem {
-  id: string;
-  symbol: string;
-  currency: string;
 }
 
 interface WebSettings {
@@ -125,7 +135,9 @@ interface ImportPortfolioOptions {
 
 const STORAGE_KEY = "stocker-web-v2";
 const SETTINGS_STORAGE_KEY = "stocker-web-settings-v1";
-const STOCK_QUOTE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const BETA_CONSENT_STORAGE_KEY = "stocker-web-beta-consent-v1";
+const STOCK_QUOTE_MIN_REQUEST_GAP_MS = 60 * 1000;
+const ENABLE_SYNC_TRACE = Boolean(import.meta.env.DEV);
 const MONTHLY_UPLOAD_LIMIT = 20;
 const UPLOAD_QUOTA_STORAGE_KEY = "stocker-web-upload-quota-v1";
 const STOCK_PRICE_TRANSACTION_TYPES = new Set<TxType>([
@@ -198,6 +210,25 @@ function detectDefaultLocale(): Locale {
   return "en";
 }
 
+function syncTrace(event: string, payload?: Record<string, unknown>): void {
+  if (!ENABLE_SYNC_TRACE) {
+    return;
+  }
+  const stamp = new Date().toISOString();
+  if (payload) {
+    console.info(`[SYNC_TRACE] ${stamp} ${event}`, payload);
+    try {
+      const serialized = JSON.stringify(payload);
+      const limited = serialized.length > 4000 ? `${serialized.slice(0, 4000)}...` : serialized;
+      console.info(`[SYNC_TRACE_JSON] ${stamp} ${event} ${limited}`);
+    } catch {
+      // Ignore payload serialization errors in debug logging.
+    }
+    return;
+  }
+  console.info(`[SYNC_TRACE] ${stamp} ${event}`);
+}
+
 const DEFAULT_SETTINGS: WebSettings = {
   language: detectDefaultLocale(),
   showObscure: false,
@@ -233,10 +264,9 @@ const TIME_RANGE_OPTIONS: { value: ChartRangePreset; label: string }[] = [
 ];
 
 const PORTFOLIO_LINE_OPTIONS: { value: PortfolioLineId; label: string; labelZh: string; color: string }[] = [
-  { value: "stockMarketValue", label: "Stock Market Value", labelZh: "股票市值", color: "#3B82F6" },
-  { value: "totalMarketValue", label: "Total Market Value", labelZh: "總市值", color: "#14B8A6" },
-  { value: "totalProfit", label: "Profit", labelZh: "收益", color: "#22A06B" },
-  { value: "totalReturnPct", label: "Return %", labelZh: "收益率", color: "#F59E0B" },
+  { value: "totalMarketValue", label: "Market Value", labelZh: "市值", color: "#14B8A6" },
+  { value: "totalProfit", label: "Profit", labelZh: "收益", color: "#7C3AED" },
+  { value: "totalReturnPct", label: "Profit %", labelZh: "收益率", color: "#F59E0B" },
 ];
 
 const TIME_RANGE_TITLES: Record<ChartRangePreset, string> = {
@@ -286,6 +316,46 @@ const TRANSACTION_TYPE_OPTIONS: { value: TransactionTypeFilter; label: string }[
   { value: "FEE", label: "FEE" },
   { value: "INTEREST", label: "INTEREST" },
 ];
+
+const TRANSACTION_DISTRICT_OPTIONS: {
+  value: TransactionDistrict;
+  label: string;
+  labelZh: string;
+  currency?: string;
+}[] = [
+  { value: "US", label: "US", labelZh: "美國", currency: "USD" },
+  { value: "HK", label: "HK", labelZh: "香港", currency: "HKD" },
+  { value: "CRYPTO", label: "Crypto", labelZh: "加密貨幣", currency: "USD" },
+  { value: "TW", label: "TW", labelZh: "台股", currency: "TWD" },
+  { value: "TWO", label: "TWO", labelZh: "台股上櫃", currency: "TWD" },
+  { value: "SG", label: "SG", labelZh: "新加坡", currency: "SGD" },
+  { value: "UK", label: "UK", labelZh: "英國", currency: "GBP" },
+  { value: "SZ", label: "SZ", labelZh: "深股", currency: "CNY" },
+  { value: "CN", label: "CN", labelZh: "中股", currency: "CNY" },
+  { value: "JP", label: "JP", labelZh: "日本", currency: "JPY" },
+  { value: "CA", label: "CA", labelZh: "加拿大", currency: "CAD" },
+  { value: "AU", label: "AU", labelZh: "澳洲", currency: "AUD" },
+  { value: "OTHER", label: "Others", labelZh: "其他" },
+];
+
+const ALLOWED_TRANSACTION_DISTRICTS = new Set<TransactionDistrict>(
+  TRANSACTION_DISTRICT_OPTIONS.map((option) => option.value),
+);
+
+const DISTRICT_CURRENCY_MAP: Record<Exclude<TransactionDistrict, "OTHER">, string> = {
+  US: "USD",
+  HK: "HKD",
+  CRYPTO: "USD",
+  TW: "TWD",
+  TWO: "TWD",
+  SZ: "CNY",
+  CN: "CNY",
+  JP: "JPY",
+  UK: "GBP",
+  CA: "CAD",
+  AU: "AUD",
+  SG: "SGD",
+};
 
 const PIE_SEGMENT_COLORS = [
   "#3367D6",
@@ -419,6 +489,73 @@ function normalizeCurrencyCode(code: string | undefined | null): string {
     .toUpperCase();
 }
 
+function normalizeTransactionDistrict(value: string | undefined | null): TransactionDistrict {
+  const normalized = String(value ?? "")
+    .trim()
+    .toUpperCase() as TransactionDistrict;
+  return ALLOWED_TRANSACTION_DISTRICTS.has(normalized) ? normalized : "OTHER";
+}
+
+function getAutoCurrencyByDistrict(district: TransactionDistrict): string | null {
+  const normalizedDistrict = normalizeTransactionDistrict(district);
+  if (normalizedDistrict === "OTHER") {
+    return null;
+  }
+  return DISTRICT_CURRENCY_MAP[normalizedDistrict] ?? null;
+}
+
+function inferDistrictFromCurrency(currency: string, symbol?: string): TransactionDistrict {
+  const upperSymbol = String(symbol ?? "")
+    .trim()
+    .toUpperCase();
+
+  if (upperSymbol.includes("-USD") || upperSymbol.includes("USDT") || upperSymbol.includes("BTC") || upperSymbol.includes("ETH")) {
+    return "CRYPTO";
+  }
+  if (upperSymbol.endsWith(".SZ")) {
+    return "SZ";
+  }
+  if (upperSymbol.endsWith(".SS") || upperSymbol.endsWith(".SH")) {
+    return "CN";
+  }
+  if (upperSymbol.endsWith(".TWO")) {
+    return "TWO";
+  }
+  if (upperSymbol.endsWith(".TW")) {
+    return "TW";
+  }
+
+  const normalized = normalizeCurrencyCode(currency);
+  if (normalized === "HKD") {
+    return "HK";
+  }
+  if (normalized === "TWD") {
+    return "TW";
+  }
+  if (normalized === "SGD") {
+    return "SG";
+  }
+  if (normalized === "GBP") {
+    return "UK";
+  }
+  if (normalized === "CNY" || normalized === "CNH") {
+    return "CN";
+  }
+  if (normalized === "JPY") {
+    return "JP";
+  }
+  if (normalized === "CAD") {
+    return "CA";
+  }
+  if (normalized === "AUD") {
+    return "AU";
+  }
+  if (normalized === "USD") {
+    return "US";
+  }
+  return "OTHER";
+}
+
 function isValidCurrencyCode(code: string): boolean {
   return /^[A-Z0-9]{2,8}$/.test(code);
 }
@@ -427,28 +564,85 @@ function buildFxPairSymbol(fromCurrency: string, toCurrency: string): string {
   return `${fromCurrency}${toCurrency}=X`;
 }
 
-function resolveFxRate(
-  quotePriceBySymbol: Record<string, number>,
+function resolveFxRateFromPairMap(
+  pairMap: Record<string, number>,
   fromCurrency: string,
   toCurrency: string,
 ): number | null {
-  if (fromCurrency === toCurrency) {
+  const from = normalizeCurrencyCode(fromCurrency) || "USD";
+  const to = normalizeCurrencyCode(toCurrency) || "USD";
+  if (from === to) {
     return 1;
   }
 
-  const directSymbol = buildFxPairSymbol(fromCurrency, toCurrency);
-  const directRate = quotePriceBySymbol[directSymbol];
-  if (typeof directRate === "number" && Number.isFinite(directRate) && directRate > 0) {
-    return directRate;
+  const direct = pairMap[`${from}->${to}`];
+  if (typeof direct === "number" && Number.isFinite(direct) && direct > 0) {
+    return direct;
   }
 
-  const inverseSymbol = buildFxPairSymbol(toCurrency, fromCurrency);
-  const inverseRate = quotePriceBySymbol[inverseSymbol];
-  if (typeof inverseRate === "number" && Number.isFinite(inverseRate) && inverseRate > 0) {
-    return 1 / inverseRate;
+  if (from === "USD" || to === "USD") {
+    return null;
+  }
+
+  const fromToUsd = pairMap[`${from}->USD`];
+  const usdToTarget = pairMap[`USD->${to}`];
+  if (
+    typeof fromToUsd === "number" &&
+    Number.isFinite(fromToUsd) &&
+    fromToUsd > 0 &&
+    typeof usdToTarget === "number" &&
+    Number.isFinite(usdToTarget) &&
+    usdToTarget > 0
+  ) {
+    return fromToUsd * usdToTarget;
   }
 
   return null;
+}
+
+function buildFxSymbolsForConversion(currencies: string[]): string[] {
+  const symbols = new Set<string>();
+
+  const addPairBothDirections = (from: string, to: string): void => {
+    if (!from || !to || from === to) {
+      return;
+    }
+    symbols.add(buildFxPairSymbol(from, to));
+    symbols.add(buildFxPairSymbol(to, from));
+  };
+
+  currencies.forEach((currency) => {
+    const normalized = normalizeCurrencyCode(currency);
+    if (!normalized || normalized === "USD") {
+      return;
+    }
+    addPairBothDirections(normalized, "USD");
+  });
+
+  return [...symbols];
+}
+
+function buildFxRatePairMapFromQuotePriceMap(quotePriceBySymbol: Record<string, number>): Record<string, number> {
+  const pairMap: Record<string, number> = {};
+  const fxSymbolPattern = /^([A-Z]{3})([A-Z]{3})=X$/;
+
+  Object.entries(quotePriceBySymbol).forEach(([symbol, rawRate]) => {
+    const match = symbol.match(fxSymbolPattern);
+    if (!match) {
+      return;
+    }
+    const rate = Number(rawRate);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return;
+    }
+
+    const from = match[1];
+    const to = match[2];
+    pairMap[`${from}->${to}`] = rate;
+    pairMap[`${to}->${from}`] = 1 / rate;
+  });
+
+  return pairMap;
 }
 
 function formatPercent(value: number): string {
@@ -530,6 +724,65 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...chunk);
   }
   return btoa(binary);
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+async function compressStringToDeflateBase64(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  // Keep zlib-compatible output (same as mobile app's Compression.compressString).
+  return bytesToBase64(deflate(bytes));
+}
+
+function decodeBase64ToString(base64: string): string {
+  const bytes = base64ToBytes(base64);
+  return new TextDecoder().decode(bytes);
+}
+
+async function parseRemoteDatabasePayload(rawData: string): Promise<EntityDataset[]> {
+  const text = rawData.trim();
+  if (!text) {
+    return [];
+  }
+
+  const decodeInflatedBase64 = async (): Promise<EntityDataset[]> => {
+    const compressed = base64ToBytes(text);
+    const inflated = inflate(compressed);
+    const decoded = new TextDecoder().decode(inflated);
+    try {
+      return await parseInputByType(decoded, "stockerpro");
+    } catch {
+      return deserializeEntities(decoded);
+    }
+  };
+
+  const parsers: Array<() => Promise<EntityDataset[]>> = [
+    () => parseInputByType(text, "stockerpro"),
+    () => parseInputByType(text, "stockerx"),
+    decodeInflatedBase64,
+    async () => deserializeEntities(text),
+    async () => deserializeEntities(decodeBase64ToString(text)),
+  ];
+
+  for (const parser of parsers) {
+    try {
+      const result = await parser();
+      if (result.length > 0) {
+        return result;
+      }
+    } catch {
+      // Try next parser strategy.
+    }
+  }
+
+  return [];
 }
 
 async function readFileContentForImport(file: File): Promise<string> {
@@ -633,6 +886,9 @@ function getTransactionNetCashFlow(tx: NormalizedTransaction): number {
   if (tx.type === "DIVIDEND_CASH") {
     return gross - tx.fee;
   }
+  if (tx.type === "DIVIDEND_SHARE") {
+    return -tx.fee;
+  }
   if (tx.type === "FEE") {
     return -(gross + tx.fee);
   }
@@ -649,6 +905,9 @@ function buildLatestPriceBySymbol(transactions: NormalizedTransaction[]): Record
   const latest = new Map<string, { date: number; price: number }>();
 
   for (const tx of transactions) {
+    if (tx.type !== "BUY" && tx.type !== "SELL") {
+      continue;
+    }
     if (!tx.symbol || tx.symbol === tx.currency || tx.price <= 0) {
       continue;
     }
@@ -692,6 +951,10 @@ function collectPortfolioStockSymbols(entities: EntityDataset[]): string[] {
   return [...symbols].sort((a, b) => a.localeCompare(b));
 }
 
+function isRateLimitMessage(message: string): boolean {
+  return /too many requests|retry after|rate limit|429/i.test(message);
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -723,21 +986,6 @@ function parseQuoteNumber(value: unknown): number | null {
   }
 
   return parseQuoteNumber(record.fmt);
-}
-
-function isOriginRestrictionErrorMessage(message: string): boolean {
-  return message.toLowerCase().includes("restricted to allowed stocker origins");
-}
-
-function normalizeLocalApiErrorMessage(error: unknown, fallback: string): string {
-  const message = error instanceof Error ? error.message : fallback;
-  if (!message) {
-    return fallback;
-  }
-  if (isOriginRestrictionErrorMessage(message)) {
-    return "";
-  }
-  return message;
 }
 
 function extractYahooQuotePriceMap(payload: unknown): Record<string, number> {
@@ -830,6 +1078,32 @@ function extractYahooChartPriceSeries(payload: unknown): PricePoint[] {
   return points.sort((a, b) => a.date.getTime() - b.date.getTime());
 }
 
+function extractYahooChartPriceSeriesBatch(payload: unknown): Record<string, PricePoint[]> {
+  const payloadRecord = asRecord(payload);
+  const source = payloadRecord?.data ?? payload;
+  const sourceRecord = asRecord(source);
+  const batchRecord = asRecord(
+    sourceRecord?.chartBatch ?? sourceRecord?.batch ?? sourceRecord?.charts,
+  );
+
+  if (!batchRecord) {
+    return {};
+  }
+
+  const result: Record<string, PricePoint[]> = {};
+  Object.entries(batchRecord).forEach(([symbolRaw, chartPayload]) => {
+    const symbol = symbolRaw.trim().toUpperCase();
+    if (!symbol) {
+      return;
+    }
+    const points = extractYahooChartPriceSeries(chartPayload);
+    if (points.length > 0) {
+      result[symbol] = points;
+    }
+  });
+  return result;
+}
+
 function resolveYahooChartRequest(preset: ChartRangePreset): { range: string; interval: string } {
   if (preset === "1W") {
     return { range: "7d", interval: "15m" };
@@ -920,9 +1194,12 @@ function calculateProfitSeriesFromPriceSeries(
     ) {
       const tx = sortedTransactions[txIndex];
 
-      if (tx.type === "BUY" || tx.type === "DIVIDEND_SHARE") {
+      if (tx.type === "BUY") {
         state.purchasedShares += tx.shares;
         state.purchaseTotal += tx.shares * tx.price;
+        state.fees += tx.fee;
+      } else if (tx.type === "DIVIDEND_SHARE") {
+        state.purchasedShares += tx.shares;
         state.fees += tx.fee;
       } else if (tx.type === "SELL") {
         state.soldShares += tx.shares;
@@ -1026,6 +1303,27 @@ function serializeEntities(entities: EntityDataset[]): string {
   );
 }
 
+function serializeEntitiesForCloudSync(entities: EntityDataset[]): string {
+  return JSON.stringify(
+    entities.map((entity) => ({
+      id: entity.id,
+      name: entity.name,
+      currency: entity.currency,
+      transactions: entity.transactions.map((tx) => ({
+        id: tx.id,
+        date: tx.date.toISOString(),
+        symbol: tx.symbol,
+        type: tx.type,
+        shares: tx.shares,
+        price: tx.price,
+        fee: tx.fee,
+        currency: tx.currency,
+        note: tx.note ?? "",
+      })),
+    })),
+  );
+}
+
 function deserializeEntities(raw: string): EntityDataset[] {
   const parsed = JSON.parse(raw) as Array<Record<string, unknown>>;
   if (!Array.isArray(parsed)) {
@@ -1062,6 +1360,268 @@ function deserializeEntities(raw: string): EntityDataset[] {
         buildLatestPriceBySymbol(transactions),
     };
   });
+}
+
+function safeDeserializeEntities(raw: string): EntityDataset[] {
+  if (!raw.trim()) {
+    return [];
+  }
+  try {
+    return deserializeEntities(raw);
+  } catch {
+    return [];
+  }
+}
+
+function normalizeTransactionForSync(
+  tx: NormalizedTransaction,
+  fallbackId: string,
+): NormalizedTransaction {
+  const txDate = Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date();
+  return {
+    ...tx,
+    id: (tx.id || fallbackId).trim() || fallbackId,
+    date: txDate,
+    symbol: tx.symbol.trim().toUpperCase(),
+    currency: tx.currency.trim().toUpperCase(),
+    note: tx.note ?? "",
+  };
+}
+
+function normalizeEntityForSync(entity: EntityDataset, index: number): EntityDataset {
+  const normalizedTransactions = sortTransactionsByDateAsc(
+    entity.transactions
+      .map((tx, txIndex) =>
+        normalizeTransactionForSync(tx, `tx-${entity.id || index}-${txIndex}`),
+      )
+      .filter((tx) => tx.symbol),
+  );
+
+  return {
+    id: entity.id || `portfolio-${index + 1}`,
+    name: entity.name.trim() || `Portfolio ${index + 1}`,
+    currency: normalizeCurrencyCode(entity.currency) || "USD",
+    transactions: normalizedTransactions,
+    latestPriceBySymbol: buildLatestPriceBySymbol(normalizedTransactions),
+  };
+}
+
+function transactionSnapshot(tx: NormalizedTransaction): string {
+  return [
+    tx.date.getTime(),
+    tx.type,
+    tx.symbol,
+    tx.currency,
+    tx.shares,
+    tx.price,
+    tx.fee,
+    tx.note ?? "",
+  ].join("|");
+}
+
+function mergeTransactionsByThreeWay(
+  baseTransactions: NormalizedTransaction[],
+  localTransactions: NormalizedTransaction[],
+  remoteTransactions: NormalizedTransaction[],
+): NormalizedTransaction[] {
+  const byId = (rows: NormalizedTransaction[]): Map<string, NormalizedTransaction> => {
+    const map = new Map<string, NormalizedTransaction>();
+    rows.forEach((row) => {
+      map.set(row.id, row);
+    });
+    return map;
+  };
+
+  const baseMap = byId(baseTransactions);
+  const localMap = byId(localTransactions);
+  const remoteMap = byId(remoteTransactions);
+  const allIds = new Set<string>([
+    ...baseMap.keys(),
+    ...localMap.keys(),
+    ...remoteMap.keys(),
+  ]);
+  const mergedMap = new Map<string, NormalizedTransaction>();
+
+  allIds.forEach((txId) => {
+    const baseTx = baseMap.get(txId);
+    const localTx = localMap.get(txId);
+    const remoteTx = remoteMap.get(txId);
+
+    // New transaction from either side (not present in base): keep whichever exists.
+    if (!baseTx) {
+      if (localTx && remoteTx) {
+        // Same ID added on both sides: choose the newer timestamp snapshot.
+        mergedMap.set(
+          txId,
+          localTx.date.getTime() >= remoteTx.date.getTime() ? localTx : remoteTx,
+        );
+      } else if (localTx) {
+        mergedMap.set(txId, localTx);
+      } else if (remoteTx) {
+        mergedMap.set(txId, remoteTx);
+      }
+      return;
+    }
+
+    const baseSnapshot = transactionSnapshot(baseTx);
+    const localSnapshot = localTx ? transactionSnapshot(localTx) : null;
+    const remoteSnapshot = remoteTx ? transactionSnapshot(remoteTx) : null;
+
+    const localTouched = localTx ? localSnapshot !== baseSnapshot : true;
+    const remoteTouched = remoteTx ? remoteSnapshot !== baseSnapshot : true;
+
+    if (!localTouched && !remoteTouched) {
+      mergedMap.set(txId, localTx ?? remoteTx ?? baseTx);
+      return;
+    }
+
+    if (localTouched && !remoteTouched) {
+      if (localTx) {
+        mergedMap.set(txId, localTx);
+      }
+      return;
+    }
+
+    if (!localTouched && remoteTouched) {
+      // Data-loss guard: when remote is missing this tx but local is still unchanged from base,
+      // keep the local/base copy to prevent accidental disappearance from stale overwrites.
+      if (!remoteTx) {
+        mergedMap.set(txId, localTx ?? baseTx);
+      } else {
+        mergedMap.set(txId, remoteTx);
+      }
+      return;
+    }
+
+    // Both sides touched.
+    if (!localTx && !remoteTx) {
+      return;
+    }
+    if (!localTx && remoteTx) {
+      mergedMap.set(txId, remoteTx);
+      return;
+    }
+    if (localTx && !remoteTx) {
+      mergedMap.set(txId, localTx);
+      return;
+    }
+
+    // Both changed and both exist: if different, prefer newer tx timestamp.
+    const resolvedLocalTx = localTx as NormalizedTransaction;
+    const resolvedRemoteTx = remoteTx as NormalizedTransaction;
+    if (localSnapshot === remoteSnapshot) {
+      mergedMap.set(txId, resolvedLocalTx);
+      return;
+    }
+    mergedMap.set(
+      txId,
+      resolvedLocalTx.date.getTime() >= resolvedRemoteTx.date.getTime()
+        ? resolvedLocalTx
+        : resolvedRemoteTx,
+    );
+  });
+
+  return sortTransactionsByDateAsc([...mergedMap.values()]);
+}
+
+function mergeEntitiesByThreeWay(
+  baseEntitiesRaw: EntityDataset[],
+  localEntitiesRaw: EntityDataset[],
+  remoteEntitiesRaw: EntityDataset[],
+): EntityDataset[] {
+  const baseEntities = baseEntitiesRaw.map((entity, index) =>
+    normalizeEntityForSync(entity, index),
+  );
+  const localEntities = localEntitiesRaw.map((entity, index) =>
+    normalizeEntityForSync(entity, index),
+  );
+  const remoteEntities = remoteEntitiesRaw.map((entity, index) =>
+    normalizeEntityForSync(entity, index),
+  );
+
+  const mapById = (rows: EntityDataset[]): Map<string, EntityDataset> => {
+    const map = new Map<string, EntityDataset>();
+    rows.forEach((row) => {
+      map.set(row.id, row);
+    });
+    return map;
+  };
+
+  const baseMap = mapById(baseEntities);
+  const localMap = mapById(localEntities);
+  const mergedMap = mapById(remoteEntities);
+
+  // Apply local portfolio add/update operations over remote.
+  localMap.forEach((localEntity, portfolioId) => {
+    const baseEntity = baseMap.get(portfolioId);
+    const remoteEntity = mergedMap.get(portfolioId);
+
+    if (!baseEntity) {
+      mergedMap.set(portfolioId, localEntity);
+      return;
+    }
+
+    const mergedTransactions = mergeTransactionsByThreeWay(
+      baseEntity.transactions,
+      localEntity.transactions,
+      remoteEntity?.transactions ?? [],
+    );
+
+    const name =
+      baseEntity.name !== localEntity.name
+        ? localEntity.name
+        : (remoteEntity?.name ?? localEntity.name);
+    const currency =
+      baseEntity.currency !== localEntity.currency
+        ? localEntity.currency
+        : (remoteEntity?.currency ?? localEntity.currency);
+
+    mergedMap.set(portfolioId, {
+      id: portfolioId,
+      name,
+      currency,
+      transactions: mergedTransactions,
+      latestPriceBySymbol: buildLatestPriceBySymbol(mergedTransactions),
+    });
+  });
+
+  // Apply local portfolio deletions relative to the base snapshot.
+  baseMap.forEach((_, portfolioId) => {
+    if (!localMap.has(portfolioId)) {
+      mergedMap.delete(portfolioId);
+    }
+  });
+
+  const orderedIds: string[] = [];
+  localEntities.forEach((entity) => {
+    if (!orderedIds.includes(entity.id)) {
+      orderedIds.push(entity.id);
+    }
+  });
+  remoteEntities.forEach((entity) => {
+    if (!orderedIds.includes(entity.id)) {
+      orderedIds.push(entity.id);
+    }
+  });
+
+  return orderedIds
+    .map((id) => mergedMap.get(id))
+    .filter((entity): entity is EntityDataset => Boolean(entity))
+    .map((entity, index) => normalizeEntityForSync(entity, index));
+}
+
+function buildSyncSummary(entities: EntityDataset[]): Record<string, unknown> {
+  const txCount = entities.reduce((total, entity) => total + entity.transactions.length, 0);
+  const latestTxMs = entities
+    .flatMap((entity) => entity.transactions.map((tx) => tx.date.getTime()))
+    .filter((ms) => Number.isFinite(ms))
+    .reduce((max, ms) => (ms > max ? ms : max), 0);
+  return {
+    portfolios: entities.length,
+    transactions: txCount,
+    latestTxAt:
+      latestTxMs > 0 ? new Date(latestTxMs).toISOString() : null,
+  };
 }
 
 function cloneEntitiesForReview(entities: EntityDataset[]): EntityDataset[] {
@@ -1122,16 +1682,19 @@ function normalizeReviewEntities(entities: EntityDataset[]): EntityDataset[] {
 }
 
 function buildDefaultDraft(portfolioId: string, currency: string): TransactionDraft {
+  const normalizedCurrency = normalizeCurrencyCode(currency) || "USD";
+  const district = inferDistrictFromCurrency(normalizedCurrency);
   return {
     id: `tx-${Date.now()}`,
     portfolioId,
     date: toDateInputValue(new Date()),
     type: "BUY",
+    district,
     symbol: "",
     shares: "0",
     price: "0",
     fee: "0",
-    currency,
+    currency: normalizedCurrency,
     note: "",
   };
 }
@@ -1146,8 +1709,8 @@ export default function App(): JSX.Element {
   const [selectedRange, setSelectedRange] = useState<ChartRangePreset>("1Y");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
-  const [selectedPortfolioLineIds, setSelectedPortfolioLineIds] = useState<PortfolioLineId[]>(
-    () => PORTFOLIO_LINE_OPTIONS.map((option) => option.value),
+  const [selectedPortfolioLineId, setSelectedPortfolioLineId] = useState<PortfolioLineId>(
+    "totalMarketValue",
   );
 
   const [txTypeFilter, setTxTypeFilter] = useState<TransactionTypeFilter>("all");
@@ -1167,7 +1730,6 @@ export default function App(): JSX.Element {
   const [pendingCashAmount, setPendingCashAmount] = useState("");
 
   const [menuOpen, setMenuOpen] = useState(false);
-  const [headerSearchKeyword, setHeaderSearchKeyword] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [importStatusMessage, setImportStatusMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1196,8 +1758,34 @@ export default function App(): JSX.Element {
   const [valuationLastUpdatedAt, setValuationLastUpdatedAt] = useState<Date | null>(null);
   const [valuationSeriesCache, setValuationSeriesCache] = useState<Record<string, PricePoint[]>>({});
   const [portfolioHistoryBySymbol, setPortfolioHistoryBySymbol] = useState<Record<string, PricePoint[]>>({});
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [isAuthLoading, setAuthLoading] = useState(true);
+  const [hasAcceptedBetaRisk, setHasAcceptedBetaRisk] = useState(false);
+  const [showBetaConsentModal, setShowBetaConsentModal] = useState(false);
+  const [betaConsentChecked, setBetaConsentChecked] = useState(false);
+  const [isCloudLoading, setCloudLoading] = useState(false);
+  const [isCloudSaving, setCloudSaving] = useState(false);
+  const [cloudStatusMessage, setCloudStatusMessage] = useState("");
+  const [cloudErrorMessage, setCloudErrorMessage] = useState("");
+  const [cloudLastSyncedAt, setCloudLastSyncedAt] = useState<Date | null>(null);
+  const [isCloudReady, setCloudReady] = useState(false);
   const quoteSyncInFlightRef = useRef(false);
-  const portfolioHistoryRequestSeqRef = useRef(0);
+  const quoteLastRequestedAtRef = useRef(0);
+  const quoteRetryTimeoutRef = useRef<number | null>(null);
+  const portfolioHistorySyncInFlightRef = useRef(false);
+  const portfolioHistoryLastRequestedAtRef = useRef(0);
+  const portfolioHistoryAutoRequestedRef = useRef(false);
+  const fxRenderPreviewTraceKeyRef = useRef("");
+  const cloudDocExistsRef = useRef(false);
+  const cloudHydratingRef = useRef(false);
+  const lastCloudSerializedRef = useRef("");
+  const latestCloudUpdatedAtMsRef = useRef(0);
+  const cloudPersistInFlightRef = useRef(false);
+  const cloudPersistQueueRef = useRef<{
+    user: User;
+    entities: EntityDataset[];
+    serialized: string;
+  } | null>(null);
 
   const isZh = settings.language === "zh-HK";
   const localeTag = isZh ? "zh-HK" : "en-US";
@@ -1207,7 +1795,449 @@ export default function App(): JSX.Element {
   const dateFilterLabel = (preset: DateFilterPreset, fallback: string): string =>
     isZh ? DATE_FILTER_LABELS_ZH[preset] : fallback;
 
+  const persistCloudData = useCallback(
+    async (
+      signedInUser: User,
+      localEntities: EntityDataset[],
+      serializedEntities: string,
+    ): Promise<void> => {
+      if (!serializedEntities.trim()) {
+        return;
+      }
+
+      setCloudSaving(true);
+      setCloudErrorMessage("");
+      syncTrace("persist:start", {
+        uid: signedInUser.uid,
+        ...buildSyncSummary(localEntities),
+      });
+      try {
+        const docRef = doc(firestoreDb, firebaseDatabaseCollection, signedInUser.uid);
+        const baseEntities = safeDeserializeEntities(lastCloudSerializedRef.current);
+        syncTrace("persist:base", buildSyncSummary(baseEntities));
+
+        const result = await runTransaction(
+          firestoreDb,
+          async (transaction): Promise<{
+            mergedEntities: EntityDataset[];
+            mergedSerialized: string;
+          }> => {
+            const snapshot = await transaction.get(docRef);
+            const snapshotData = snapshot.data() as Record<string, unknown> | undefined;
+            const remoteDataValue = snapshotData?.data;
+            const remoteRaw =
+              typeof remoteDataValue === "string"
+                ? remoteDataValue
+                : remoteDataValue
+                  ? JSON.stringify(remoteDataValue)
+                  : "";
+
+            const remoteEntities = snapshot.exists()
+              ? await parseRemoteDatabasePayload(remoteRaw)
+              : [];
+            syncTrace("persist:remote", {
+              exists: snapshot.exists(),
+              ...buildSyncSummary(remoteEntities),
+            });
+            const mergedEntities = mergeEntitiesByThreeWay(
+              baseEntities,
+              localEntities,
+              remoteEntities,
+            );
+            const mergedSerialized = serializeEntitiesForCloudSync(mergedEntities);
+            syncTrace("persist:merged", buildSyncSummary(mergedEntities));
+            const { stockerProJson } = buildDualFormatRecords(mergedEntities);
+            const compressed = await compressStringToDeflateBase64(stockerProJson);
+            const payload: Record<string, unknown> = {
+              data: compressed,
+              updatedAt: serverTimestamp(),
+            };
+            if (!snapshot.exists()) {
+              payload.createdAt = serverTimestamp();
+            }
+            transaction.set(docRef, payload, { merge: true });
+
+            return {
+              mergedEntities,
+              mergedSerialized,
+            };
+          },
+        );
+
+        cloudDocExistsRef.current = true;
+        lastCloudSerializedRef.current = result.mergedSerialized;
+
+        if (result.mergedSerialized !== serializedEntities) {
+          syncTrace("persist:local-reconciled", buildSyncSummary(result.mergedEntities));
+          setEntities(result.mergedEntities);
+        }
+
+        const syncedAt = new Date();
+        setCloudLastSyncedAt(syncedAt);
+        setCloudStatusMessage(
+          t(
+            "Cloud synced.",
+            "雲端已同步。",
+          ),
+        );
+        syncTrace("persist:done", {
+          uid: signedInUser.uid,
+          syncedAt: syncedAt.toISOString(),
+        });
+      } catch (error) {
+        syncTrace("persist:error", {
+          uid: signedInUser.uid,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        setCloudErrorMessage(
+          error instanceof Error
+            ? error.message
+            : t("Cloud sync failed.", "雲端同步失敗。"),
+        );
+      } finally {
+        setCloudSaving(false);
+      }
+    },
+    [t],
+  );
+
+  const loadCloudData = useCallback(
+    async (signedInUser: User): Promise<void> => {
+      setCloudLoading(true);
+      setCloudReady(false);
+      setCloudErrorMessage("");
+      setCloudStatusMessage(t("Cloud sync ready.", "雲端同步已準備。"));
+      cloudHydratingRef.current = true;
+      let readyForSync = true;
+
+      try {
+        const docRef = doc(firestoreDb, firebaseDatabaseCollection, signedInUser.uid);
+        const snapshot = await getDoc(docRef);
+
+        if (!snapshot.exists()) {
+          cloudDocExistsRef.current = false;
+          setEntities([]);
+          setSelectedPortfolioId("all");
+          setSelectedStockId("");
+          setSelectedStockDetailId(null);
+          setScreen("choose");
+          setUserType(null);
+          setCloudStatusMessage(t("No cloud data yet. Your next changes will create it.", "雲端暫時冇資料，你下一次更改會建立。"));
+          setCloudReady(true);
+          return;
+        }
+
+        cloudDocExistsRef.current = true;
+        const snapshotData = snapshot.data() as Record<string, unknown>;
+        const remoteDataValue = snapshotData.data;
+        const remoteRaw =
+          typeof remoteDataValue === "string"
+            ? remoteDataValue
+            : remoteDataValue
+              ? JSON.stringify(remoteDataValue)
+              : "";
+
+        const parsedEntities = await parseRemoteDatabasePayload(remoteRaw);
+        if (parsedEntities.length > 0) {
+          setEntities(parsedEntities);
+          setSelectedPortfolioId("all");
+          setSelectedStockId("");
+          setSelectedStockDetailId(null);
+          setSelectedRange("1Y");
+          setUserType("stockerpro");
+          setScreen("dashboard");
+          setSettings((previous) => {
+            if (normalizeCurrencyCode(previous.displayCurrency) !== "AUTO") {
+              return previous;
+            }
+            const preferred = normalizeCurrencyCode(parsedEntities[0]?.currency);
+            if (!preferred || preferred === "AUTO") {
+              return previous;
+            }
+            return {
+              ...previous,
+              displayCurrency: preferred,
+            };
+          });
+          lastCloudSerializedRef.current = serializeEntitiesForCloudSync(parsedEntities);
+          setCloudStatusMessage(t("Cloud portfolio loaded.", "已載入雲端投資組合。"));
+        } else {
+          setEntities([]);
+          setSelectedPortfolioId("all");
+          setSelectedStockId("");
+          setSelectedStockDetailId(null);
+          setScreen("choose");
+          setUserType(null);
+          setCloudErrorMessage(
+            t(
+              "Cloud data exists but cannot be parsed. You can import manually and overwrite.",
+              "雲端資料存在但未能解析，你可先手動匯入再覆蓋。",
+            ),
+          );
+          readyForSync = false;
+        }
+
+        const updatedAt = snapshotData.updatedAt as { toDate?: () => Date } | undefined;
+        if (updatedAt && typeof updatedAt.toDate === "function") {
+          const updatedAtDate = updatedAt.toDate();
+          setCloudLastSyncedAt(updatedAtDate);
+          latestCloudUpdatedAtMsRef.current = Math.max(
+            latestCloudUpdatedAtMsRef.current,
+            updatedAtDate.getTime(),
+          );
+        }
+      } catch (error) {
+        setCloudErrorMessage(
+          error instanceof Error
+            ? error.message
+            : t("Failed to load cloud data.", "載入雲端資料失敗。"),
+        );
+      } finally {
+        cloudHydratingRef.current = false;
+        setCloudReady(readyForSync);
+        setCloudLoading(false);
+      }
+    },
+    [t],
+  );
+
+  const onGoogleSignIn = useCallback(async (): Promise<void> => {
+    setCloudErrorMessage("");
+    try {
+      await signInWithPopup(firebaseAuth, googleProvider);
+    } catch (error) {
+      setCloudErrorMessage(
+        error instanceof Error
+          ? error.message
+          : t("Google sign-in failed.", "Google 登入失敗。"),
+      );
+    }
+  }, [t]);
+
+  const drainCloudPersistQueue = useCallback(async (): Promise<void> => {
+    if (cloudPersistInFlightRef.current) {
+      return;
+    }
+
+    while (cloudPersistQueueRef.current) {
+      const nextPayload = cloudPersistQueueRef.current;
+      cloudPersistQueueRef.current = null;
+      cloudPersistInFlightRef.current = true;
+
+      try {
+        syncTrace("persist:flush", buildSyncSummary(nextPayload.entities));
+        await persistCloudData(
+          nextPayload.user,
+          nextPayload.entities,
+          nextPayload.serialized,
+        );
+      } finally {
+        cloudPersistInFlightRef.current = false;
+      }
+    }
+  }, [persistCloudData]);
+
+  const openLoginFlow = (): void => {
+    if (hasAcceptedBetaRisk) {
+      void onGoogleSignIn();
+      return;
+    }
+    setBetaConsentChecked(false);
+    setShowBetaConsentModal(true);
+  };
+
+  const confirmBetaRiskAndSignIn = (): void => {
+    if (!betaConsentChecked) {
+      return;
+    }
+    localStorage.setItem(BETA_CONSENT_STORAGE_KEY, "1");
+    setHasAcceptedBetaRisk(true);
+    setShowBetaConsentModal(false);
+    void onGoogleSignIn();
+  };
+
+  const onSignOut = useCallback(async (): Promise<void> => {
+    try {
+      await signOut(firebaseAuth);
+      setEntities([]);
+      setSelectedPortfolioId("all");
+      setSelectedStockId("");
+      setSelectedStockDetailId(null);
+      setScreen("choose");
+      setUserType(null);
+      setImportStatusMessage("");
+      setCloudStatusMessage(t("Signed out.", "已登出。"));
+      localStorage.removeItem(STORAGE_KEY);
+      lastCloudSerializedRef.current = "";
+      cloudDocExistsRef.current = false;
+      latestCloudUpdatedAtMsRef.current = 0;
+      setCloudReady(false);
+    } catch (error) {
+      setCloudErrorMessage(
+        error instanceof Error
+          ? error.message
+          : t("Sign out failed.", "登出失敗。"),
+      );
+    }
+  }, [t]);
+
   useEffect(() => {
+    const unsubscribe = onAuthStateChanged(firebaseAuth, (nextUser) => {
+      setAuthUser(nextUser);
+      setAuthLoading(false);
+
+      if (!nextUser) {
+        setCloudReady(false);
+        setCloudLoading(false);
+        setCloudSaving(false);
+        setCloudStatusMessage("");
+        setCloudLastSyncedAt(null);
+        cloudDocExistsRef.current = false;
+        latestCloudUpdatedAtMsRef.current = 0;
+        return;
+      }
+
+      void loadCloudData(nextUser);
+    });
+
+    return () => unsubscribe();
+  }, [loadCloudData]);
+
+  useEffect(() => {
+    if (!authUser || isAuthLoading || !isCloudReady) {
+      return;
+    }
+
+    const docRef = doc(firestoreDb, firebaseDatabaseCollection, authUser.uid);
+    const unsubscribe = onSnapshot(
+      docRef,
+      (snapshot) => {
+        void (async () => {
+          syncTrace("snapshot:received", {
+            uid: authUser.uid,
+            exists: snapshot.exists(),
+          });
+          if (!snapshot.exists()) {
+            cloudDocExistsRef.current = false;
+            return;
+          }
+
+          cloudDocExistsRef.current = true;
+          const snapshotData = snapshot.data() as Record<string, unknown>;
+          const updatedAt = snapshotData.updatedAt as { toDate?: () => Date } | undefined;
+          if (!updatedAt || typeof updatedAt.toDate !== "function") {
+            return;
+          }
+          const snapshotUpdatedAt = updatedAt.toDate();
+          const snapshotUpdatedAtMs = snapshotUpdatedAt.getTime();
+          if (snapshotUpdatedAtMs <= latestCloudUpdatedAtMsRef.current) {
+            syncTrace("snapshot:ignored-old", {
+              uid: authUser.uid,
+              snapshotUpdatedAt: snapshotUpdatedAt.toISOString(),
+              latestKnownUpdatedAt:
+                latestCloudUpdatedAtMsRef.current > 0
+                  ? new Date(latestCloudUpdatedAtMsRef.current).toISOString()
+                  : null,
+            });
+            return;
+          }
+
+          latestCloudUpdatedAtMsRef.current = snapshotUpdatedAtMs;
+          const remoteDataValue = snapshotData.data;
+          const remoteRaw =
+            typeof remoteDataValue === "string"
+              ? remoteDataValue
+              : remoteDataValue
+                ? JSON.stringify(remoteDataValue)
+                : "";
+
+          const remoteEntities = await parseRemoteDatabasePayload(remoteRaw);
+          if (remoteEntities.length === 0) {
+            syncTrace("snapshot:empty-remote", { uid: authUser.uid });
+            return;
+          }
+          syncTrace("snapshot:remote", {
+            uid: authUser.uid,
+            updatedAt: snapshotUpdatedAt.toISOString(),
+            ...buildSyncSummary(remoteEntities),
+          });
+
+          const remoteSerialized = serializeEntitiesForCloudSync(remoteEntities);
+          if (!remoteSerialized.trim()) {
+            syncTrace("snapshot:empty-serialized", { uid: authUser.uid });
+            return;
+          }
+
+          const baseSerialized = lastCloudSerializedRef.current;
+          const baseEntities = safeDeserializeEntities(baseSerialized);
+
+          // Keep base as actual cloud snapshot so any pending local edits still flush afterward.
+          lastCloudSerializedRef.current = remoteSerialized;
+
+          if (screen !== "dashboard") {
+            const mergedEntities = mergeEntitiesByThreeWay(
+              baseEntities,
+              [],
+              remoteEntities,
+            );
+            syncTrace("snapshot:apply-non-dashboard", {
+              uid: authUser.uid,
+              ...buildSyncSummary(mergedEntities),
+            });
+            setEntities(mergedEntities);
+            setSelectedPortfolioId("all");
+            setSelectedStockId("");
+            setSelectedStockDetailId(null);
+            setUserType("stockerpro");
+            setScreen("dashboard");
+          } else {
+            setEntities((currentEntities) => {
+              const localSerialized = serializeEntitiesForCloudSync(currentEntities);
+              const mergedEntities = mergeEntitiesByThreeWay(
+                baseEntities,
+                currentEntities,
+                remoteEntities,
+              );
+              const mergedSerialized = serializeEntitiesForCloudSync(mergedEntities);
+              if (mergedSerialized === localSerialized) {
+                syncTrace("snapshot:no-change", { uid: authUser.uid });
+                return currentEntities;
+              }
+              syncTrace("snapshot:apply-dashboard", {
+                uid: authUser.uid,
+                local: buildSyncSummary(currentEntities),
+                merged: buildSyncSummary(mergedEntities),
+              });
+              return mergedEntities;
+            });
+          }
+
+          setCloudLastSyncedAt(snapshotUpdatedAt);
+        })();
+      },
+      (error) => {
+        syncTrace("snapshot:error", {
+          uid: authUser.uid,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        setCloudErrorMessage(
+          error instanceof Error
+            ? error.message
+            : t("Cloud realtime sync failed.", "雲端即時同步失敗。"),
+        );
+      },
+    );
+
+    return () => unsubscribe();
+  }, [authUser, isAuthLoading, isCloudReady, screen, t]);
+
+  useEffect(() => {
+    if (isAuthLoading) {
+      return;
+    }
+    if (authUser) {
+      return;
+    }
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (!stored) {
@@ -1222,7 +2252,7 @@ export default function App(): JSX.Element {
     } catch {
       // Ignore invalid local cache.
     }
-  }, []);
+  }, [authUser, isAuthLoading]);
 
   useEffect(() => {
     const loaded = loadWebSettings();
@@ -1233,6 +2263,11 @@ export default function App(): JSX.Element {
   useEffect(() => {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   }, [settings]);
+
+  useEffect(() => {
+    const accepted = localStorage.getItem(BETA_CONSENT_STORAGE_KEY) === "1";
+    setHasAcceptedBetaRisk(accepted);
+  }, []);
 
   useEffect(() => {
     if (screen !== "dashboard") {
@@ -1246,6 +2281,28 @@ export default function App(): JSX.Element {
     localStorage.setItem(STORAGE_KEY, serializeEntities(entities));
   }, [entities, screen]);
 
+  useEffect(() => {
+    if (!authUser || isAuthLoading || !isCloudReady || cloudHydratingRef.current) {
+      return;
+    }
+    if (screen !== "dashboard") {
+      return;
+    }
+
+    const serialized = serializeEntitiesForCloudSync(entities);
+    if (!serialized.trim() || serialized === lastCloudSerializedRef.current) {
+      return;
+    }
+
+    cloudPersistQueueRef.current = {
+      user: authUser,
+      entities,
+      serialized,
+    };
+    syncTrace("persist:queued", buildSyncSummary(entities));
+    void drainCloudPersistQueue();
+  }, [authUser, drainCloudPersistQueue, entities, isAuthLoading, isCloudReady, screen]);
+
   const filteredEntities = useMemo(() => {
     if (selectedPortfolioId === "all") {
       return entities;
@@ -1253,20 +2310,108 @@ export default function App(): JSX.Element {
     return entities.filter((entity) => entity.id === selectedPortfolioId);
   }, [entities, selectedPortfolioId]);
 
-  const portfolioSummary = useMemo(
-    () => calculatePortfolioSummary(filteredEntities),
-    [filteredEntities],
+  const normalizedDisplayCurrency = useMemo(() => {
+    const normalized = normalizeCurrencyCode(settings.displayCurrency);
+    return normalized || "AUTO";
+  }, [settings.displayCurrency]);
+
+  const convertAmountToDisplay = useCallback(
+    (value: number, sourceCurrency: string): number => {
+      const from = normalizeCurrencyCode(sourceCurrency) || "USD";
+      if (normalizedDisplayCurrency === "AUTO" || from === normalizedDisplayCurrency) {
+        return value;
+      }
+
+      const rate = resolveFxRateFromPairMap(fxRateByPair, from, normalizedDisplayCurrency);
+      if (rate && Number.isFinite(rate) && rate > 0) {
+        return value * rate;
+      }
+
+      return value;
+    },
+    [fxRateByPair, normalizedDisplayCurrency],
   );
+
+  const calculationConversion = useMemo<CalculationConversionOptions | undefined>(() => {
+    if (normalizedDisplayCurrency === "AUTO") {
+      return undefined;
+    }
+    return {
+      targetCurrency: normalizedDisplayCurrency,
+      convertAmount: convertAmountToDisplay,
+    };
+  }, [convertAmountToDisplay, normalizedDisplayCurrency]);
+
+  const portfolioOverviewCalculationOptions = useMemo<CalculationConversionOptions | undefined>(() => {
+    if (!calculationConversion && Object.keys(portfolioHistoryBySymbol).length === 0) {
+      return undefined;
+    }
+    return {
+      ...(calculationConversion ?? {}),
+      historicalPriceBySymbol: portfolioHistoryBySymbol,
+    };
+  }, [calculationConversion, portfolioHistoryBySymbol]);
+
+  const portfolioSummary = useMemo(
+    () => calculatePortfolioSummary(filteredEntities, portfolioOverviewCalculationOptions),
+    [filteredEntities, portfolioOverviewCalculationOptions],
+  );
+
+  useEffect(() => {
+    if (!ENABLE_SYNC_TRACE || normalizedDisplayCurrency === "AUTO") {
+      return;
+    }
+
+    const discoveredCurrencies = new Set<string>();
+    entities.forEach((entity) => {
+      discoveredCurrencies.add(normalizeCurrencyCode(entity.currency));
+      entity.transactions.forEach((tx) => discoveredCurrencies.add(normalizeCurrencyCode(tx.currency)));
+    });
+
+    const sample100ByCurrency: Record<string, number> = {};
+    [...discoveredCurrencies]
+      .filter((currency) => currency && currency !== normalizedDisplayCurrency)
+      .slice(0, 10)
+      .forEach((currency) => {
+        sample100ByCurrency[`${currency}->${normalizedDisplayCurrency}`] = convertAmountToDisplay(100, currency);
+      });
+
+    const rawSummary = calculatePortfolioSummary(filteredEntities);
+    const traceKey = JSON.stringify({
+      targetCurrency: normalizedDisplayCurrency,
+      fxRateByPair,
+      sample100ByCurrency,
+      rawTotalAssets: rawSummary.totalAssets,
+      shownTotalAssets: portfolioSummary.totalAssets,
+    });
+    if (traceKey === fxRenderPreviewTraceKeyRef.current) {
+      return;
+    }
+    fxRenderPreviewTraceKeyRef.current = traceKey;
+
+    syncTrace("fx:render:preview", {
+      targetCurrency: normalizedDisplayCurrency,
+      fxRateByPair,
+      sample100ByCurrency,
+      rawTotalAssets: rawSummary.totalAssets,
+      rawCurrency: rawSummary.currency,
+      shownTotalAssets: portfolioSummary.totalAssets,
+      shownCurrency: portfolioSummary.currency,
+    });
+  }, [
+    convertAmountToDisplay,
+    entities,
+    filteredEntities,
+    fxRateByPair,
+    normalizedDisplayCurrency,
+    portfolioSummary.currency,
+    portfolioSummary.totalAssets,
+  ]);
 
   const cashBalances = useMemo(
     () => calculateCashBalances(filteredEntities),
     [filteredEntities],
   );
-
-  const normalizedDisplayCurrency = useMemo(() => {
-    const normalized = normalizeCurrencyCode(settings.displayCurrency);
-    return normalized || "AUTO";
-  }, [settings.displayCurrency]);
 
   const displayCurrencyOptions = useMemo(() => {
     const available = new Set<string>(COMMON_CURRENCY_CODES);
@@ -1316,10 +2461,33 @@ export default function App(): JSX.Element {
       .sort((a, b) => a.localeCompare(b));
   }, [entities, normalizedDisplayCurrency, portfolioSummary.currency]);
 
+  const fxUniverseCurrencies = useMemo(() => {
+    const universe = new Set<string>();
+    universe.add(normalizeCurrencyCode(settings.defaultCurrency));
+    universe.add(normalizeCurrencyCode(portfolioSummary.currency));
+    universe.add(normalizedDisplayCurrency);
+    displayCurrencyOptions.forEach((currency) => universe.add(normalizeCurrencyCode(currency)));
+    entities.forEach((entity) => {
+      universe.add(normalizeCurrencyCode(entity.currency));
+      entity.transactions.forEach((tx) => universe.add(normalizeCurrencyCode(tx.currency)));
+    });
+
+    return [...universe]
+      .filter((currency) => currency && currency !== "AUTO" && isValidCurrencyCode(currency))
+      .sort((a, b) => a.localeCompare(b));
+  }, [
+    displayCurrencyOptions,
+    entities,
+    normalizedDisplayCurrency,
+    portfolioSummary.currency,
+    settings.defaultCurrency,
+  ]);
+
   const fxSymbols = useMemo(
-    () => fxSourceCurrencies.map((sourceCurrency) => buildFxPairSymbol(sourceCurrency, normalizedDisplayCurrency)),
-    [fxSourceCurrencies, normalizedDisplayCurrency],
+    () => buildFxSymbolsForConversion(fxUniverseCurrencies),
+    [fxUniverseCurrencies],
   );
+  const fxSymbolsKey = useMemo(() => fxSymbols.join("|"), [fxSymbols]);
 
   const stockBreakdown = useMemo(
     () => calculateStockBreakdown(filteredEntities),
@@ -1330,32 +2498,16 @@ export default function App(): JSX.Element {
     () => collectPortfolioStockSymbols(entities).join("|"),
     [entities],
   );
-  const filteredPortfolioStockSymbolKey = useMemo(
-    () => collectPortfolioStockSymbols(filteredEntities).join("|"),
-    [filteredEntities],
-  );
 
   const stockLeaderboard = useMemo(
-    () => [...stockBreakdown].sort((a, b) => b.totalProfit - a.totalProfit),
-    [stockBreakdown],
+    () =>
+      [...stockBreakdown].sort(
+        (a, b) =>
+          convertAmountToDisplay(b.totalProfit, b.currency) -
+          convertAmountToDisplay(a.totalProfit, a.currency),
+      ),
+    [convertAmountToDisplay, stockBreakdown],
   );
-
-  const headerStockSearchResults = useMemo<HeaderStockSearchItem[]>(() => {
-    const keyword = headerSearchKeyword.trim().toUpperCase();
-    if (!keyword) {
-      return [];
-    }
-
-    return stockBreakdown
-      .filter((item) => item.symbol.includes(keyword) || item.currency.includes(keyword))
-      .sort((a, b) => Math.abs(b.marketValue) - Math.abs(a.marketValue))
-      .slice(0, 8)
-      .map((item) => ({
-        id: item.id,
-        symbol: item.symbol,
-        currency: item.currency,
-      }));
-  }, [headerSearchKeyword, stockBreakdown]);
 
   const holdingStocks = useMemo(
     () => stockBreakdown.filter((item) => item.activeShares !== 0),
@@ -1378,11 +2530,17 @@ export default function App(): JSX.Element {
         return a.symbol.localeCompare(b.symbol);
       }
       if (holdingSort === "profit") {
-        return b.totalProfit - a.totalProfit;
+        return (
+          convertAmountToDisplay(b.totalProfit, b.currency) -
+          convertAmountToDisplay(a.totalProfit, a.currency)
+        );
       }
-      return Math.abs(b.marketValue) - Math.abs(a.marketValue);
+      return (
+        Math.abs(convertAmountToDisplay(b.marketValue, b.currency)) -
+        Math.abs(convertAmountToDisplay(a.marketValue, a.currency))
+      );
     });
-  }, [holdingSearch, holdingSort, holdingStocks]);
+  }, [convertAmountToDisplay, holdingSearch, holdingSort, holdingStocks]);
 
   const displayedClosedStocks = useMemo(() => {
     const keyword = holdingSearch.trim().toUpperCase();
@@ -1495,44 +2653,57 @@ export default function App(): JSX.Element {
   );
 
   const portfolioProfitSeries = useMemo(
-    () => calculatePortfolioProfitSeries(filteredEntities, currentRange, portfolioHistoryBySymbol),
-    [currentRange, filteredEntities, portfolioHistoryBySymbol],
+    () => calculatePortfolioProfitSeries(filteredEntities, currentRange),
+    [currentRange, filteredEntities],
   );
   const portfolioOverviewSeries = useMemo(
-    () => calculatePortfolioOverviewSeries(filteredEntities, currentRange, portfolioHistoryBySymbol),
-    [currentRange, filteredEntities, portfolioHistoryBySymbol],
+    () =>
+      calculatePortfolioOverviewSeries(
+        filteredEntities,
+        currentRange,
+        portfolioOverviewCalculationOptions,
+      ),
+    [currentRange, filteredEntities, portfolioOverviewCalculationOptions],
   );
   const portfolioOverviewLatest = useMemo(
     () => portfolioOverviewSeries[portfolioOverviewSeries.length - 1] ?? null,
     [portfolioOverviewSeries],
   );
   const assetAllocation = useMemo(
-    () => calculateAssetAllocationSegments(filteredEntities),
-    [filteredEntities],
+    () => calculateAssetAllocationSegments(filteredEntities, 8, calculationConversion),
+    [calculationConversion, filteredEntities],
   );
   const currencyExposure = useMemo(
-    () => calculateCurrencyExposureSegments(filteredEntities),
-    [filteredEntities],
+    () => calculateCurrencyExposureSegments(filteredEntities, calculationConversion),
+    [calculationConversion, filteredEntities],
   );
   const monthlyDividendSeries = useMemo(
-    () => calculateMonthlyDividendSeries(filteredEntities, 18),
-    [filteredEntities],
+    () => calculateMonthlyDividendSeries(filteredEntities, 18, calculationConversion),
+    [calculationConversion, filteredEntities],
+  );
+  const monthlyBuySeries = useMemo(
+    () => calculateMonthlyBuySeries(filteredEntities, 18, calculationConversion),
+    [calculationConversion, filteredEntities],
+  );
+  const monthlySellSeries = useMemo(
+    () => calculateMonthlySellSeries(filteredEntities, 18, calculationConversion),
+    [calculationConversion, filteredEntities],
+  );
+  const monthlyFeeSeries = useMemo(
+    () => calculateMonthlyFeeSeries(filteredEntities, 18, calculationConversion),
+    [calculationConversion, filteredEntities],
   );
   const monthlyCashFlowSeries = useMemo(
-    () => calculateMonthlyCashFlowSeries(filteredEntities, 18),
-    [filteredEntities],
+    () => calculateMonthlyCashFlowSeries(filteredEntities, 18, calculationConversion),
+    [calculationConversion, filteredEntities],
   );
-  const monthlyTxCountSeries = useMemo(
-    () => calculateMonthlyTransactionCountSeries(filteredEntities, 18),
-    [filteredEntities],
-  );
-  const txTypeSeries = useMemo(
-    () => calculateTransactionTypeSeries(filteredEntities),
-    [filteredEntities],
+  const monthlyProfitBarSeries = useMemo(
+    () => calculateMonthlyProfitSeries(filteredEntities, 18, portfolioOverviewCalculationOptions),
+    [filteredEntities, portfolioOverviewCalculationOptions],
   );
   const compareSeries = useMemo(
-    () => calculateNormalizedCompareSeries(filteredEntities, currentRange, portfolioHistoryBySymbol, 4),
-    [currentRange, filteredEntities, portfolioHistoryBySymbol],
+    () => calculateNormalizedCompareSeries(filteredEntities, currentRange, 4),
+    [currentRange, filteredEntities],
   );
   const transactionHeatmap = useMemo(
     () => calculateTransactionHeatmap(filteredEntities),
@@ -1543,8 +2714,8 @@ export default function App(): JSX.Element {
     [filteredEntities],
   );
   const drawdownSeries = useMemo(
-    () => calculateDrawdownSeries(filteredEntities, currentRange, portfolioHistoryBySymbol),
-    [currentRange, filteredEntities, portfolioHistoryBySymbol],
+    () => calculateDrawdownSeries(filteredEntities, currentRange),
+    [currentRange, filteredEntities],
   );
   const dividendCalendarSeries = useMemo(
     () => calculateDividendCalendarSeries(filteredEntities),
@@ -1553,6 +2724,12 @@ export default function App(): JSX.Element {
   const rebalanceSuggestions = useMemo(
     () => calculateRebalanceSuggestions(filteredEntities, 6),
     [filteredEntities],
+  );
+
+  const hasNonZeroBarData = useCallback(
+    (series: { value: number }[]) =>
+      series.some((item) => Math.abs(item.value) > 0.000001),
+    [],
   );
 
   const visibleAssetAllocation = useMemo(() => {
@@ -1564,19 +2741,23 @@ export default function App(): JSX.Element {
 
   const stockDistribution = useMemo(() => {
     return stockBreakdown
-      .filter((item) => Math.abs(item.marketValue) > 0)
-      .sort((a, b) => Math.abs(b.marketValue) - Math.abs(a.marketValue))
+      .map((item) => ({
+        ...item,
+        convertedMarketValue: Math.abs(convertAmountToDisplay(item.marketValue, item.currency)),
+      }))
+      .filter((item) => item.convertedMarketValue > 0)
+      .sort((a, b) => b.convertedMarketValue - a.convertedMarketValue)
       .map((item, index) => ({
         label: item.symbol,
-        value: Math.abs(item.marketValue),
+        value: item.convertedMarketValue,
         color: PIE_SEGMENT_COLORS[index % PIE_SEGMENT_COLORS.length],
       }));
-  }, [stockBreakdown]);
+  }, [convertAmountToDisplay, stockBreakdown]);
 
   const stockCountryDistribution = useMemo(() => {
     const grouped = new Map<string, number>();
     stockBreakdown.forEach((item) => {
-      const value = Math.abs(item.marketValue);
+      const value = Math.abs(convertAmountToDisplay(item.marketValue, item.currency));
       if (value <= 0) {
         return;
       }
@@ -1584,12 +2765,12 @@ export default function App(): JSX.Element {
       grouped.set(country, (grouped.get(country) ?? 0) + value);
     });
     return buildSlicesFromMap(grouped);
-  }, [stockBreakdown]);
+  }, [convertAmountToDisplay, stockBreakdown]);
 
   const stockCategoryDistribution = useMemo(() => {
     const grouped = new Map<string, number>();
     stockBreakdown.forEach((item) => {
-      const value = Math.abs(item.marketValue);
+      const value = Math.abs(convertAmountToDisplay(item.marketValue, item.currency));
       if (value <= 0) {
         return;
       }
@@ -1597,7 +2778,7 @@ export default function App(): JSX.Element {
       grouped.set(category, (grouped.get(category) ?? 0) + value);
     });
     return buildSlicesFromMap(grouped);
-  }, [stockBreakdown]);
+  }, [convertAmountToDisplay, stockBreakdown]);
 
   const stockDetail = useMemo(() => {
     if (!selectedStockDetailId) {
@@ -1763,19 +2944,53 @@ export default function App(): JSX.Element {
         return;
       }
 
+      const now = Date.now();
+      const elapsedMs = now - quoteLastRequestedAtRef.current;
+      if (quoteLastRequestedAtRef.current > 0 && elapsedMs < STOCK_QUOTE_MIN_REQUEST_GAP_MS) {
+        setQuoteSyncError("");
+        if (trigger === "auto" && quoteRetryTimeoutRef.current === null) {
+          const waitMs = Math.max(250, STOCK_QUOTE_MIN_REQUEST_GAP_MS - elapsedMs + 50);
+          quoteRetryTimeoutRef.current = window.setTimeout(() => {
+            quoteRetryTimeoutRef.current = null;
+            void refreshPortfolioQuotes("auto");
+          }, waitMs);
+        }
+        return;
+      }
+
+      quoteLastRequestedAtRef.current = now;
       quoteSyncInFlightRef.current = true;
       setQuoteSyncing(true);
+      if (quoteRetryTimeoutRef.current !== null) {
+        window.clearTimeout(quoteRetryTimeoutRef.current);
+        quoteRetryTimeoutRef.current = null;
+      }
       if (trigger === "manual") {
         setQuoteSyncError("");
       }
 
       try {
+        if (normalizedDisplayCurrency !== "AUTO") {
+          syncTrace("fx:request:start", {
+            trigger,
+            targetCurrency: normalizedDisplayCurrency,
+            fxSourceCurrencies,
+            fxSymbols,
+          });
+        }
+
         const rawResponse = await fetchLocalStockData<unknown>({
           type: "query",
           symbol: requestSymbols.join(","),
         });
 
         const latestPriceMap = extractYahooQuotePriceMap(rawResponse);
+        if (normalizedDisplayCurrency !== "AUTO") {
+          syncTrace("fx:quotes:received", {
+            quoteSymbolCount: Object.keys(latestPriceMap).length,
+            quoteSymbols: Object.keys(latestPriceMap).slice(0, 50),
+          });
+        }
         const syncedSymbols = Object.keys(latestPriceMap).filter((symbol) => {
           const value = latestPriceMap[symbol];
           return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -1827,44 +3042,57 @@ export default function App(): JSX.Element {
         setQuoteLastUpdatedAt(new Date());
         setQuoteSyncError("");
 
-        if (normalizedDisplayCurrency === "AUTO") {
-          setFxRateByPair({});
-          setFxSyncedCount(0);
-          setFxLastUpdatedAt(null);
-          setFxSyncError("");
-        } else if (fxSourceCurrencies.length === 0) {
-          setFxRateByPair({});
-          setFxSyncedCount(0);
-          setFxLastUpdatedAt(new Date());
-          setFxSyncError("");
-        } else {
-          const nextFxRates: Record<string, number> = {};
-          const missingCurrencies: string[] = [];
+        const nextFxRates = buildFxRatePairMapFromQuotePriceMap(latestPriceMap);
+        setFxRateByPair(nextFxRates);
+        setFxSyncedCount(Object.keys(nextFxRates).length);
+        setFxLastUpdatedAt(new Date());
 
-          fxSourceCurrencies.forEach((sourceCurrency) => {
-            const rate = resolveFxRate(latestPriceMap, sourceCurrency, normalizedDisplayCurrency);
-            if (rate && Number.isFinite(rate) && rate > 0) {
-              nextFxRates[`${sourceCurrency}->${normalizedDisplayCurrency}`] = rate;
-              return;
-            }
-            missingCurrencies.push(sourceCurrency);
-          });
+        const missingCurrencies =
+          normalizedDisplayCurrency === "AUTO"
+            ? []
+            : fxSourceCurrencies.filter((sourceCurrency) => {
+                const rate = resolveFxRateFromPairMap(nextFxRates, sourceCurrency, normalizedDisplayCurrency);
+                return !(rate && Number.isFinite(rate) && rate > 0);
+              });
 
-          setFxRateByPair(nextFxRates);
-          setFxSyncedCount(Object.keys(nextFxRates).length);
-          setFxLastUpdatedAt(new Date());
-          setFxSyncError(
-            missingCurrencies.length > 0
-              ? isZh
-                ? `以下貨幣暫時未能換算：${missingCurrencies.join(", ")}。`
-                : `Unable to convert these currencies for now: ${missingCurrencies.join(", ")}.`
-              : "",
-          );
-        }
+        setFxSyncError(
+          missingCurrencies.length > 0
+            ? isZh
+              ? `以下貨幣暫時未能換算：${missingCurrencies.join(", ")}。`
+              : `Unable to convert these currencies for now: ${missingCurrencies.join(", ")}.`
+            : "",
+        );
+        syncTrace("fx:conversion:result", {
+          targetCurrency: normalizedDisplayCurrency,
+          requestedSources: fxSourceCurrencies,
+          resolvedPairCount: Object.keys(nextFxRates).length,
+          missingCurrencies,
+        });
       } catch (error) {
-        setQuoteSyncError(normalizeLocalApiErrorMessage(error, "Failed to refresh stock quotes."));
+        syncTrace("fx:request:error", {
+          trigger,
+          targetCurrency: normalizedDisplayCurrency,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        if (error instanceof Error && isRateLimitMessage(error.message)) {
+          setQuoteSyncError("");
+          if (normalizedDisplayCurrency !== "AUTO") {
+            setFxSyncError("");
+          }
+          return;
+        }
+
+        const resolvedErrorMessage =
+          error instanceof Error
+            ? error.message
+            : isZh
+              ? "更新股票報價失敗。"
+              : "Failed to refresh stock quotes.";
+        setQuoteSyncError(
+          resolvedErrorMessage,
+        );
         if (normalizedDisplayCurrency !== "AUTO") {
-          setFxSyncError(normalizeLocalApiErrorMessage(error, "Failed to refresh FX rates."));
+          setFxSyncError(resolvedErrorMessage);
         }
       } finally {
         quoteSyncInFlightRef.current = false;
@@ -1872,6 +3100,94 @@ export default function App(): JSX.Element {
       }
     },
     [fxSourceCurrencies, fxSymbols, isZh, normalizedDisplayCurrency, portfolioStockSymbolKey, screen],
+  );
+
+  const refreshPortfolioHistory = useCallback(
+    async (trigger: "auto" | "manual" = "auto"): Promise<void> => {
+      if (screen !== "dashboard") {
+        return;
+      }
+
+      const stockSymbols = portfolioStockSymbolKey ? portfolioStockSymbolKey.split("|") : [];
+      if (stockSymbols.length === 0) {
+        setPortfolioHistoryBySymbol({});
+        return;
+      }
+
+      if (portfolioHistorySyncInFlightRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+      const elapsedMs = now - portfolioHistoryLastRequestedAtRef.current;
+      if (
+        portfolioHistoryLastRequestedAtRef.current > 0 &&
+        elapsedMs < STOCK_QUOTE_MIN_REQUEST_GAP_MS
+      ) {
+        return;
+      }
+
+      portfolioHistoryLastRequestedAtRef.current = now;
+      portfolioHistorySyncInFlightRef.current = true;
+
+      try {
+        const chartRangePreset = selectedRange === "CUSTOM" ? "ALL" : selectedRange;
+        const request = resolveYahooChartRequest(chartRangePreset);
+        const payload = await fetchLocalStockData<unknown>({
+          type: "chart",
+          symbol: stockSymbols.join(","),
+          range: request.range,
+          interval: request.interval,
+        });
+
+        const batchSeries = extractYahooChartPriceSeriesBatch(payload);
+        if (Object.keys(batchSeries).length === 0 && stockSymbols.length === 1) {
+          const singleSeries = extractYahooChartPriceSeries(payload);
+          if (singleSeries.length > 0) {
+            batchSeries[stockSymbols[0]] = singleSeries;
+          }
+        }
+
+        const allTransactions = filteredEntities.flatMap((entity) => entity.transactions);
+        const nextHistoryBySymbol: Record<string, PricePoint[]> = {};
+        stockSymbols.forEach((symbol) => {
+          const normalizedSymbol = symbol.trim().toUpperCase();
+          const sourceSeries = batchSeries[normalizedSymbol] ?? [];
+          const filteredSeries = filterPriceSeriesByCustomRange(
+            sourceSeries,
+            selectedRange,
+            customStart,
+            customEnd,
+          );
+          const fallbackSeries = filterPriceSeriesByCustomRange(
+            buildFallbackPriceSeries(allTransactions, normalizedSymbol),
+            selectedRange,
+            customStart,
+            customEnd,
+          );
+          const finalSeries = filteredSeries.length > 0 ? filteredSeries : fallbackSeries;
+          if (finalSeries.length > 0) {
+            nextHistoryBySymbol[normalizedSymbol] = finalSeries;
+          }
+        });
+
+        setPortfolioHistoryBySymbol(nextHistoryBySymbol);
+      } catch (error) {
+        if (trigger === "manual" && error instanceof Error && !isRateLimitMessage(error.message)) {
+          setQuoteSyncError(error.message);
+        }
+      } finally {
+        portfolioHistorySyncInFlightRef.current = false;
+      }
+    },
+    [
+      customEnd,
+      customStart,
+      filteredEntities,
+      portfolioStockSymbolKey,
+      screen,
+      selectedRange,
+    ],
   );
 
   const refreshValuationChart = useCallback(
@@ -1926,6 +3242,10 @@ export default function App(): JSX.Element {
             : "",
         );
       } catch (error) {
+        if (error instanceof Error && isRateLimitMessage(error.message)) {
+          setValuationSyncError("");
+          return;
+        }
         setValuationSeriesCache((previous) => ({
           ...previous,
           [valuationCacheKey]:
@@ -1937,7 +3257,11 @@ export default function App(): JSX.Element {
               valuationCustomEnd,
             ),
         }));
-        setValuationSyncError(normalizeLocalApiErrorMessage(error, "Failed to refresh valuation chart."));
+        setValuationSyncError(
+          error instanceof Error
+            ? error.message
+            : t("Failed to refresh valuation chart.", "更新估價圖失敗。"),
+        );
       } finally {
         setValuationSyncing(false);
       }
@@ -1952,58 +3276,6 @@ export default function App(): JSX.Element {
       valuationRange,
     ],
   );
-
-  const refreshPortfolioHistorySeries = useCallback(async (): Promise<void> => {
-    if (screen !== "dashboard") {
-      return;
-    }
-
-    const symbols = filteredPortfolioStockSymbolKey
-      ? filteredPortfolioStockSymbolKey.split("|").filter(Boolean)
-      : [];
-    if (symbols.length === 0) {
-      setPortfolioHistoryBySymbol({});
-      return;
-    }
-
-    const requestSeq = portfolioHistoryRequestSeqRef.current + 1;
-    portfolioHistoryRequestSeqRef.current = requestSeq;
-
-    const request = resolveYahooChartRequest(currentRange.preset);
-    const nextHistoryBySymbol: Record<string, PricePoint[]> = {};
-
-    for (const symbol of symbols) {
-      try {
-        const payload = await fetchLocalStockData<unknown>({
-          type: "chart",
-          symbol,
-          range: request.range,
-          interval: request.interval,
-        });
-        const parsed = extractYahooChartPriceSeries(payload);
-        const filtered = filterPriceSeriesByCustomRange(
-          parsed,
-          currentRange.preset,
-          customStart,
-          customEnd,
-        );
-        if (filtered.length > 0) {
-          nextHistoryBySymbol[symbol] = filtered;
-        }
-      } catch {
-        // Keep fallback behavior from transaction-derived prices when historical fetch is unavailable.
-      }
-    }
-
-    if (portfolioHistoryRequestSeqRef.current !== requestSeq) {
-      return;
-    }
-    setPortfolioHistoryBySymbol(nextHistoryBySymbol);
-  }, [currentRange.preset, customEnd, customStart, filteredPortfolioStockSymbolKey, screen]);
-
-  useEffect(() => {
-    void refreshPortfolioHistorySeries();
-  }, [refreshPortfolioHistorySeries]);
 
   const quoteStatusText = useMemo(() => {
     if (!portfolioStockSymbolKey && fxSymbols.length === 0) {
@@ -2109,35 +3381,52 @@ export default function App(): JSX.Element {
   const displayPercent = (value: number): string =>
     settings.showObscure ? "•••%" : formatPercent(value);
 
-  const portfolioOverviewMetrics: PortfolioOverviewMetric[] = PORTFOLIO_LINE_OPTIONS
-    .filter((option) => selectedPortfolioLineIds.includes(option.value))
-    .map((option) => ({
+  const selectedPortfolioLineOption = useMemo(
+    () =>
+      PORTFOLIO_LINE_OPTIONS.find((option) => option.value === selectedPortfolioLineId) ??
+      PORTFOLIO_LINE_OPTIONS[0],
+    [selectedPortfolioLineId],
+  );
+
+  const portfolioOverviewPrimaryMetric = useMemo<PortfolioOverviewMetric>(() => {
+    const option = selectedPortfolioLineOption;
+    return {
       id: option.value,
       label: isZh ? option.labelZh : option.label,
       color: option.color,
       getValue: (point) => {
-        if (option.value === "cashBalance") {
-          return point.cashBalance;
-        }
-        if (option.value === "stockMarketValue") {
-          return point.stockMarketValue;
-        }
         if (option.value === "totalMarketValue") {
           return point.totalMarketValue;
         }
         if (option.value === "totalProfit") {
           return point.totalProfit;
         }
-        if (option.value === "totalReturnPct") {
-          return point.totalReturnPct;
-        }
-        return point.totalCost;
+        return point.totalReturnPct;
       },
       formatValue: (value: number) =>
         option.value === "totalReturnPct"
           ? displayPercent(value)
           : displayMoney(value, portfolioSummary.currency),
-    }));
+    };
+  }, [displayMoney, displayPercent, isZh, portfolioSummary.currency, selectedPortfolioLineOption]);
+
+  const portfolioOverviewMetrics: PortfolioOverviewMetric[] = useMemo(
+    () => [portfolioOverviewPrimaryMetric],
+    [portfolioOverviewPrimaryMetric],
+  );
+
+  const portfolioOverviewLatestPrimaryValue = useMemo(() => {
+    if (!portfolioOverviewLatest) {
+      return 0;
+    }
+    if (selectedPortfolioLineId === "totalMarketValue") {
+      return portfolioOverviewLatest.totalMarketValue;
+    }
+    if (selectedPortfolioLineId === "totalProfit") {
+      return portfolioOverviewLatest.totalProfit;
+    }
+    return portfolioOverviewLatest.totalReturnPct;
+  }, [portfolioOverviewLatest, selectedPortfolioLineId]);
 
   const formatPieMoneyValue = (value: number): string =>
     displayMoney(value, portfolioSummary.currency);
@@ -2215,10 +3504,7 @@ export default function App(): JSX.Element {
     if (normalizedDisplayCurrency !== "AUTO") {
       return;
     }
-    setFxRateByPair({});
     setFxSyncError("");
-    setFxLastUpdatedAt(null);
-    setFxSyncedCount(0);
   }, [normalizedDisplayCurrency]);
 
   useEffect(() => {
@@ -2230,12 +3516,44 @@ export default function App(): JSX.Element {
     }
 
     void refreshPortfolioQuotes("auto");
-    const intervalId = window.setInterval(() => {
-      void refreshPortfolioQuotes("auto");
-    }, STOCK_QUOTE_SYNC_INTERVAL_MS);
+  }, [fxSymbolsKey, portfolioStockSymbolKey, refreshPortfolioQuotes, screen]);
 
-    return () => window.clearInterval(intervalId);
-  }, [fxSymbols.length, portfolioStockSymbolKey, refreshPortfolioQuotes, screen]);
+  useEffect(() => {
+    portfolioHistoryAutoRequestedRef.current = false;
+  }, [portfolioStockSymbolKey]);
+
+  useEffect(() => {
+    return () => {
+      if (quoteRetryTimeoutRef.current !== null) {
+        window.clearTimeout(quoteRetryTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (screen !== "dashboard") {
+      return;
+    }
+    if (portfolioHistoryAutoRequestedRef.current) {
+      return;
+    }
+    if (!portfolioStockSymbolKey) {
+      return;
+    }
+
+    portfolioHistoryAutoRequestedRef.current = true;
+    void refreshPortfolioHistory("auto");
+  }, [portfolioStockSymbolKey, refreshPortfolioHistory, screen]);
+
+  useEffect(() => {
+    if (screen !== "dashboard") {
+      return;
+    }
+    if (!portfolioStockSymbolKey) {
+      return;
+    }
+    void refreshPortfolioHistory("auto");
+  }, [customEnd, customStart, portfolioStockSymbolKey, refreshPortfolioHistory, screen, selectedRange]);
 
   const applyImportedEntities = useCallback((parsed: EntityDataset[]): void => {
     setEntities(parsed);
@@ -2442,16 +3760,8 @@ export default function App(): JSX.Element {
     }
   };
 
-  const togglePortfolioLine = (lineId: PortfolioLineId): void => {
-    setSelectedPortfolioLineIds((previous) => {
-      if (previous.includes(lineId)) {
-        if (previous.length <= 1) {
-          return previous;
-        }
-        return previous.filter((item) => item !== lineId);
-      }
-      return [...previous, lineId];
-    });
+  const selectPortfolioLine = (lineId: PortfolioLineId): void => {
+    setSelectedPortfolioLineId(lineId);
   };
 
   const onValuationCustomStartChange = (event: ChangeEvent<HTMLInputElement>): void => {
@@ -2694,6 +4004,7 @@ export default function App(): JSX.Element {
       portfolioId: row.portfolioId,
       date: toDateInputValue(row.date),
       type: row.type,
+      district: inferDistrictFromCurrency(row.currency, row.symbol),
       symbol: row.symbol,
       shares: String(row.shares),
       price: String(row.price),
@@ -2799,7 +4110,9 @@ export default function App(): JSX.Element {
       return;
     }
 
-    const currency = draft.currency.trim().toUpperCase();
+    const normalizedDistrict = normalizeTransactionDistrict(draft.district);
+    const autoCurrency = getAutoCurrencyByDistrict(normalizedDistrict);
+    const currency = autoCurrency ?? normalizeCurrencyCode(draft.currency);
     if (!currency) {
       setTransactionError(t("Currency is required.", "請輸入貨幣。"));
       return;
@@ -3027,13 +4340,92 @@ export default function App(): JSX.Element {
     setMenuOpen(false);
   };
 
-  const jumpToSearchedStock = (stockId: string): void => {
-    setSelectedStockId(stockId);
-    setSelectedStockDetailId(stockId);
-    setScreen("dashboard");
-    setActiveTab("dashboard");
-    setMenuOpen(false);
-  };
+  if (isAuthLoading) {
+    return (
+      <div
+        className={`app-shell ${settings.enableAnimations ? "" : "reduced-motion"} ${tableDensityClass}`.trim()}
+      >
+        <main className="auth-screen">
+          <div className="auth-card">
+            <img className="brand-wordmark" src={stockerWordmark} alt="Stocker" />
+            <h1>{t("Connecting to Firebase...", "正在連接 Firebase...")}</h1>
+            <p>{t("Please wait a moment.", "請稍候。")}</p>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <div
+        className={`app-shell ${settings.enableAnimations ? "" : "reduced-motion"} ${tableDensityClass}`.trim()}
+      >
+        <main className="auth-screen">
+          <div className="auth-card">
+            <img className="brand-wordmark" src={stockerWordmark} alt="Stocker" />
+            <h1>{t("Sign In To View Your Portfolio", "登入後查看你嘅投資收益")}</h1>
+            <p>
+              {t(
+                "Your data will load from Firebase after Google sign-in.",
+                "Google 登入後會自動載入你喺 Firebase 嘅資料。",
+              )}
+            </p>
+            <button type="button" className="primary-btn auth-btn" onClick={openLoginFlow}>
+              {t("Sign in with Google", "使用 Google 登入")}
+            </button>
+            {cloudErrorMessage && <div className="error-text">{cloudErrorMessage}</div>}
+          </div>
+          {showBetaConsentModal && (
+            <div className="modal-backdrop" role="presentation" onClick={() => setShowBetaConsentModal(false)}>
+              <div
+                className="modal-card beta-consent-modal"
+                role="dialog"
+                aria-modal="true"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <h3>Beta Version Notice / Beta 版本注意事項</h3>
+                <p>
+                  This is a beta version. Data may be lost, and analysis may be inaccurate.
+                  <br />
+                  目前為 Beta 版本，資料可能遺失，分析結果亦可能不準確。
+                </p>
+                <label className="beta-consent-check">
+                  <input
+                    type="checkbox"
+                    checked={betaConsentChecked}
+                    onChange={(event) => setBetaConsentChecked(event.target.checked)}
+                  />
+                  <span>
+                    I understand and agree to continue.
+                    <br />
+                    我已了解以上風險，並同意繼續使用。
+                  </span>
+                </label>
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={() => setShowBetaConsentModal(false)}
+                  >
+                    Cancel / 取消
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    disabled={!betaConsentChecked}
+                    onClick={confirmBetaRiskAndSignIn}
+                  >
+                    Agree and Continue / 同意並繼續
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -3043,31 +4435,6 @@ export default function App(): JSX.Element {
         <div className="header-left">
           <img className="brand-wordmark" src={stockerWordmark} alt="Stocker" />
         </div>
-
-        <label className="header-search" aria-label={t("Header Search", "頂部搜尋")}>
-          <span className="search-icon" aria-hidden="true">
-            ⌕
-          </span>
-          <input
-            type="search"
-            placeholder={t("Search (⌘K)", "搜尋 (⌘K)")}
-            value={headerSearchKeyword}
-            onFocus={() => setMenuOpen(false)}
-            onChange={(event) => setHeaderSearchKeyword(event.target.value.toUpperCase())}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter") {
-                return;
-              }
-              const firstMatch = headerStockSearchResults[0];
-              if (!firstMatch) {
-                return;
-              }
-              event.preventDefault();
-              jumpToSearchedStock(firstMatch.id);
-            }}
-          />
-          <kbd>⌘K</kbd>
-        </label>
 
         <nav className={`header-nav ${menuOpen ? "open" : ""}`}>
           <button
@@ -3115,14 +4482,24 @@ export default function App(): JSX.Element {
         </nav>
 
         <div className="header-tools">
+          <span className="user-chip" title={authUser.email ?? authUser.uid}>
+            {authUser.displayName || authUser.email || `${authUser.uid.slice(0, 8)}...`}
+          </span>
           <button
             type="button"
-            className="secondary-btn lang-btn"
+            className="header-tool-btn"
             onClick={() => updateSetting("language", settings.language === "zh-HK" ? "en" : "zh-HK")}
           >
             {settings.language === "zh-HK" ? "English" : "繁中"}
           </button>
-          <button type="button" className="header-cta-btn" onClick={() => changeTab("transactions")}>
+          <button type="button" className="header-tool-btn" onClick={() => void onSignOut()}>
+            {t("Sign Out", "登出")}
+          </button>
+          <button
+            type="button"
+            className="header-tool-btn header-tool-btn-primary header-add-trade"
+            onClick={() => changeTab("transactions")}
+          >
             {t("Add Trade", "新增交易")}
           </button>
         </div>
@@ -3228,13 +4605,21 @@ export default function App(): JSX.Element {
                 <div className="panel-head">
                   <div>
                     <p className="panel-label">{t("Portfolio Overview", "組合總覽")}</p>
-                    <h2>{rangeTitle(selectedRange)} {t("Assets + Return + Profit", "總資產 + 收益率 + 收益")}</h2>
+                    <h2>
+                      {rangeTitle(selectedRange)} {isZh ? selectedPortfolioLineOption.labelZh : selectedPortfolioLineOption.label}
+                    </h2>
                   </div>
                   <div
-                    className={`metric-badge ${(portfolioOverviewLatest?.totalProfit ?? 0) >= 0 ? "positive" : "negative"}`}
+                    className={`metric-badge ${portfolioOverviewLatestPrimaryValue >= 0 ? "positive" : "negative"}`}
                   >
-                    <strong>{displayMoney(portfolioOverviewLatest?.totalProfit ?? 0, portfolioSummary.currency)}</strong>
-                    <span>{displayPercent(portfolioOverviewLatest?.totalReturnPct ?? 0)}</span>
+                    <strong>
+                      {selectedPortfolioLineId === "totalReturnPct"
+                        ? displayPercent(portfolioOverviewLatestPrimaryValue)
+                        : displayMoney(portfolioOverviewLatestPrimaryValue, portfolioSummary.currency)}
+                    </strong>
+                    {selectedPortfolioLineId !== "totalReturnPct" && (
+                      <span>{displayPercent(portfolioOverviewLatest?.totalReturnPct ?? 0)}</span>
+                    )}
                   </div>
                 </div>
 
@@ -3309,13 +4694,13 @@ export default function App(): JSX.Element {
                   <div className="portfolio-switcher-title">{t("Chart Lines", "圖表線條")}</div>
                   <div className="portfolio-switcher">
                     {PORTFOLIO_LINE_OPTIONS.map((option) => {
-                      const active = selectedPortfolioLineIds.includes(option.value);
+                      const active = selectedPortfolioLineId === option.value;
                       return (
                         <button
                           key={option.value}
                           type="button"
                           className={`portfolio-pill line-pill ${active ? "active" : ""}`}
-                          onClick={() => togglePortfolioLine(option.value)}
+                          onClick={() => selectPortfolioLine(option.value)}
                         >
                           <span className="line-pill-dot" style={{ background: option.color }} />
                           <span>{isZh ? option.labelZh : option.label}</span>
@@ -3484,24 +4869,61 @@ export default function App(): JSX.Element {
 
               <section className="dual-column-grid">
                 <BarChart
-                  data={monthlyDividendSeries.slice(-12)}
-                  title={t("Monthly Dividends (12M)", "每月股息（12個月）")}
-                  positiveColor="#1f9a72"
+                  data={monthlyBuySeries.slice(-12)}
+                  title={t("Monthly Buy Amount (12M)", "每月買入金額（12個月）")}
+                  positiveColor="#22a06b"
                 />
                 <BarChart
-                  data={monthlyCashFlowSeries.slice(-12)}
-                  title={t("Monthly Cash Flow (12M)", "每月現金流（12個月）")}
+                  data={monthlySellSeries.slice(-12)}
+                  title={t("Monthly Sell Amount (12M)", "每月賣出金額（12個月）")}
                   positiveColor="#2f7dd6"
+                />
+              </section>
+
+              <section className="dual-column-grid">
+                <BarChart
+                  data={
+                    hasNonZeroBarData(monthlyDividendSeries.slice(-12))
+                      ? monthlyDividendSeries.slice(-12)
+                      : []
+                  }
+                  title={t("Monthly Dividend Income (12M)", "每月股息收益（12個月）")}
+                  positiveColor="#1f9a72"
+                  negativeColor="#c84f4f"
+                />
+                <BarChart
+                  data={
+                    hasNonZeroBarData(monthlyFeeSeries.slice(-12))
+                      ? monthlyFeeSeries.slice(-12)
+                      : []
+                  }
+                  title={t("Monthly Fee (12M)", "每月手續費（12個月）")}
+                  positiveColor="#4f8fd9"
                   negativeColor="#c84f4f"
                 />
               </section>
 
               <section className="dual-column-grid">
                 <BarChart
-                  data={monthlyTxCountSeries.slice(-12)}
-                  title={t("Monthly Transactions (12M)", "每月交易次數（12個月）")}
+                  data={
+                    hasNonZeroBarData(monthlyCashFlowSeries.slice(-12))
+                      ? monthlyCashFlowSeries.slice(-12)
+                      : []
+                  }
+                  title={t("Monthly Cash Flow (12M)", "每月現金流（12個月）")}
+                  positiveColor="#2f7dd6"
+                  negativeColor="#c84f4f"
                 />
-                <BarChart data={txTypeSeries} title={t("Transaction Type Distribution", "交易類型分佈")} />
+                <BarChart
+                  data={
+                    hasNonZeroBarData(monthlyProfitBarSeries.slice(-12))
+                      ? monthlyProfitBarSeries.slice(-12)
+                      : []
+                  }
+                  title={t("Monthly Profit Histogram (12M)", "每月收益柱狀圖（12個月）")}
+                  positiveColor="#1f9a72"
+                  negativeColor="#d14e4e"
+                />
               </section>
 
               <section className="table-panel">
@@ -3548,7 +4970,6 @@ export default function App(): JSX.Element {
                         <th>{t("Current Weight", "目前權重")}</th>
                         <th>{t("Target Weight", "目標權重")}</th>
                         <th>{t("Diff %", "差異%")}</th>
-                        <th>{t("Suggested Trade Value", "建議調整金額")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3560,15 +4981,11 @@ export default function App(): JSX.Element {
                           <td className={item.diffPct >= 0 ? "negative" : "positive"}>
                             {displayPercent(item.diffPct)}
                           </td>
-                          <td className={item.diffValue >= 0 ? "negative" : "positive"}>
-                            {item.diffValue >= 0 ? t("Reduce ", "減持 ") : t("Add ", "增持 ")}
-                            {displayMoney(Math.abs(item.diffValue), item.currency)}
-                          </td>
                         </tr>
                       ))}
                       {rebalanceSuggestions.length === 0 && (
                         <tr>
-                          <td colSpan={5} className="empty-cell">
+                          <td colSpan={4} className="empty-cell">
                             {t("No rebalance signals.", "暫無再平衡訊號。")}
                           </td>
                         </tr>
@@ -3576,7 +4993,9 @@ export default function App(): JSX.Element {
                     </tbody>
                   </table>
                 </div>
-              </section>`n            </section>
+              </section>
+
+            </section>
           )}
 
           {activeTab === "holdings" && (
@@ -3609,7 +5028,7 @@ export default function App(): JSX.Element {
                   </label>
                 </div>
                 <div className="table-scroll">
-                  <table className="data-table holdings-table">
+                  <table className="data-table">
                     <thead>
                       <tr>
                         <th>{t("Symbol", "代號")}</th>
@@ -3650,7 +5069,7 @@ export default function App(): JSX.Element {
                   <h3>{t("Closed Stocks", "已平倉股票")} ({displayedClosedStocks.length})</h3>
                 </div>
                 <div className="table-scroll">
-                  <table className="data-table holdings-table">
+                  <table className="data-table">
                     <thead>
                       <tr>
                         <th>{t("Symbol", "代號")}</th>
@@ -4086,8 +5505,8 @@ export default function App(): JSX.Element {
                 </div>
                 <p className="settings-hint">
                   {t(
-                    "These defaults are saved in your browser only. Firebase is not connected yet.",
-                    "以上預設只會儲存在瀏覽器，本版本尚未連接 Firebase。",
+                    "Defaults are saved locally, and portfolio data is synced to Firebase after sign-in.",
+                    "預設值會儲存在本機，而投資資料會於登入後同步到 Firebase。",
                   )}
                 </p>
                 <p className={`settings-hint ${fxSyncError ? "negative" : ""}`}>{displayCurrencyStatusText}</p>
@@ -4552,7 +5971,18 @@ export default function App(): JSX.Element {
                 {t("Portfolio", "組合")}
                 <select
                   value={draft.portfolioId}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, portfolioId: event.target.value }))}
+                  onChange={(event) => {
+                    const nextPortfolioId = event.target.value;
+                    const selectedPortfolio = entities.find((entity) => entity.id === nextPortfolioId);
+                    setDraft((prev) => ({
+                      ...prev,
+                      portfolioId: nextPortfolioId,
+                      currency:
+                        getAutoCurrencyByDistrict(normalizeTransactionDistrict(prev.district)) ??
+                        normalizeCurrencyCode(selectedPortfolio?.currency) ??
+                        prev.currency,
+                    }));
+                  }}
                 >
                   {entities.map((entity) => (
                     <option key={entity.id} value={entity.id}>
@@ -4580,6 +6010,28 @@ export default function App(): JSX.Element {
                   {TRANSACTION_TYPE_OPTIONS.filter((item) => item.value !== "all").map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                {t("District", "地區")}
+                <select
+                  value={draft.district}
+                  onChange={(event) => {
+                    const nextDistrict = normalizeTransactionDistrict(event.target.value);
+                    const autoCurrency = getAutoCurrencyByDistrict(nextDistrict);
+                    setDraft((prev) => ({
+                      ...prev,
+                      district: nextDistrict,
+                      currency: autoCurrency ?? prev.currency,
+                    }));
+                  }}
+                >
+                  {TRANSACTION_DISTRICT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {isZh ? option.labelZh : option.label}
                     </option>
                   ))}
                 </select>
@@ -4622,9 +6074,9 @@ export default function App(): JSX.Element {
                 {t("Currency", "貨幣")}
                 <input
                   value={draft.currency}
-                  onChange={(event) =>
-                    setDraft((prev) => ({ ...prev, currency: event.target.value.toUpperCase() }))
-                  }
+                  onChange={(event) => setDraft((prev) => ({ ...prev, currency: event.target.value.toUpperCase() }))}
+                  readOnly={normalizeTransactionDistrict(draft.district) !== "OTHER"}
+                  disabled={normalizeTransactionDistrict(draft.district) !== "OTHER"}
                 />
               </label>
             </div>
@@ -4706,16 +6158,6 @@ export default function App(): JSX.Element {
             </p>
 
             <div className="modal-actions">
-              <button
-                type="button"
-                className="secondary-btn"
-                onClick={() => setPendingCashAmount(pendingCashReview.shortfall.toFixed(2))}
-              >
-                {t("Fill Required", "補齊所需")}
-              </button>
-              <button type="button" className="secondary-btn" onClick={() => setPendingCashAmount("0")}>
-                {t("Use Leverage", "使用槓桿")}
-              </button>
               <button type="button" className="secondary-btn" onClick={closeCashReviewModal}>
                 {t("Back", "返回")}
               </button>

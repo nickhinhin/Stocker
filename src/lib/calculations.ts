@@ -3,8 +3,8 @@ import {
   EntityDataset,
   NormalizedTransaction,
   PortfolioSummary,
-  PricePoint,
   ProfitPoint,
+  PricePoint,
   StockBreakdown,
   StockMetrics,
   TxType,
@@ -92,6 +92,12 @@ export interface PortfolioOverviewPoint {
   totalReturnPct: number;
 }
 
+export interface CalculationConversionOptions {
+  targetCurrency?: string;
+  convertAmount?: (value: number, fromCurrency: string) => number;
+  historicalPriceBySymbol?: Record<string, PricePoint[]>;
+}
+
 interface DateBounds {
   minDate: Date;
   maxDate: Date;
@@ -109,11 +115,6 @@ interface StockEvaluation {
   marketValue: number;
 }
 
-interface StockEvaluationOptions {
-  useLatestPriceOnToday?: boolean;
-  historicalPriceBySymbol?: Record<string, PricePoint[]>;
-}
-
 const STOCK_RELEVANT_TYPES = new Set([
   "BUY",
   "SELL",
@@ -121,6 +122,8 @@ const STOCK_RELEVANT_TYPES = new Set([
   "DIVIDEND_SHARE",
   "FEE",
 ]);
+
+const TRADE_PRICE_TYPES = new Set<TxType>(["BUY", "SELL"]);
 
 const CHART_COLORS = [
   "#3367D6",
@@ -165,6 +168,18 @@ function pickColor(index: number): string {
 
 function sortByDateAsc(transactions: NormalizedTransaction[]): NormalizedTransaction[] {
   return [...transactions].sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+function applyConversion(
+  value: number,
+  fromCurrency: string,
+  options?: CalculationConversionOptions,
+): number {
+  if (!options?.convertAmount) {
+    return value;
+  }
+  const converted = options.convertAmount(value, fromCurrency);
+  return Number.isFinite(converted) ? converted : value;
 }
 
 function startOfDay(date: Date): Date {
@@ -267,7 +282,11 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
       const group = groups.get(key)!;
       group.transactions.push(tx);
 
-      if (tx.price > 0 && tx.date.getTime() >= group.latestPriceDate) {
+      if (
+        TRADE_PRICE_TYPES.has(tx.type) &&
+        tx.price > 0 &&
+        tx.date.getTime() >= group.latestPriceDate
+      ) {
         group.latestPrice = tx.price;
         group.latestPriceDate = tx.date.getTime();
       }
@@ -275,6 +294,9 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
   });
 
   groups.forEach((group) => {
+    if (group.latestPrice > 0) {
+      return;
+    }
     for (const entity of entities) {
       const fallbackPrice = entity.latestPriceBySymbol[group.symbol];
       if (fallbackPrice && fallbackPrice > 0) {
@@ -290,34 +312,11 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
   }));
 }
 
-function resolveHistoricalPriceAtDate(
-  series: PricePoint[] | undefined,
-  date: Date,
-): number | null {
-  if (!series || series.length === 0) {
-    return null;
-  }
-
-  const targetTime = date.getTime();
-  for (let index = series.length - 1; index >= 0; index -= 1) {
-    const point = series[index];
-    if (point.date.getTime() > targetTime) {
-      continue;
-    }
-    if (Number.isFinite(point.price) && point.price > 0) {
-      return point.price;
-    }
-  }
-
-  return null;
-}
-
 function evaluateStockAtDate(
   group: StockGroup,
   date: Date,
-  options: StockEvaluationOptions = {},
+  marketPriceOverride?: number,
 ): StockEvaluation {
-  const { useLatestPriceOnToday = true, historicalPriceBySymbol } = options;
   const state: SymbolAccumulator = {
     purchasedShares: 0,
     soldShares: 0,
@@ -337,13 +336,20 @@ function evaluateStockAtDate(
 
     visibleTransactions.push(tx);
 
-    if (tx.type === "BUY" || tx.type === "DIVIDEND_SHARE") {
+    if (tx.type === "BUY") {
       state.purchasedShares += tx.shares;
       state.purchaseTotal += tx.shares * tx.price;
       state.fees += tx.fee;
       if (tx.price > 0) {
         state.lastPrice = tx.price;
       }
+      continue;
+    }
+
+    if (tx.type === "DIVIDEND_SHARE") {
+      // Stock dividend increases quantity but should not increase invested cost.
+      state.purchasedShares += tx.shares;
+      state.fees += tx.fee;
       continue;
     }
 
@@ -377,15 +383,11 @@ function evaluateStockAtDate(
 
   const activeShares = state.purchasedShares - state.soldShares;
   const isTodayPoint = startOfDay(date).getTime() >= startOfDay(new Date()).getTime();
-  const historicalPrice = resolveHistoricalPriceAtDate(
-    historicalPriceBySymbol?.[group.symbol],
-    date,
-  );
-  const marketPrice = historicalPrice ?? (
-    useLatestPriceOnToday && isTodayPoint && group.latestPrice > 0
+  const marketPrice = typeof marketPriceOverride === "number" && Number.isFinite(marketPriceOverride)
+    ? marketPriceOverride
+    : isTodayPoint && group.latestPrice > 0
       ? group.latestPrice
-      : (state.lastPrice || group.latestPrice || buyAvg || 0)
-  );
+      : (state.lastPrice || group.latestPrice || buyAvg || 0);
 
   let holdingProfit = 0;
   if (activeShares > 0) {
@@ -412,13 +414,76 @@ function evaluateStockAtDate(
   };
 }
 
+function resolveHistoricalMarketPriceAtDate(
+  history: PricePoint[] | undefined,
+  date: Date,
+): number | undefined {
+  if (!history || history.length === 0) {
+    return undefined;
+  }
+
+  const targetTime = date.getTime();
+  let previous: number | undefined;
+  for (const point of history) {
+    const price = point.price;
+    if (!Number.isFinite(price) || price <= 0) {
+      continue;
+    }
+    const pointTime = point.date.getTime();
+    if (pointTime > targetTime) {
+      return previous ?? price;
+    }
+    previous = price;
+  }
+
+  return previous;
+}
+
+function resolveRecentHistoricalMarketPriceAtDate(
+  history: PricePoint[] | undefined,
+  date: Date,
+  maxAgeDays: number,
+): number | undefined {
+  if (!history || history.length === 0) {
+    return undefined;
+  }
+
+  const targetTime = date.getTime();
+  const maxAgeMs = Math.max(0, maxAgeDays) * 86_400_000;
+  let candidate: PricePoint | undefined;
+
+  for (const point of history) {
+    if (!Number.isFinite(point.price) || point.price <= 0) {
+      continue;
+    }
+    const pointTime = point.date.getTime();
+    if (pointTime > targetTime) {
+      break;
+    }
+    candidate = point;
+  }
+
+  if (!candidate) {
+    return undefined;
+  }
+
+  if (targetTime - candidate.date.getTime() > maxAgeMs) {
+    return undefined;
+  }
+
+  return candidate.price;
+}
+
 function getGroupDateBounds(group: StockGroup): DateBounds | null {
   if (group.transactions.length === 0) {
     return null;
   }
 
   const today = startOfDay(new Date());
-  const minDate = startOfDay(group.transactions[0].date);
+  const minDate = resolveDisplayMinDate(group.transactions.map((tx) => tx.date));
+  if (!minDate) {
+    return null;
+  }
   return { minDate, maxDate: today };
 }
 
@@ -519,10 +584,60 @@ function getAllTransactions(entities: EntityDataset[]): NormalizedTransaction[] 
   return sortByDateAsc(all);
 }
 
+function getFundingTransactions(entities: EntityDataset[]): NormalizedTransaction[] {
+  // Keep funding cost aligned with mobile chart logic: use CASH top-up records.
+  return getAllTransactions(entities).filter((tx) => tx.type === "CASH");
+}
+
+function createFundingCostResolver(
+  fundingTransactions: NormalizedTransaction[],
+  options?: CalculationConversionOptions,
+): (targetTime: number) => number {
+  let fundingIndex = 0;
+  let cumulativeFunding = 0;
+
+  return (targetTime: number): number => {
+    while (
+      fundingIndex < fundingTransactions.length &&
+      fundingTransactions[fundingIndex].date.getTime() <= targetTime
+    ) {
+      const tx = fundingTransactions[fundingIndex];
+      // Mobile parity: total cost follows CASH amount only (exclude fees).
+      const signedFunding = tx.shares * tx.price;
+      cumulativeFunding += applyConversion(signedFunding, tx.currency, options);
+      fundingIndex += 1;
+    }
+    return round2(cumulativeFunding);
+  };
+}
+
+function calculateFundingCostAtDate(
+  entities: EntityDataset[],
+  date: Date,
+  options?: CalculationConversionOptions,
+): number {
+  const fundingTransactions = getFundingTransactions(entities);
+  if (fundingTransactions.length === 0) {
+    return 0;
+  }
+
+  const targetTime = date.getTime();
+  let total = 0;
+  for (const tx of fundingTransactions) {
+    if (tx.date.getTime() > targetTime) {
+      break;
+    }
+    // Mobile parity: total cost follows CASH amount only (exclude fees).
+    total += applyConversion(tx.shares * tx.price, tx.currency, options);
+  }
+  return round2(total);
+}
+
 function buildMonthlySeriesFromTransactions(
   entities: EntityDataset[],
   extractor: (tx: NormalizedTransaction) => number,
   monthCount: number,
+  options?: CalculationConversionOptions,
 ): ChartBarDatum[] {
   const allTransactions = getAllTransactions(entities);
   if (allTransactions.length === 0) {
@@ -542,7 +657,10 @@ function buildMonthlySeriesFromTransactions(
     }
     const key = monthKey(tx.date);
     const current = monthly.get(key) ?? 0;
-    monthly.set(key, current + extractor(tx));
+    const amount = extractor(tx);
+    const normalizedAmount =
+      amount === 0 ? 0 : applyConversion(amount, tx.currency, options);
+    monthly.set(key, current + normalizedAmount);
   });
 
   const output: ChartBarDatum[] = [];
@@ -623,6 +741,10 @@ function getTransactionCashDelta(tx: NormalizedTransaction): number {
   if (tx.type === "DIVIDEND_CASH") {
     return gross - tx.fee;
   }
+  if (tx.type === "DIVIDEND_SHARE") {
+    // Mobile parity: stock-share dividend still deducts fee from cash.
+    return -tx.fee;
+  }
   if (tx.type === "FEE") {
     return -(gross + tx.fee);
   }
@@ -670,39 +792,92 @@ function calculateCashBalancesAtDate(
   return balances;
 }
 
-export function calculatePortfolioSummary(entities: EntityDataset[]): PortfolioSummary {
+export function calculatePortfolioSummary(
+  entities: EntityDataset[],
+  options?: CalculationConversionOptions,
+): PortfolioSummary {
   const stockBreakdown = calculateStockBreakdown(entities);
   const cashBalances = calculateCashBalances(entities);
-  const summaryCurrency = entities[0]?.currency ?? "USD";
-  const cashBalance =
-    cashBalances.find((item) => item.currency === summaryCurrency)?.balance ??
-    cashBalances[0]?.balance ??
-    0;
+  const summaryCurrency = options?.targetCurrency ?? entities[0]?.currency ?? "USD";
+  const cashBalance = round2(
+    cashBalances.reduce(
+      (total, item) => total + applyConversion(item.balance, item.currency, options),
+      0,
+    ),
+  );
 
   const totalMarketValue = round2(
-    stockBreakdown.reduce((total, item) => total + item.marketValue, 0),
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.marketValue, item.currency, options),
+      0,
+    ),
   );
-  const totalCost = round2(stockBreakdown.reduce((total, item) => total + item.totalCost, 0));
-  const totalProfit = round2(stockBreakdown.reduce((total, item) => total + item.totalProfit, 0));
+  const convertedTotalProfit = round2(
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.totalProfit, item.currency, options),
+      0,
+    ),
+  );
   const holdingProfit = round2(
-    stockBreakdown.reduce((total, item) => total + item.holdingProfit, 0),
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.holdingProfit, item.currency, options),
+      0,
+    ),
   );
   const realizedProfit = round2(
-    stockBreakdown.reduce((total, item) => total + item.realizedProfit, 0),
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.realizedProfit, item.currency, options),
+      0,
+    ),
   );
   const totalDividend = round2(
-    stockBreakdown.reduce((total, item) => total + item.totalDividend, 0),
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.totalDividend, item.currency, options),
+      0,
+    ),
   );
-  const totalFee = round2(stockBreakdown.reduce((total, item) => total + item.totalFee, 0));
+  const totalFee = round2(
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.totalFee, item.currency, options),
+      0,
+    ),
+  );
   const totalAssets = round2(totalMarketValue + cashBalance);
+  const today = startOfDay(new Date());
+  const fundingTotalCost = calculateFundingCostAtDate(entities, today, options);
+  const stockDerivedCost = round2(
+    stockBreakdown.reduce(
+      (total, item) => total + applyConversion(item.totalCost, item.currency, options),
+      0,
+    ),
+  );
+  const totalCost = fundingTotalCost !== 0 ? fundingTotalCost : stockDerivedCost;
 
   const groups = collectStockGroups(entities);
-  const today = startOfDay(new Date());
   const yesterday = addDays(today, -1);
   const dailyProfit = round2(
     groups.reduce((total, group) => {
-      const todayValue = evaluateStockAtDate(group, today).totalProfit;
-      const yesterdayValue = evaluateStockAtDate(group, yesterday).totalProfit;
+      const history = options?.historicalPriceBySymbol?.[group.symbol];
+      const todayHistoricalPrice = resolveRecentHistoricalMarketPriceAtDate(history, today, 5);
+      const yesterdayHistoricalPrice = resolveRecentHistoricalMarketPriceAtDate(
+        history,
+        yesterday,
+        5,
+      );
+      const todayMarketPrice =
+        group.latestPrice > 0
+          ? group.latestPrice
+          : (todayHistoricalPrice ?? undefined);
+      const todayValue = applyConversion(
+        evaluateStockAtDate(group, today, todayMarketPrice).totalProfit,
+        group.currency,
+        options,
+      );
+      const yesterdayValue = applyConversion(
+        evaluateStockAtDate(group, yesterday, yesterdayHistoricalPrice).totalProfit,
+        group.currency,
+        options,
+      );
       return total + (todayValue - yesterdayValue);
     }, 0),
   );
@@ -714,8 +889,8 @@ export function calculatePortfolioSummary(entities: EntityDataset[]): PortfolioS
     totalMarketValue,
     cashBalance: round2(cashBalance),
     totalCost,
-    totalProfit,
-    totalProfitPct: totalCost > 0 ? round2((totalProfit / totalCost) * 100) : 0,
+    totalProfit: convertedTotalProfit,
+    totalProfitPct: totalCost > 0 ? round2((convertedTotalProfit / totalCost) * 100) : 0,
     holdingProfit,
     holdingProfitPct: totalCost > 0 ? round2((holdingProfit / totalCost) * 100) : 0,
     realizedProfit,
@@ -731,6 +906,7 @@ export function calculatePortfolioSummary(entities: EntityDataset[]): PortfolioS
 export function calculateAssetAllocationSegments(
   entities: EntityDataset[],
   maxItems = 8,
+  options?: CalculationConversionOptions,
 ): ChartSlice[] {
   const stockBreakdown = calculateStockBreakdown(entities).filter(
     (item) => Math.abs(item.marketValue) > 0,
@@ -743,12 +919,17 @@ export function calculateAssetAllocationSegments(
 
   const segments: ChartSlice[] = top.map((item, index) => ({
     label: item.symbol,
-    value: round2(Math.abs(item.marketValue)),
+    value: round2(Math.abs(applyConversion(item.marketValue, item.currency, options))),
     color: pickColor(index),
   }));
 
   if (rest.length > 0) {
-    const others = round2(rest.reduce((sum, item) => sum + Math.abs(item.marketValue), 0));
+    const others = round2(
+      rest.reduce(
+        (sum, item) => sum + Math.abs(applyConversion(item.marketValue, item.currency, options)),
+        0,
+      ),
+    );
     if (others > 0) {
       segments.push({
         label: "Others",
@@ -760,7 +941,10 @@ export function calculateAssetAllocationSegments(
 
   const cashByCurrency = calculateCashBalances(entities);
   const totalCash = round2(
-    cashByCurrency.reduce((sum, item) => sum + Math.abs(item.balance), 0),
+    cashByCurrency.reduce(
+      (sum, item) => sum + Math.abs(applyConversion(item.balance, item.currency, options)),
+      0,
+    ),
   );
   if (totalCash > 0) {
     segments.push({
@@ -773,19 +957,28 @@ export function calculateAssetAllocationSegments(
   return segments.filter((item) => item.value > 0);
 }
 
-export function calculateCurrencyExposureSegments(entities: EntityDataset[]): ChartSlice[] {
+export function calculateCurrencyExposureSegments(
+  entities: EntityDataset[],
+  options?: CalculationConversionOptions,
+): ChartSlice[] {
   const stockBreakdown = calculateStockBreakdown(entities);
   const cashBalances = calculateCashBalances(entities);
   const exposure = new Map<string, number>();
 
   stockBreakdown.forEach((item) => {
     const current = exposure.get(item.currency) ?? 0;
-    exposure.set(item.currency, current + Math.abs(item.marketValue));
+    exposure.set(
+      item.currency,
+      current + Math.abs(applyConversion(item.marketValue, item.currency, options)),
+    );
   });
 
   cashBalances.forEach((item) => {
     const current = exposure.get(item.currency) ?? 0;
-    exposure.set(item.currency, current + Math.abs(item.balance));
+    exposure.set(
+      item.currency,
+      current + Math.abs(applyConversion(item.balance, item.currency, options)),
+    );
   });
 
   return [...exposure.entries()]
@@ -798,7 +991,7 @@ export function calculateCurrencyExposureSegments(entities: EntityDataset[]): Ch
     .sort((a, b) => b.value - a.value);
 }
 
-function getCashFlow(tx: NormalizedTransaction): number {
+function getActivityTotal(tx: NormalizedTransaction): number {
   const gross = tx.shares * tx.price;
   if (tx.type === "BUY") {
     return -(gross + tx.fee);
@@ -810,7 +1003,7 @@ function getCashFlow(tx: NormalizedTransaction): number {
     return gross - tx.fee;
   }
   if (tx.type === "DIVIDEND_SHARE") {
-    return 0;
+    return -tx.fee;
   }
   if (tx.type === "FEE") {
     return -(gross + tx.fee);
@@ -824,19 +1017,72 @@ function getCashFlow(tx: NormalizedTransaction): number {
 export function calculateMonthlyDividendSeries(
   entities: EntityDataset[],
   monthCount = 18,
+  options?: CalculationConversionOptions,
 ): ChartBarDatum[] {
   return buildMonthlySeriesFromTransactions(
     entities,
-    (tx) => (tx.type === "DIVIDEND_CASH" ? tx.shares * tx.price : 0),
+    (tx) =>
+      tx.type === "DIVIDEND_CASH" || tx.type === "DIVIDEND_SHARE"
+        ? getActivityTotal(tx)
+        : 0,
     monthCount,
+    options,
+  );
+}
+
+export function calculateMonthlyBuySeries(
+  entities: EntityDataset[],
+  monthCount = 18,
+  options?: CalculationConversionOptions,
+): ChartBarDatum[] {
+  return buildMonthlySeriesFromTransactions(
+    entities,
+    (tx) => (tx.type === "BUY" ? Math.abs(tx.shares * tx.price) : 0),
+    monthCount,
+    options,
+  );
+}
+
+export function calculateMonthlySellSeries(
+  entities: EntityDataset[],
+  monthCount = 18,
+  options?: CalculationConversionOptions,
+): ChartBarDatum[] {
+  return buildMonthlySeriesFromTransactions(
+    entities,
+    (tx) => (tx.type === "SELL" ? Math.abs(tx.shares * tx.price) : 0),
+    monthCount,
+    options,
+  );
+}
+
+export function calculateMonthlyFeeSeries(
+  entities: EntityDataset[],
+  monthCount = 18,
+  options?: CalculationConversionOptions,
+): ChartBarDatum[] {
+  return buildMonthlySeriesFromTransactions(
+    entities,
+    (tx) => (tx.type === "FEE" ? getActivityTotal(tx) : 0),
+    monthCount,
+    options,
   );
 }
 
 export function calculateMonthlyCashFlowSeries(
   entities: EntityDataset[],
   monthCount = 18,
+  options?: CalculationConversionOptions,
 ): ChartBarDatum[] {
-  return buildMonthlySeriesFromTransactions(entities, getCashFlow, monthCount);
+  return buildMonthlySeriesFromTransactions(
+    entities,
+    (tx) =>
+      tx.type === "CASH" || tx.type === "CASH_CONVERT" || tx.type === "INTEREST"
+        ? getActivityTotal(tx)
+        : 0,
+    monthCount,
+    options,
+  );
 }
 
 export function calculateMonthlyTransactionCountSeries(
@@ -844,6 +1090,68 @@ export function calculateMonthlyTransactionCountSeries(
   monthCount = 18,
 ): ChartBarDatum[] {
   return buildMonthlySeriesFromTransactions(entities, () => 1, monthCount);
+}
+
+export function calculateMonthlyProfitSeries(
+  entities: EntityDataset[],
+  monthCount = 18,
+  options?: CalculationConversionOptions,
+): ChartBarDatum[] {
+  const groups = collectStockGroups(entities);
+  if (groups.length === 0) {
+    return [];
+  }
+
+  const today = startOfDay(new Date());
+  const firstMonth = new Date(today.getFullYear(), today.getMonth() - (monthCount - 1), 1);
+  const hasHistoricalSource =
+    Object.keys(options?.historicalPriceBySymbol ?? {}).length > 0;
+
+  if (!hasHistoricalSource) {
+    return buildMonthlySeriesFromTransactions(
+      entities,
+      getActivityTotal,
+      monthCount,
+      options,
+    );
+  }
+
+  const byMonth = new Map<string, number>();
+  let previousTotalProfit: number | null = null;
+  for (
+    let cursor = new Date(firstMonth);
+    cursor.getTime() <= today.getTime();
+    cursor = addDays(cursor, 1)
+  ) {
+    const isToday = cursor.getTime() === today.getTime();
+    let totalProfit = 0;
+    for (const group of groups) {
+      const historicalPrice = resolveHistoricalMarketPriceAtDate(
+        options?.historicalPriceBySymbol?.[group.symbol],
+        cursor,
+      );
+      const marketPrice = isToday && group.latestPrice > 0 ? group.latestPrice : historicalPrice;
+      const metrics = evaluateStockAtDate(group, cursor, marketPrice);
+      totalProfit += applyConversion(metrics.totalProfit, group.currency, options);
+    }
+
+    const dayProfit = previousTotalProfit === null ? 0 : totalProfit - previousTotalProfit;
+    const key = monthKey(cursor);
+    byMonth.set(key, (byMonth.get(key) ?? 0) + dayProfit);
+    previousTotalProfit = totalProfit;
+  }
+
+  const output: ChartBarDatum[] = [];
+  const monthCursor = new Date(firstMonth);
+  for (let i = 0; i < monthCount; i += 1) {
+    const key = monthKey(monthCursor);
+    output.push({
+      label: monthLabel(key),
+      value: round2(byMonth.get(key) ?? 0),
+    });
+    monthCursor.setMonth(monthCursor.getMonth() + 1);
+  }
+  return output;
 }
 
 export function calculateTransactionTypeSeries(entities: EntityDataset[]): ChartBarDatum[] {
@@ -917,7 +1225,6 @@ export function calculateTransactionHeatmap(
 export function calculateNormalizedCompareSeries(
   entities: EntityDataset[],
   range: ChartRange,
-  historicalPriceBySymbol?: Record<string, PricePoint[]>,
   limit = 3,
 ): CompareLineSeries[] {
   const breakdown = calculateStockBreakdown(entities)
@@ -926,7 +1233,7 @@ export function calculateNormalizedCompareSeries(
     .slice(0, limit);
 
   return breakdown.map((item, index) => {
-    const series = calculateSeriesForStock(entities, item.id, range, historicalPriceBySymbol);
+    const series = calculateSeriesForStock(entities, item.id, range);
     if (series.length === 0) {
       return {
         id: item.id,
@@ -990,7 +1297,6 @@ export function calculateInsightMetrics(entities: EntityDataset[]): InsightMetri
 export function calculatePortfolioProfitSeries(
   entities: EntityDataset[],
   range: ChartRange,
-  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): ProfitPoint[] {
   const groups = collectStockGroups(entities);
   if (groups.length === 0) {
@@ -1015,10 +1321,7 @@ export function calculatePortfolioProfitSeries(
   while (cursor.getTime() <= end.getTime()) {
     let total = 0;
     groups.forEach((group) => {
-      total += evaluateStockAtDate(group, cursor, {
-        useLatestPriceOnToday: false,
-        historicalPriceBySymbol,
-      }).totalProfit;
+      total += evaluateStockAtDate(group, cursor).totalProfit;
     });
     points.push({ date: new Date(cursor), profit: round2(total) });
     cursor = addDays(cursor, stepDays);
@@ -1027,10 +1330,7 @@ export function calculatePortfolioProfitSeries(
   if (points.length === 0 || points[points.length - 1].date.getTime() !== end.getTime()) {
     let total = 0;
     groups.forEach((group) => {
-      total += evaluateStockAtDate(group, end, {
-        useLatestPriceOnToday: false,
-        historicalPriceBySymbol,
-      }).totalProfit;
+      total += evaluateStockAtDate(group, end).totalProfit;
     });
     points.push({ date: new Date(end), profit: round2(total) });
   }
@@ -1041,7 +1341,7 @@ export function calculatePortfolioProfitSeries(
 export function calculatePortfolioOverviewSeries(
   entities: EntityDataset[],
   range: ChartRange,
-  historicalPriceBySymbol?: Record<string, PricePoint[]>,
+  options?: CalculationConversionOptions,
 ): PortfolioOverviewPoint[] {
   const allTransactions = getAllTransactions(entities);
   if (allTransactions.length === 0) {
@@ -1049,26 +1349,21 @@ export function calculatePortfolioOverviewSeries(
   }
 
   const groups = collectStockGroups(entities);
-  const summaryCurrency = entities[0]?.currency ?? "USD";
+  const summaryCurrency = options?.targetCurrency ?? entities[0]?.currency ?? "USD";
   const minDate = resolveDisplayMinDate(allTransactions.map((tx) => tx.date));
   if (!minDate) {
     return [];
   }
-  const fundingTransactions = allTransactions.filter((tx) => tx.type === "CASH");
-  let fundingIndex = 0;
-  let cumulativeFunding = 0;
-
-  const resolveFundingCostAtTime = (targetTime: number): number => {
-    while (
-      fundingIndex < fundingTransactions.length &&
-      fundingTransactions[fundingIndex].date.getTime() <= targetTime
-    ) {
-      const tx = fundingTransactions[fundingIndex];
-      cumulativeFunding += tx.shares * tx.price - tx.fee;
-      fundingIndex += 1;
-    }
-    return round2(cumulativeFunding);
-  };
+  const resolveFundingCostAtTime = createFundingCostResolver(
+    getFundingTransactions(entities),
+    options,
+  );
+  const fallbackStockCost = round2(
+    calculateStockBreakdown(entities).reduce(
+      (total, item) => total + applyConversion(item.totalCost, item.currency, options),
+      0,
+    ),
+  );
 
   const { start, end } = resolveDateRange(startOfDay(minDate), range);
   const totalDays = daysBetweenInclusive(start, end);
@@ -1079,22 +1374,31 @@ export function calculatePortfolioOverviewSeries(
   let cursor = new Date(start);
 
   while (cursor.getTime() <= end.getTime()) {
-    const totalCost = resolveFundingCostAtTime(cursor.getTime());
+    const totalCostRaw = resolveFundingCostAtTime(cursor.getTime());
+    const totalCost = totalCostRaw !== 0 ? totalCostRaw : fallbackStockCost;
     let totalProfit = 0;
     let stockMarketValue = 0;
 
+    const isFinalPoint = cursor.getTime() === end.getTime();
     groups.forEach((group) => {
-      const metrics = evaluateStockAtDate(group, cursor, {
-        useLatestPriceOnToday: false,
-        historicalPriceBySymbol,
-      });
-      totalProfit += metrics.totalProfit;
-      stockMarketValue += metrics.marketValue;
+      const historicalPrice = resolveHistoricalMarketPriceAtDate(
+        options?.historicalPriceBySymbol?.[group.symbol],
+        cursor,
+      );
+      const marketPriceForPoint =
+        isFinalPoint && group.latestPrice > 0 ? group.latestPrice : historicalPrice;
+      const metrics = evaluateStockAtDate(group, cursor, marketPriceForPoint);
+      totalProfit += applyConversion(metrics.totalProfit, group.currency, options);
+      stockMarketValue += applyConversion(metrics.marketValue, group.currency, options);
     });
 
     const cashBalances = calculateCashBalancesAtDate(entities, cursor);
-    const fallbackCash = [...cashBalances.values()][0] ?? 0;
-    const cashBalance = cashBalances.get(summaryCurrency) ?? fallbackCash;
+    const cashBalance = round2(
+      [...cashBalances.entries()].reduce(
+        (total, [currency, balance]) => total + applyConversion(balance, currency, options),
+        0,
+      ),
+    );
     const totalAssets = round2(stockMarketValue + cashBalance);
     const totalReturnPct = totalCost > 0 ? round2((totalProfit / totalCost) * 100) : 0;
 
@@ -1112,22 +1416,29 @@ export function calculatePortfolioOverviewSeries(
   }
 
   if (points.length === 0 || points[points.length - 1].date.getTime() !== end.getTime()) {
-    const totalCost = resolveFundingCostAtTime(end.getTime());
+    const totalCostRaw = resolveFundingCostAtTime(end.getTime());
+    const totalCost = totalCostRaw !== 0 ? totalCostRaw : fallbackStockCost;
     let totalProfit = 0;
     let stockMarketValue = 0;
 
     groups.forEach((group) => {
-      const metrics = evaluateStockAtDate(group, end, {
-        useLatestPriceOnToday: false,
-        historicalPriceBySymbol,
-      });
-      totalProfit += metrics.totalProfit;
-      stockMarketValue += metrics.marketValue;
+      const historicalPrice = resolveHistoricalMarketPriceAtDate(
+        options?.historicalPriceBySymbol?.[group.symbol],
+        end,
+      );
+      const marketPriceForPoint = group.latestPrice > 0 ? group.latestPrice : historicalPrice;
+      const metrics = evaluateStockAtDate(group, end, marketPriceForPoint);
+      totalProfit += applyConversion(metrics.totalProfit, group.currency, options);
+      stockMarketValue += applyConversion(metrics.marketValue, group.currency, options);
     });
 
     const cashBalances = calculateCashBalancesAtDate(entities, end);
-    const fallbackCash = [...cashBalances.values()][0] ?? 0;
-    const cashBalance = cashBalances.get(summaryCurrency) ?? fallbackCash;
+    const cashBalance = round2(
+      [...cashBalances.entries()].reduce(
+        (total, [currency, balance]) => total + applyConversion(balance, currency, options),
+        0,
+      ),
+    );
     const totalAssets = round2(stockMarketValue + cashBalance);
     const totalReturnPct = totalCost > 0 ? round2((totalProfit / totalCost) * 100) : 0;
 
@@ -1149,9 +1460,8 @@ export function calculatePortfolioOverviewSeries(
 export function calculateDrawdownSeries(
   entities: EntityDataset[],
   range: ChartRange,
-  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): ChartBarDatum[] {
-  const series = calculatePortfolioProfitSeries(entities, range, historicalPriceBySymbol);
+  const series = calculatePortfolioProfitSeries(entities, range);
   if (series.length === 0) {
     return [];
   }
@@ -1247,7 +1557,6 @@ export function calculateSeriesForStock(
   entities: EntityDataset[],
   stockId: string,
   range: ChartRange,
-  historicalPriceBySymbol?: Record<string, PricePoint[]>,
 ): ProfitPoint[] {
   const target = collectStockGroups(entities).find((group) => group.id === stockId);
   if (!target) {
@@ -1270,19 +1579,13 @@ export function calculateSeriesForStock(
 
   while (cursor.getTime() <= end.getTime()) {
     const pointDate = new Date(cursor);
-    const { totalProfit } = evaluateStockAtDate(target, pointDate, {
-      useLatestPriceOnToday: false,
-      historicalPriceBySymbol,
-    });
+    const { totalProfit } = evaluateStockAtDate(target, pointDate);
     points.push({ date: pointDate, profit: totalProfit });
     cursor = addDays(cursor, stepDays);
   }
 
   if (points.length === 0 || points[points.length - 1].date.getTime() !== end.getTime()) {
-    const { totalProfit } = evaluateStockAtDate(target, end, {
-      useLatestPriceOnToday: false,
-      historicalPriceBySymbol,
-    });
+    const { totalProfit } = evaluateStockAtDate(target, end);
     points.push({ date: new Date(end), profit: totalProfit });
   }
 

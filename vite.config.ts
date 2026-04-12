@@ -7,8 +7,6 @@ const OPENAI_MAX_INPUT_CHARS = 120_000;
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5173",
   "http://localhost:5173",
-  "http://127.0.0.1:4173",
-  "http://localhost:4173",
   "https://stockerwebpro.nanistudio.org",
 ];
 
@@ -79,14 +77,8 @@ function isLocalTestingOrigin(origin: string): boolean {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return false;
     }
-    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    const hostname = parsed.hostname.toLowerCase();
     if (hostname === "localhost" || hostname === "127.0.0.1") {
-      return true;
-    }
-    if (hostname === "::1" || hostname === "0.0.0.0") {
-      return true;
-    }
-    if (hostname.endsWith(".local")) {
       return true;
     }
     return isPrivateIpv4Hostname(hostname);
@@ -119,20 +111,6 @@ function resolveRequestOrigin(request: any): string {
   } catch {
     return "";
   }
-}
-
-function resolveRequestHostOrigin(request: any): string {
-  const hostHeader = String(request.headers["x-forwarded-host"] ?? request.headers.host ?? "").trim();
-  if (!hostHeader) {
-    return "";
-  }
-
-  const forwardedProto = String(request.headers["x-forwarded-proto"] ?? "")
-    .split(",")[0]
-    .trim()
-    .toLowerCase();
-  const protocol = forwardedProto === "https" ? "https" : "http";
-  return `${protocol}://${hostHeader}`;
 }
 
 function applyCorsHeaders(response: any, origin: string): void {
@@ -220,6 +198,26 @@ async function fetchYahooData(payload: Record<string, unknown>): Promise<any> {
     query: `https://query2.finance.yahoo.com/v7/finance/quote?lang=zh-Hant-HK&formatted=true&region=TW&symbols=${encodedSymbol}`,
     chart: `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?range=${range}&interval=${interval}`,
   };
+
+  if (type === "chart") {
+    const symbols = symbol
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (symbols.length > 1) {
+      const entries = await Promise.all(
+        symbols.map(async (item) => {
+          const chartUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${item}?range=${range}&interval=${interval}`;
+          const chartData = await fetchJson(chartUrl);
+          return [item.toUpperCase(), chartData] as const;
+        }),
+      );
+
+      return {
+        chartBatch: Object.fromEntries(entries),
+      };
+    }
+  }
 
   if (type !== "query") {
     return fetchJson(requestUrlByType[type]);
@@ -395,6 +393,8 @@ function localFunctionPlugin() {
   const allowedOrigins = parseAllowedOrigins();
   const allowPrivateTestingOrigins = shouldAllowPrivateTestingOrigins();
   const lastCallAtByOrigin = new Map<string, number>();
+  const recentResponseCacheByKey = new Map<string, { cachedAt: number; data: unknown }>();
+  const inFlightRequestByKey = new Map<string, Promise<unknown>>();
   const monthlyUploadUsageByClient = new Map<string, { month: string; used: number }>();
 
   const consumeMonthlyAiUploadQuota = (
@@ -419,6 +419,26 @@ function localFunctionPlugin() {
     };
   };
 
+  const normalizeThrottleScope = (
+    requestPath: string,
+    requestType: string,
+    body: Record<string, unknown>,
+  ): string => {
+    if (requestPath === "/api/local-functions/normalize-portfolio") {
+      return "normalize";
+    }
+
+    // Throttle by endpoint + request shape, so stock detail chart requests do not block
+    // portfolio chart requests and vice versa.
+    return JSON.stringify({
+      endpoint: requestPath,
+      type: requestType,
+      symbol: String(body.symbol ?? "").trim().toUpperCase(),
+      range: String(body.range ?? "").trim(),
+      interval: String(body.interval ?? "").trim(),
+    });
+  };
+
   const handleLocalFunctionRequest = async (request: any, response: any, next: any) => {
     const requestPath = String(request.url ?? "").split("?")[0];
     const isFunctionPath =
@@ -432,9 +452,7 @@ function localFunctionPlugin() {
     }
 
     const origin = resolveRequestOrigin(request);
-    const hostOrigin = resolveRequestHostOrigin(request);
-    const requestOrigin = origin || hostOrigin;
-    const originAllowed = isAllowedOrigin(requestOrigin, allowedOrigins, allowPrivateTestingOrigins);
+    const originAllowed = isAllowedOrigin(origin, allowedOrigins, allowPrivateTestingOrigins);
 
     if (request.method === "OPTIONS") {
       if (!originAllowed) {
@@ -443,13 +461,13 @@ function localFunctionPlugin() {
         return;
       }
       response.statusCode = 204;
-      applyCorsHeaders(response, requestOrigin);
+      applyCorsHeaders(response, origin);
       response.end();
       return;
     }
 
     if (request.method !== "POST") {
-      sendJson(response, 405, {error: "Method not allowed."}, originAllowed ? requestOrigin : undefined);
+      sendJson(response, 405, {error: "Method not allowed."}, originAllowed ? origin : undefined);
       return;
     }
 
@@ -460,13 +478,13 @@ function localFunctionPlugin() {
 
     const appHeader = String(request.headers["x-stocker-app"] ?? "").trim();
     if (appHeader !== "stocker-web") {
-      sendJson(response, 403, {error: "Missing or invalid app identity header."}, requestOrigin);
+      sendJson(response, 403, {error: "Missing or invalid app identity header."}, origin);
       return;
     }
 
     const clientHeader = String(request.headers["x-stocker-client"] ?? "").trim();
     if (!clientHeader || clientHeader.length < 8 || clientHeader.length > 200) {
-      sendJson(response, 403, {error: "Missing or invalid client identity header."}, requestOrigin);
+      sendJson(response, 403, {error: "Missing or invalid client identity header."}, origin);
       return;
     }
 
@@ -474,7 +492,7 @@ function localFunctionPlugin() {
     try {
       body = await readRequestJson(request);
     } catch (error) {
-      sendJson(response, 400, {error: (error as Error).message}, requestOrigin);
+      sendJson(response, 400, {error: (error as Error).message}, origin);
       return;
     }
 
@@ -482,25 +500,38 @@ function localFunctionPlugin() {
       requestPath === "/api/local-functions/normalize-portfolio"
         ? "normalize"
         : String(body.type ?? "unknown").trim().toLowerCase();
-    const requestSymbol = String(body.symbol ?? "").trim().toUpperCase();
-    const requestRange = String(body.range ?? "").trim().toLowerCase();
-    const requestInterval = String(body.interval ?? "").trim().toLowerCase();
-    const rateLimitScope =
-      requestType === "chart"
-        ? `chart:${requestSymbol}:${requestRange}:${requestInterval}`
-        : requestType === "query"
-          ? `query:${requestSymbol}`
-          : requestType;
+    const throttleScope = normalizeThrottleScope(requestPath, requestType, body);
     const now = Date.now();
-    const rateLimitKey = `${requestOrigin || "unknown-origin"}:${requestPath}:${rateLimitScope}`;
+    const rateLimitKey = `${origin || "unknown-origin"}:${requestPath}:${throttleScope}`;
     const lastCallAt = lastCallAtByOrigin.get(rateLimitKey) ?? 0;
-    if (now - lastCallAt < RATE_LIMIT_WINDOW_MS) {
+
+    // For stock/crypto quote endpoints, reuse fresh response instead of returning 429.
+    // This avoids noisy rate-limit errors in the UI while still protecting upstream usage.
+    const isNormalizeRequest = requestPath === "/api/local-functions/normalize-portfolio";
+    if (!isNormalizeRequest) {
+      const cached = recentResponseCacheByKey.get(rateLimitKey);
+      if (cached && now - cached.cachedAt < RATE_LIMIT_WINDOW_MS) {
+        sendJson(response, 200, {data: cached.data, cached: true}, origin);
+        return;
+      }
+
+      const inFlight = inFlightRequestByKey.get(rateLimitKey);
+      if (inFlight) {
+        try {
+          const inFlightData = await inFlight;
+          sendJson(response, 200, {data: inFlightData, cached: true}, origin);
+        } catch (error) {
+          sendJson(response, 500, {error: (error as Error).message}, origin);
+        }
+        return;
+      }
+    } else if (now - lastCallAt < RATE_LIMIT_WINDOW_MS) {
       const retryAfterSeconds = Math.ceil((RATE_LIMIT_WINDOW_MS - (now - lastCallAt)) / 1000);
       sendJson(
         response,
         429,
         {error: `Too many requests. Retry after ${retryAfterSeconds} seconds.`},
-        requestOrigin,
+        origin,
       );
       return;
     }
@@ -513,30 +544,39 @@ function localFunctionPlugin() {
             response,
             500,
             {error: "Server missing STOCKER_AI_API_KEY. Add it to .env.local and restart."},
-            requestOrigin,
+            origin,
           );
           return;
         }
 
         let quota;
         try {
-          quota = consumeMonthlyAiUploadQuota(`${requestOrigin}:${clientHeader}`);
+          quota = consumeMonthlyAiUploadQuota(`${origin}:${clientHeader}`);
         } catch (error) {
-          sendJson(response, 429, {error: (error as Error).message}, requestOrigin);
+          sendJson(response, 429, {error: (error as Error).message}, origin);
           return;
         }
 
         const normalized = await normalizePortfolioWithOpenAi(body);
-        sendJson(response, 200, {data: {normalized, quota}}, requestOrigin);
+        sendJson(response, 200, {data: {normalized, quota}}, origin);
         return;
       }
 
-      const data = requestPath === "/api/local-functions/fetch-stock-data"
-        ? await fetchYahooData(body)
-        : await fetchCryptoData(body);
-      sendJson(response, 200, {data}, requestOrigin);
+      const upstreamPromise = (requestPath === "/api/local-functions/fetch-stock-data"
+        ? fetchYahooData(body)
+        : fetchCryptoData(body)) as Promise<unknown>;
+      inFlightRequestByKey.set(rateLimitKey, upstreamPromise);
+
+      const data = await upstreamPromise;
+      recentResponseCacheByKey.set(rateLimitKey, {
+        cachedAt: Date.now(),
+        data,
+      });
+      sendJson(response, 200, {data}, origin);
     } catch (error) {
-      sendJson(response, 500, {error: (error as Error).message}, requestOrigin);
+      sendJson(response, 500, {error: (error as Error).message}, origin);
+    } finally {
+      inFlightRequestByKey.delete(rateLimitKey);
     }
   };
 
