@@ -1,4 +1,4 @@
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
 import { doc, getDoc, onSnapshot, runTransaction, serverTimestamp } from "firebase/firestore";
 import { deflate, inflate } from "pako";
@@ -116,6 +116,8 @@ interface AiImportResponse {
 interface ImportReviewSource {
   rawText: string;
   fileName: string;
+  fileCount: number;
+  fileNames: string[];
   preferredType: UserType;
   localQuota: UploadQuotaSnapshot;
   usedAi: boolean;
@@ -133,13 +135,25 @@ interface ImportPortfolioOptions {
   currentNormalized?: string;
 }
 
+interface ImportBatchItem {
+  fileName: string;
+  rawText: string;
+  entities: EntityDataset[];
+  usedAi: boolean;
+  localQuota: UploadQuotaSnapshot;
+  aiQuota?: AiImportResponse["quota"];
+}
+
 const STORAGE_KEY = "stocker-web-v2";
 const SETTINGS_STORAGE_KEY = "stocker-web-settings-v1";
 const BETA_CONSENT_STORAGE_KEY = "stocker-web-beta-consent-v1";
+const ALL_PORTFOLIO_ID = "all";
 const STOCK_QUOTE_MIN_REQUEST_GAP_MS = 60 * 1000;
 const ENABLE_SYNC_TRACE = Boolean(import.meta.env.DEV);
+const ENABLE_PORTFOLIO_SELECTION_TRACE = true;
 const MONTHLY_UPLOAD_LIMIT = 20;
 const UPLOAD_QUOTA_STORAGE_KEY = "stocker-web-upload-quota-v1";
+const FRANKFURTER_LATEST_URL = "https://api.frankfurter.dev/v1/latest";
 const STOCK_PRICE_TRANSACTION_TYPES = new Set<TxType>([
   "BUY",
   "SELL",
@@ -148,11 +162,44 @@ const STOCK_PRICE_TRANSACTION_TYPES = new Set<TxType>([
   "FEE",
 ]);
 
+const FIXED_USD_FX_RATES: Record<string, number> = {
+  USD: 1,
+  USDT: 1,
+  HKD: 7.8,
+  TWD: 32,
+  JPY: 150,
+  CNY: 7.2,
+  CNH: 7.2,
+  EUR: 0.92,
+  GBP: 0.79,
+  AUD: 1.52,
+  CAD: 1.36,
+  SGD: 1.35,
+  KRW: 1350,
+  INR: 83,
+  CHF: 0.9,
+};
+
 interface UploadQuotaSnapshot {
   month: string;
   used: number;
   remaining: number;
   limit: number;
+}
+
+function buildSafePortfolioId(rawId: string, fallbackSeed: string, usedIds: Set<string>): string {
+  const trimmed = rawId.trim();
+  let candidate = trimmed || fallbackSeed;
+  if (candidate.toLowerCase() === ALL_PORTFOLIO_ID) {
+    candidate = fallbackSeed;
+  }
+  let counter = 2;
+  while (usedIds.has(candidate) || candidate.toLowerCase() === ALL_PORTFOLIO_ID) {
+    candidate = `${fallbackSeed}-${counter}`;
+    counter += 1;
+  }
+  usedIds.add(candidate);
+  return candidate;
 }
 
 function currentMonthKey(): string {
@@ -465,7 +512,7 @@ function buildSlicesFromMap(values: Map<string, number>): ChartSlice[] {
     .filter(([, value]) => value > 0)
     .sort((a, b) => b[1] - a[1])
     .map(([label, value], index) => ({
-      label,
+      label: String(label ?? "").trim() || "Other",
       value: Math.round(value * 100) / 100,
       color: PIE_SEGMENT_COLORS[index % PIE_SEGMENT_COLORS.length],
     }));
@@ -560,10 +607,6 @@ function isValidCurrencyCode(code: string): boolean {
   return /^[A-Z0-9]{2,8}$/.test(code);
 }
 
-function buildFxPairSymbol(fromCurrency: string, toCurrency: string): string {
-  return `${fromCurrency}${toCurrency}=X`;
-}
-
 function resolveFxRateFromPairMap(
   pairMap: Record<string, number>,
   fromCurrency: string,
@@ -600,49 +643,99 @@ function resolveFxRateFromPairMap(
   return null;
 }
 
-function buildFxSymbolsForConversion(currencies: string[]): string[] {
-  const symbols = new Set<string>();
-
-  const addPairBothDirections = (from: string, to: string): void => {
-    if (!from || !to || from === to) {
-      return;
-    }
-    symbols.add(buildFxPairSymbol(from, to));
-    symbols.add(buildFxPairSymbol(to, from));
-  };
-
-  currencies.forEach((currency) => {
-    const normalized = normalizeCurrencyCode(currency);
-    if (!normalized || normalized === "USD") {
-      return;
-    }
-    addPairBothDirections(normalized, "USD");
-  });
-
-  return [...symbols];
-}
-
-function buildFxRatePairMapFromQuotePriceMap(quotePriceBySymbol: Record<string, number>): Record<string, number> {
+function buildFxRatePairMapFromUsdRates(
+  usdRateByCurrency: Record<string, number>,
+  currencies: string[],
+): Record<string, number> {
   const pairMap: Record<string, number> = {};
-  const fxSymbolPattern = /^([A-Z]{3})([A-Z]{3})=X$/;
+  const uniqueCurrencies = [...new Set(currencies
+    .map((currency) => normalizeCurrencyCode(currency))
+    .filter((currency) => currency && currency !== "AUTO"))];
+  if (!uniqueCurrencies.includes("USD")) {
+    uniqueCurrencies.push("USD");
+  }
 
-  Object.entries(quotePriceBySymbol).forEach(([symbol, rawRate]) => {
-    const match = symbol.match(fxSymbolPattern);
-    if (!match) {
+  uniqueCurrencies.forEach((from) => {
+    const fromPerUsd = usdRateByCurrency[from];
+    if (!(typeof fromPerUsd === "number" && Number.isFinite(fromPerUsd) && fromPerUsd > 0)) {
       return;
     }
-    const rate = Number(rawRate);
-    if (!Number.isFinite(rate) || rate <= 0) {
-      return;
-    }
 
-    const from = match[1];
-    const to = match[2];
-    pairMap[`${from}->${to}`] = rate;
-    pairMap[`${to}->${from}`] = 1 / rate;
+    uniqueCurrencies.forEach((to) => {
+      const toPerUsd = usdRateByCurrency[to];
+      if (!(typeof toPerUsd === "number" && Number.isFinite(toPerUsd) && toPerUsd > 0)) {
+        return;
+      }
+      pairMap[`${from}->${to}`] = toPerUsd / fromPerUsd;
+    });
   });
 
   return pairMap;
+}
+
+interface FxRateFetchResult {
+  pairMap: Record<string, number>;
+  fallbackCurrencies: string[];
+  missingCurrencies: string[];
+  liveCurrencies: string[];
+}
+
+async function fetchFrankfurterFxRates(currencies: string[]): Promise<FxRateFetchResult> {
+  const normalizedCurrencies = [...new Set(currencies
+    .map((currency) => normalizeCurrencyCode(currency))
+    .filter((currency) => currency && currency !== "AUTO" && isValidCurrencyCode(currency)))];
+  if (!normalizedCurrencies.includes("USD")) {
+    normalizedCurrencies.push("USD");
+  }
+
+  const requestedCurrencies = normalizedCurrencies.filter((currency) => currency !== "USD");
+  const usdRateByCurrency: Record<string, number> = { USD: 1 };
+  const liveCurrencies: string[] = [];
+
+  if (requestedCurrencies.length > 0) {
+    const params = new URLSearchParams({
+      base: "USD",
+    });
+    const response = await fetch(`${FRANKFURTER_LATEST_URL}?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(`Frankfurter FX request failed (${response.status}).`);
+    }
+
+    const payload = (await response.json()) as { rates?: Record<string, number> };
+    Object.entries(payload.rates ?? {}).forEach(([currency, rawRate]) => {
+      const normalized = normalizeCurrencyCode(currency);
+      const rate = Number(rawRate);
+      if (!normalized || !Number.isFinite(rate) || rate <= 0) {
+        return;
+      }
+      usdRateByCurrency[normalized] = rate;
+      if (requestedCurrencies.includes(normalized)) {
+        liveCurrencies.push(normalized);
+      }
+    });
+  }
+
+  const fallbackCurrencies: string[] = [];
+  normalizedCurrencies.forEach((currency) => {
+    if (currency in usdRateByCurrency) {
+      return;
+    }
+    const fallback = FIXED_USD_FX_RATES[currency];
+    if (typeof fallback === "number" && Number.isFinite(fallback) && fallback > 0) {
+      usdRateByCurrency[currency] = fallback;
+      fallbackCurrencies.push(currency);
+    }
+  });
+
+  const missingCurrencies = normalizedCurrencies.filter((currency) => !(currency in usdRateByCurrency));
+  const pairMap = buildFxRatePairMapFromUsdRates(usdRateByCurrency, normalizedCurrencies);
+
+  return {
+    pairMap,
+    fallbackCurrencies,
+    missingCurrencies,
+    liveCurrencies,
+  };
 }
 
 function formatPercent(value: number): string {
@@ -986,6 +1079,32 @@ function parseQuoteNumber(value: unknown): number | null {
   }
 
   return parseQuoteNumber(record.fmt);
+}
+
+function buildYahooSymbolCandidates(symbol: string): string[] {
+  const normalized = symbol.trim().toUpperCase();
+  if (!normalized) {
+    return [];
+  }
+  const candidates = [normalized];
+  if (normalized.endsWith("-USDT")) {
+    candidates.push(normalized.replace(/-USDT$/, "-USD"));
+  }
+  return [...new Set(candidates)];
+}
+
+function resolveQuotedPriceBySymbol(
+  quotePriceMap: Record<string, number>,
+  symbol: string,
+): number | null {
+  const candidates = buildYahooSymbolCandidates(symbol);
+  for (const candidate of candidates) {
+    const price = quotePriceMap[candidate];
+    if (typeof price === "number" && Number.isFinite(price) && price > 0) {
+      return price;
+    }
+  }
+  return null;
 }
 
 function extractYahooQuotePriceMap(payload: unknown): Record<string, number> {
@@ -1389,16 +1508,21 @@ function normalizeTransactionForSync(
 }
 
 function normalizeEntityForSync(entity: EntityDataset, index: number): EntityDataset {
+  const fallbackId = `portfolio-${index + 1}`;
+  const safeId =
+    entity.id.trim() && entity.id.trim().toLowerCase() !== ALL_PORTFOLIO_ID
+      ? entity.id.trim()
+      : fallbackId;
   const normalizedTransactions = sortTransactionsByDateAsc(
     entity.transactions
       .map((tx, txIndex) =>
-        normalizeTransactionForSync(tx, `tx-${entity.id || index}-${txIndex}`),
+        normalizeTransactionForSync(tx, `tx-${safeId}-${txIndex}`),
       )
       .filter((tx) => tx.symbol),
   );
 
   return {
-    id: entity.id || `portfolio-${index + 1}`,
+    id: safeId,
     name: entity.name.trim() || `Portfolio ${index + 1}`,
     currency: normalizeCurrencyCode(entity.currency) || "USD",
     transactions: normalizedTransactions,
@@ -1636,10 +1760,11 @@ function cloneEntitiesForReview(entities: EntityDataset[]): EntityDataset[] {
 }
 
 function normalizeReviewEntities(entities: EntityDataset[]): EntityDataset[] {
+  const usedPortfolioIds = new Set<string>();
   return entities
     .map((entity, index) => {
       const portfolioCurrency = normalizeCurrencyCode(entity.currency) || "USD";
-      const portfolioId = entity.id || `portfolio-${index + 1}`;
+      const portfolioId = buildSafePortfolioId(entity.id, `portfolio-${index + 1}`, usedPortfolioIds);
       const portfolioName = entity.name.trim() || `Portfolio ${index + 1}`;
 
       const transactions = entity.transactions
@@ -1679,6 +1804,118 @@ function normalizeReviewEntities(entities: EntityDataset[]): EntityDataset[] {
       };
     })
     .filter((entity) => entity.transactions.length > 0 || entity.name.trim().length > 0);
+}
+
+function normalizePortfolioIdsForUi(
+  entities: EntityDataset[],
+): { normalizedEntities: EntityDataset[]; idMap: Map<string, string>; changed: boolean } {
+  const usedIds = new Set<string>();
+  const idMap = new Map<string, string>();
+  let changed = false;
+
+  const normalizedEntities = entities.map((entity, index) => {
+    const safeId = buildSafePortfolioId(entity.id, `portfolio-${index + 1}`, usedIds);
+    if (safeId !== entity.id) {
+      changed = true;
+    }
+    if (!idMap.has(entity.id)) {
+      idMap.set(entity.id, safeId);
+    }
+    return {
+      ...entity,
+      id: safeId,
+    };
+  });
+
+  return { normalizedEntities, idMap, changed };
+}
+
+function buildImportBatchRawText(items: ImportBatchItem[]): string {
+  if (items.length === 1) {
+    return items[0].rawText;
+  }
+  return items
+    .map((item) =>
+      [
+        `[STOCKER_IMPORT_FILE] ${item.fileName}`,
+        item.rawText,
+      ].join("\n"),
+    )
+    .join("\n\n");
+}
+
+function mergeImportBatchEntities(items: ImportBatchItem[]): EntityDataset[] {
+  const portfolioMap = new Map<string, EntityDataset>();
+  const transactionSignaturesByPortfolio = new Map<string, Set<string>>();
+  const usedPortfolioIds = new Set<string>();
+
+  items.forEach((item, itemIndex) => {
+    item.entities.forEach((entity, entityIndex) => {
+      const currency = normalizeCurrencyCode(entity.currency) || "USD";
+      const trimmedId = entity.id.trim();
+      const portfolioName = entity.name.trim() || `Portfolio ${portfolioMap.size + 1}`;
+      const portfolioKey = trimmedId
+        ? `id:${trimmedId.toUpperCase()}`
+        : `name:${portfolioName.toLowerCase()}|currency:${currency}`;
+
+      if (!portfolioMap.has(portfolioKey)) {
+        const safeId = buildSafePortfolioId(trimmedId, `portfolio-import-${portfolioMap.size + 1}`, usedPortfolioIds);
+        portfolioMap.set(portfolioKey, {
+          id: safeId,
+          name: portfolioName,
+          currency,
+          transactions: [],
+          latestPriceBySymbol: {},
+        });
+        transactionSignaturesByPortfolio.set(portfolioKey, new Set<string>());
+      }
+
+      const targetPortfolio = portfolioMap.get(portfolioKey);
+      const signatures = transactionSignaturesByPortfolio.get(portfolioKey);
+      if (!targetPortfolio || !signatures) {
+        return;
+      }
+
+      entity.transactions.forEach((tx) => {
+        const date = Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date();
+        const symbol = tx.symbol.trim().toUpperCase();
+        const txCurrency = normalizeCurrencyCode(tx.currency) || currency;
+
+        if (!symbol) {
+          return;
+        }
+
+        const normalizedTxBase: Omit<NormalizedTransaction, "id"> = {
+          date,
+          symbol,
+          type: tx.type,
+          shares: Number.isFinite(tx.shares) ? tx.shares : 0,
+          price: Number.isFinite(tx.price) ? tx.price : 0,
+          fee: Number.isFinite(tx.fee) ? tx.fee : 0,
+          currency: txCurrency,
+          note: tx.note ?? "",
+        };
+
+        const signature = transactionSnapshot({
+          id: "__sig__",
+          ...normalizedTxBase,
+        });
+        if (signatures.has(signature)) {
+          return;
+        }
+        signatures.add(signature);
+
+        const uniqueIndex = targetPortfolio.transactions.length + 1;
+        const dateKey = Number.isFinite(date.getTime()) ? date.getTime() : Date.now();
+        targetPortfolio.transactions.push({
+          id: `imp-${targetPortfolio.id}-${itemIndex + 1}-${entityIndex + 1}-${uniqueIndex}-${dateKey}`,
+          ...normalizedTxBase,
+        });
+      });
+    });
+  });
+
+  return Array.from(portfolioMap.values()).map((entity, index) => normalizeEntityForSync(entity, index));
 }
 
 function buildDefaultDraft(portfolioId: string, currency: string): TransactionDraft {
@@ -1733,6 +1970,8 @@ export default function App(): JSX.Element {
   const [errorMessage, setErrorMessage] = useState("");
   const [importStatusMessage, setImportStatusMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isEntryUploadDragOver, setEntryUploadDragOver] = useState(false);
+  const [isDataUploadDragOver, setDataUploadDragOver] = useState(false);
   const [isImportReviewOpen, setImportReviewOpen] = useState(false);
   const [importReviewEntities, setImportReviewEntities] = useState<EntityDataset[]>([]);
   const [importReviewSource, setImportReviewSource] = useState<ImportReviewSource | null>(null);
@@ -1775,6 +2014,9 @@ export default function App(): JSX.Element {
   const portfolioHistorySyncInFlightRef = useRef(false);
   const portfolioHistoryLastRequestedAtRef = useRef(0);
   const portfolioHistoryAutoRequestedRef = useRef(false);
+  const manualPortfolioSelectionRef = useRef<string | null>(null);
+  const selectedPortfolioSetReasonRef = useRef("init");
+  const selectedPortfolioLastValueRef = useRef(ALL_PORTFOLIO_ID);
   const fxRenderPreviewTraceKeyRef = useRef("");
   const cloudDocExistsRef = useRef(false);
   const cloudHydratingRef = useRef(false);
@@ -1789,11 +2031,47 @@ export default function App(): JSX.Element {
 
   const isZh = settings.language === "zh-HK";
   const localeTag = isZh ? "zh-HK" : "en-US";
-  const t = (en: string, zh: string): string => (isZh ? zh : en);
+  const t = useCallback((en: string, zh: string): string => (isZh ? zh : en), [isZh]);
   const rangeTitle = (preset: ChartRangePreset): string =>
     isZh ? TIME_RANGE_TITLES_ZH[preset] : TIME_RANGE_TITLES[preset];
   const dateFilterLabel = (preset: DateFilterPreset, fallback: string): string =>
     isZh ? DATE_FILTER_LABELS_ZH[preset] : fallback;
+  const setSelectedPortfolioIdWithTrace = useCallback(
+    (nextPortfolioId: string, reason: string): void => {
+      selectedPortfolioSetReasonRef.current = reason;
+      if (ENABLE_PORTFOLIO_SELECTION_TRACE) {
+        console.warn("[PORTFOLIO_TRACE:set]", {
+          from: selectedPortfolioLastValueRef.current,
+          to: nextPortfolioId,
+          reason,
+          stack: new Error().stack?.split("\n").slice(0, 6).join("\n"),
+        });
+      }
+      setSelectedPortfolioId(nextPortfolioId);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const previousId = selectedPortfolioLastValueRef.current;
+    if (previousId === selectedPortfolioId) {
+      return;
+    }
+
+    if (ENABLE_PORTFOLIO_SELECTION_TRACE) {
+      console.warn("[PORTFOLIO_TRACE:changed]", {
+        from: previousId,
+        to: selectedPortfolioId,
+        reason: selectedPortfolioSetReasonRef.current,
+        screen,
+        tab: activeTab,
+        rememberedManual: manualPortfolioSelectionRef.current,
+        portfolioIds: entities.map((entity) => entity.id),
+      });
+    }
+
+    selectedPortfolioLastValueRef.current = selectedPortfolioId;
+  }, [activeTab, entities, screen, selectedPortfolioId]);
 
   const persistCloudData = useCallback(
     async (
@@ -1898,7 +2176,7 @@ export default function App(): JSX.Element {
         setCloudSaving(false);
       }
     },
-    [t],
+    [setSelectedPortfolioIdWithTrace, t],
   );
 
   const loadCloudData = useCallback(
@@ -1917,7 +2195,7 @@ export default function App(): JSX.Element {
         if (!snapshot.exists()) {
           cloudDocExistsRef.current = false;
           setEntities([]);
-          setSelectedPortfolioId("all");
+          setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "loadCloudData:no-document");
           setSelectedStockId("");
           setSelectedStockDetailId(null);
           setScreen("choose");
@@ -1940,7 +2218,7 @@ export default function App(): JSX.Element {
         const parsedEntities = await parseRemoteDatabasePayload(remoteRaw);
         if (parsedEntities.length > 0) {
           setEntities(parsedEntities);
-          setSelectedPortfolioId("all");
+          setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "loadCloudData:parsed-entities");
           setSelectedStockId("");
           setSelectedStockDetailId(null);
           setSelectedRange("1Y");
@@ -1963,7 +2241,7 @@ export default function App(): JSX.Element {
           setCloudStatusMessage(t("Cloud portfolio loaded.", "已載入雲端投資組合。"));
         } else {
           setEntities([]);
-          setSelectedPortfolioId("all");
+          setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "loadCloudData:parsed-empty");
           setSelectedStockId("");
           setSelectedStockDetailId(null);
           setScreen("choose");
@@ -2012,7 +2290,7 @@ export default function App(): JSX.Element {
           : t("Google sign-in failed.", "Google 登入失敗。"),
       );
     }
-  }, [t]);
+  }, [setSelectedPortfolioIdWithTrace, t]);
 
   const drainCloudPersistQueue = useCallback(async (): Promise<void> => {
     if (cloudPersistInFlightRef.current) {
@@ -2060,7 +2338,7 @@ export default function App(): JSX.Element {
     try {
       await signOut(firebaseAuth);
       setEntities([]);
-      setSelectedPortfolioId("all");
+      setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "auth:sign-out");
       setSelectedStockId("");
       setSelectedStockDetailId(null);
       setScreen("choose");
@@ -2185,7 +2463,7 @@ export default function App(): JSX.Element {
               ...buildSyncSummary(mergedEntities),
             });
             setEntities(mergedEntities);
-            setSelectedPortfolioId("all");
+            setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "snapshot:apply-non-dashboard");
             setSelectedStockId("");
             setSelectedStockDetailId(null);
             setUserType("stockerpro");
@@ -2460,34 +2738,6 @@ export default function App(): JSX.Element {
       )
       .sort((a, b) => a.localeCompare(b));
   }, [entities, normalizedDisplayCurrency, portfolioSummary.currency]);
-
-  const fxUniverseCurrencies = useMemo(() => {
-    const universe = new Set<string>();
-    universe.add(normalizeCurrencyCode(settings.defaultCurrency));
-    universe.add(normalizeCurrencyCode(portfolioSummary.currency));
-    universe.add(normalizedDisplayCurrency);
-    displayCurrencyOptions.forEach((currency) => universe.add(normalizeCurrencyCode(currency)));
-    entities.forEach((entity) => {
-      universe.add(normalizeCurrencyCode(entity.currency));
-      entity.transactions.forEach((tx) => universe.add(normalizeCurrencyCode(tx.currency)));
-    });
-
-    return [...universe]
-      .filter((currency) => currency && currency !== "AUTO" && isValidCurrencyCode(currency))
-      .sort((a, b) => a.localeCompare(b));
-  }, [
-    displayCurrencyOptions,
-    entities,
-    normalizedDisplayCurrency,
-    portfolioSummary.currency,
-    settings.defaultCurrency,
-  ]);
-
-  const fxSymbols = useMemo(
-    () => buildFxSymbolsForConversion(fxUniverseCurrencies),
-    [fxUniverseCurrencies],
-  );
-  const fxSymbolsKey = useMemo(() => fxSymbols.join("|"), [fxSymbols]);
 
   const stockBreakdown = useMemo(
     () => calculateStockBreakdown(filteredEntities),
@@ -2911,6 +3161,15 @@ export default function App(): JSX.Element {
       return 0;
     }
 
+    // Keep stock detail modal consistent with current portfolio filter:
+    // prefer quote inside filtered entities first, then fallback to all entities.
+    for (const entity of filteredEntities) {
+      const livePrice = entity.latestPriceBySymbol[stockDetail.symbol];
+      if (typeof livePrice === "number" && Number.isFinite(livePrice) && livePrice > 0) {
+        return livePrice;
+      }
+    }
+
     for (const entity of entities) {
       const livePrice = entity.latestPriceBySymbol[stockDetail.symbol];
       if (typeof livePrice === "number" && Number.isFinite(livePrice) && livePrice > 0) {
@@ -2919,7 +3178,14 @@ export default function App(): JSX.Element {
     }
 
     return stockDetail.lastPrice;
-  }, [entities, stockDetail]);
+  }, [entities, filteredEntities, stockDetail]);
+
+  const stockDetailLiveMarketValue = useMemo(() => {
+    if (!stockDetail) {
+      return 0;
+    }
+    return stockDetail.activeShares * stockDetailLivePrice;
+  }, [stockDetail, stockDetailLivePrice]);
 
   const refreshPortfolioQuotes = useCallback(
     async (trigger: "auto" | "manual" = "manual"): Promise<void> => {
@@ -2927,14 +3193,17 @@ export default function App(): JSX.Element {
         return;
       }
 
-      const stockSymbols = portfolioStockSymbolKey ? portfolioStockSymbolKey.split("|") : [];
-      const requestSymbols = [...new Set([...stockSymbols, ...fxSymbols])];
-      if (requestSymbols.length === 0) {
+      const stockSymbols = portfolioStockSymbolKey
+        ? portfolioStockSymbolKey.split("|").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean)
+        : [];
+      const requestSymbols = [...new Set(stockSymbols)];
+      const shouldSyncFx = normalizedDisplayCurrency !== "AUTO" && fxSourceCurrencies.length > 0;
+      if (requestSymbols.length === 0 && !shouldSyncFx) {
         if (trigger === "manual") {
           setQuoteSyncError(
             isZh
               ? "目前未有可更新股價或匯率資料。"
-              : "No stock symbols or FX pairs to refresh right now.",
+              : "No stock symbols or currencies to refresh right now.",
           );
         }
         return;
@@ -2970,115 +3239,183 @@ export default function App(): JSX.Element {
       }
 
       try {
-        if (normalizedDisplayCurrency !== "AUTO") {
-          syncTrace("fx:request:start", {
-            trigger,
-            targetCurrency: normalizedDisplayCurrency,
-            fxSourceCurrencies,
-            fxSymbols,
-          });
-        }
-
-        const rawResponse = await fetchLocalStockData<unknown>({
-          type: "query",
-          symbol: requestSymbols.join(","),
-        });
-
-        const latestPriceMap = extractYahooQuotePriceMap(rawResponse);
-        if (normalizedDisplayCurrency !== "AUTO") {
-          syncTrace("fx:quotes:received", {
-            quoteSymbolCount: Object.keys(latestPriceMap).length,
-            quoteSymbols: Object.keys(latestPriceMap).slice(0, 50),
-          });
-        }
-        const syncedSymbols = Object.keys(latestPriceMap).filter((symbol) => {
-          const value = latestPriceMap[symbol];
-          return typeof value === "number" && Number.isFinite(value) && value > 0;
-        });
-        if (syncedSymbols.length === 0) {
-          throw new Error(
-            isZh
-              ? "報價服務未回傳有效股價資料。"
-              : "No valid price returned from quote service.",
-          );
-        }
-
-        setEntities((previous) =>
-          previous.map((entity) => {
-            const entitySymbols = new Set<string>();
-            entity.transactions.forEach((tx) => {
-              if (isStockSymbolTransaction(tx)) {
-                entitySymbols.add(tx.symbol.toUpperCase());
-              }
+        if (requestSymbols.length > 0) {
+          try {
+            const rawResponse = await fetchLocalStockData<unknown>({
+              type: "query",
+              symbol: requestSymbols.join(","),
             });
 
-            if (entitySymbols.size === 0) {
-              return entity;
+            const latestPriceMap = extractYahooQuotePriceMap(rawResponse);
+            if (normalizedDisplayCurrency !== "AUTO") {
+              syncTrace("fx:quotes:received", {
+                quoteSymbolCount: Object.keys(latestPriceMap).length,
+                quoteSymbols: Object.keys(latestPriceMap).slice(0, 50),
+              });
+            }
+            const syncedSymbols = Object.keys(latestPriceMap).filter((symbol) => {
+              const value = latestPriceMap[symbol];
+              return typeof value === "number" && Number.isFinite(value) && value > 0;
+            });
+            if (syncedSymbols.length === 0) {
+              throw new Error(
+                isZh
+                  ? "報價服務未回傳有效股價資料。"
+                  : "No valid price returned from quote service.",
+              );
             }
 
-            let changed = false;
-            const nextLatestPriceBySymbol = { ...entity.latestPriceBySymbol };
-            entitySymbols.forEach((symbol) => {
-              const latestPrice = latestPriceMap[symbol];
-              if (
-                typeof latestPrice === "number" &&
-                Number.isFinite(latestPrice) &&
-                latestPrice > 0 &&
-                nextLatestPriceBySymbol[symbol] !== latestPrice
-              ) {
-                nextLatestPriceBySymbol[symbol] = latestPrice;
-                changed = true;
-              }
-            });
+            setEntities((previous) =>
+              previous.map((entity) => {
+                const entitySymbols = new Set<string>();
+                entity.transactions.forEach((tx) => {
+                  if (isStockSymbolTransaction(tx)) {
+                    entitySymbols.add(tx.symbol.toUpperCase());
+                  }
+                });
 
-            return changed ? { ...entity, latestPriceBySymbol: nextLatestPriceBySymbol } : entity;
-          }),
-        );
+                if (entitySymbols.size === 0) {
+                  return entity;
+                }
 
-        const syncedStockCount = stockSymbols.filter((symbol) =>
-          Object.prototype.hasOwnProperty.call(latestPriceMap, symbol),
-        ).length;
-        setQuoteSyncedCount(syncedStockCount);
-        setQuoteLastUpdatedAt(new Date());
-        setQuoteSyncError("");
+                let changed = false;
+                const nextLatestPriceBySymbol = { ...entity.latestPriceBySymbol };
+                entitySymbols.forEach((symbol) => {
+                  const latestPrice = resolveQuotedPriceBySymbol(latestPriceMap, symbol);
+                  if (
+                    typeof latestPrice === "number" &&
+                    Number.isFinite(latestPrice) &&
+                    latestPrice > 0 &&
+                    nextLatestPriceBySymbol[symbol] !== latestPrice
+                  ) {
+                    nextLatestPriceBySymbol[symbol] = latestPrice;
+                    changed = true;
+                  }
+                });
 
-        const nextFxRates = buildFxRatePairMapFromQuotePriceMap(latestPriceMap);
-        setFxRateByPair(nextFxRates);
-        setFxSyncedCount(Object.keys(nextFxRates).length);
-        setFxLastUpdatedAt(new Date());
+                return changed ? { ...entity, latestPriceBySymbol: nextLatestPriceBySymbol } : entity;
+              }),
+            );
 
-        const missingCurrencies =
-          normalizedDisplayCurrency === "AUTO"
-            ? []
-            : fxSourceCurrencies.filter((sourceCurrency) => {
-                const rate = resolveFxRateFromPairMap(nextFxRates, sourceCurrency, normalizedDisplayCurrency);
-                return !(rate && Number.isFinite(rate) && rate > 0);
-              });
+            const syncedStockCount = stockSymbols.filter((symbol) => {
+              const latestPrice = resolveQuotedPriceBySymbol(latestPriceMap, symbol);
+              return !!(typeof latestPrice === "number" && Number.isFinite(latestPrice) && latestPrice > 0);
+            }).length;
+            setQuoteSyncedCount(syncedStockCount);
+            setQuoteLastUpdatedAt(new Date());
+            setQuoteSyncError("");
+          } catch (error) {
+            if (error instanceof Error && isRateLimitMessage(error.message)) {
+              setQuoteSyncError("");
+            } else {
+              const resolvedErrorMessage =
+                error instanceof Error
+                  ? error.message
+                  : isZh
+                    ? "更新股票報價失敗。"
+                    : "Failed to refresh stock quotes.";
+              setQuoteSyncError(resolvedErrorMessage);
+            }
+          }
+        } else {
+          setQuoteSyncError("");
+        }
 
-        setFxSyncError(
-          missingCurrencies.length > 0
-            ? isZh
-              ? `以下貨幣暫時未能換算：${missingCurrencies.join(", ")}。`
-              : `Unable to convert these currencies for now: ${missingCurrencies.join(", ")}.`
-            : "",
-        );
-        syncTrace("fx:conversion:result", {
+        if (!shouldSyncFx) {
+          setFxRateByPair({});
+          setFxSyncedCount(0);
+          setFxLastUpdatedAt(null);
+          setFxSyncError("");
+          return;
+        }
+
+        syncTrace("fx:request:start", {
+          trigger,
           targetCurrency: normalizedDisplayCurrency,
-          requestedSources: fxSourceCurrencies,
-          resolvedPairCount: Object.keys(nextFxRates).length,
-          missingCurrencies,
+          fxSourceCurrencies,
         });
+
+        try {
+          const fxResult = await fetchFrankfurterFxRates([
+            normalizedDisplayCurrency,
+            ...fxSourceCurrencies,
+          ]);
+
+          setFxRateByPair(fxResult.pairMap);
+          setFxSyncedCount(Object.keys(fxResult.pairMap).length);
+          setFxLastUpdatedAt(new Date());
+
+          const missingCurrencies = fxSourceCurrencies.filter((sourceCurrency) => {
+            const rate = resolveFxRateFromPairMap(
+              fxResult.pairMap,
+              sourceCurrency,
+              normalizedDisplayCurrency,
+            );
+            return !(rate && Number.isFinite(rate) && rate > 0);
+          });
+
+          setFxSyncError(
+            missingCurrencies.length > 0
+              ? isZh
+                ? `以下貨幣暫時未能換算：${missingCurrencies.join(", ")}。`
+                : `Unable to convert these currencies for now: ${missingCurrencies.join(", ")}.`
+              : "",
+          );
+          syncTrace("fx:conversion:result", {
+            targetCurrency: normalizedDisplayCurrency,
+            requestedSources: fxSourceCurrencies,
+            resolvedPairCount: Object.keys(fxResult.pairMap).length,
+            missingCurrencies,
+            fallbackCurrencies: fxResult.fallbackCurrencies,
+            liveCurrencies: fxResult.liveCurrencies,
+          });
+        } catch (error) {
+          syncTrace("fx:request:error", {
+            trigger,
+            targetCurrency: normalizedDisplayCurrency,
+            message: error instanceof Error ? error.message : String(error),
+          });
+
+          const fallbackPairMap = buildFxRatePairMapFromUsdRates(
+            FIXED_USD_FX_RATES,
+            [normalizedDisplayCurrency, ...fxSourceCurrencies],
+          );
+          setFxRateByPair(fallbackPairMap);
+          setFxSyncedCount(Object.keys(fallbackPairMap).length);
+          setFxLastUpdatedAt(new Date());
+
+          const missingCurrencies = fxSourceCurrencies.filter((sourceCurrency) => {
+            const rate = resolveFxRateFromPairMap(
+              fallbackPairMap,
+              sourceCurrency,
+              normalizedDisplayCurrency,
+            );
+            return !(rate && Number.isFinite(rate) && rate > 0);
+          });
+          setFxSyncError(
+            missingCurrencies.length > 0
+              ? isZh
+                ? `以下貨幣暫時未能換算：${missingCurrencies.join(", ")}。`
+                : `Unable to convert these currencies for now: ${missingCurrencies.join(", ")}.`
+              : "",
+          );
+          syncTrace("fx:conversion:result", {
+            targetCurrency: normalizedDisplayCurrency,
+            requestedSources: fxSourceCurrencies,
+            resolvedPairCount: Object.keys(fallbackPairMap).length,
+            missingCurrencies,
+            fallbackCurrencies: fxSourceCurrencies,
+            liveCurrencies: [],
+          });
+        }
       } catch (error) {
-        syncTrace("fx:request:error", {
+        syncTrace("quote:request:error", {
           trigger,
           targetCurrency: normalizedDisplayCurrency,
           message: error instanceof Error ? error.message : String(error),
         });
         if (error instanceof Error && isRateLimitMessage(error.message)) {
           setQuoteSyncError("");
-          if (normalizedDisplayCurrency !== "AUTO") {
-            setFxSyncError("");
-          }
           return;
         }
 
@@ -3091,15 +3428,12 @@ export default function App(): JSX.Element {
         setQuoteSyncError(
           resolvedErrorMessage,
         );
-        if (normalizedDisplayCurrency !== "AUTO") {
-          setFxSyncError(resolvedErrorMessage);
-        }
       } finally {
         quoteSyncInFlightRef.current = false;
         setQuoteSyncing(false);
       }
     },
-    [fxSourceCurrencies, fxSymbols, isZh, normalizedDisplayCurrency, portfolioStockSymbolKey, screen],
+    [fxSourceCurrencies, isZh, normalizedDisplayCurrency, portfolioStockSymbolKey, screen],
   );
 
   const refreshPortfolioHistory = useCallback(
@@ -3152,7 +3486,12 @@ export default function App(): JSX.Element {
         const nextHistoryBySymbol: Record<string, PricePoint[]> = {};
         stockSymbols.forEach((symbol) => {
           const normalizedSymbol = symbol.trim().toUpperCase();
-          const sourceSeries = batchSeries[normalizedSymbol] ?? [];
+          const sourceSeries =
+            batchSeries[normalizedSymbol] ??
+            buildYahooSymbolCandidates(normalizedSymbol)
+              .map((candidate) => batchSeries[candidate])
+              .find((candidateSeries): candidateSeries is PricePoint[] => Array.isArray(candidateSeries)) ??
+            [];
           const filteredSeries = filterPriceSeriesByCustomRange(
             sourceSeries,
             selectedRange,
@@ -3278,7 +3617,7 @@ export default function App(): JSX.Element {
   );
 
   const quoteStatusText = useMemo(() => {
-    if (!portfolioStockSymbolKey && fxSymbols.length === 0) {
+    if (!portfolioStockSymbolKey && fxSourceCurrencies.length === 0) {
       return t("No stocks available for quote sync.", "目前冇可同步股價嘅股票。");
     }
     if (isQuoteSyncing) {
@@ -3297,7 +3636,7 @@ export default function App(): JSX.Element {
   }, [
     isQuoteSyncing,
     isZh,
-    fxSymbols.length,
+    fxSourceCurrencies.length,
     portfolioStockSymbolKey,
     quoteLastUpdatedAt,
     quoteSyncedCount,
@@ -3380,6 +3719,14 @@ export default function App(): JSX.Element {
 
   const displayPercent = (value: number): string =>
     settings.showObscure ? "•••%" : formatPercent(value);
+
+  const displayNativeMoney = useCallback((value: number, currency: string): string => {
+    if (settings.showObscure) {
+      return "••••";
+    }
+    const normalizedCurrency = normalizeCurrencyCode(currency) || "USD";
+    return formatCurrency(value, normalizedCurrency);
+  }, [settings.showObscure]);
 
   const selectedPortfolioLineOption = useMemo(
     () =>
@@ -3481,13 +3828,36 @@ export default function App(): JSX.Element {
   }, [isValuationSyncing, refreshValuationChart, stockDetail, valuationCacheKey, valuationSeriesCache]);
 
   useEffect(() => {
-    if (selectedPortfolioId === "all") {
+    const { normalizedEntities, idMap, changed } = normalizePortfolioIdsForUi(entities);
+    if (!changed) {
       return;
     }
-    if (!entities.some((entity) => entity.id === selectedPortfolioId)) {
-      setSelectedPortfolioId("all");
+    setEntities(normalizedEntities);
+    if (selectedPortfolioId !== ALL_PORTFOLIO_ID) {
+      const remappedId = idMap.get(selectedPortfolioId);
+      if (remappedId && remappedId !== selectedPortfolioId) {
+        setSelectedPortfolioIdWithTrace(remappedId, "normalizePortfolioIdsForUi:remap");
+      }
     }
-  }, [entities, selectedPortfolioId]);
+  }, [entities, selectedPortfolioId, setSelectedPortfolioIdWithTrace]);
+
+  useEffect(() => {
+    if (selectedPortfolioId !== ALL_PORTFOLIO_ID) {
+      return;
+    }
+
+    const rememberedId = manualPortfolioSelectionRef.current;
+    if (!rememberedId) {
+      return;
+    }
+
+    if (!entities.some((entity) => entity.id === rememberedId)) {
+      manualPortfolioSelectionRef.current = null;
+      return;
+    }
+
+    setSelectedPortfolioIdWithTrace(rememberedId, "manual-selection:restore");
+  }, [entities, selectedPortfolioId, setSelectedPortfolioIdWithTrace]);
 
   useEffect(() => {
     if (!portfolioBounds) {
@@ -3511,12 +3881,12 @@ export default function App(): JSX.Element {
     if (screen !== "dashboard") {
       return;
     }
-    if (!portfolioStockSymbolKey && fxSymbols.length === 0) {
+    if (!portfolioStockSymbolKey && fxSourceCurrencies.length === 0) {
       return;
     }
 
     void refreshPortfolioQuotes("auto");
-  }, [fxSymbolsKey, portfolioStockSymbolKey, refreshPortfolioQuotes, screen]);
+  }, [fxSourceCurrencies.length, portfolioStockSymbolKey, refreshPortfolioQuotes, screen]);
 
   useEffect(() => {
     portfolioHistoryAutoRequestedRef.current = false;
@@ -3557,11 +3927,11 @@ export default function App(): JSX.Element {
 
   const applyImportedEntities = useCallback((parsed: EntityDataset[]): void => {
     setEntities(parsed);
-    setSelectedPortfolioId("all");
+    setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "import:applyImportedEntities");
     setSelectedStockId("");
     setSelectedRange("1Y");
     setScreen("dashboard");
-  }, []);
+  }, [setSelectedPortfolioIdWithTrace]);
 
   const openImportReview = useCallback((parsed: EntityDataset[], source: ImportReviewSource): void => {
     setImportReviewEntities(cloneEntitiesForReview(parsed));
@@ -3649,7 +4019,7 @@ export default function App(): JSX.Element {
           currency: preferredCurrency,
         })),
       );
-      setSelectedPortfolioId("all");
+      setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "selectUserType:new");
       setSelectedStockId("");
       setSelectedRange("1Y");
       setScreen("dashboard");
@@ -3659,42 +4029,122 @@ export default function App(): JSX.Element {
     setScreen("upload");
   };
 
+  const importFilesWithReview = useCallback(
+    async (rawFiles: FileList | File[], preferredType: UserType): Promise<void> => {
+      const files = Array.from(rawFiles);
+      if (files.length === 0) {
+        return;
+      }
+
+      setLoading(true);
+      setErrorMessage("");
+      setImportStatusMessage("");
+
+      const importedItems: ImportBatchItem[] = [];
+      const failedMessages: string[] = [];
+
+      try {
+        for (const file of files) {
+          try {
+            const localQuota = consumeLocalMonthlyUploadQuota();
+            const content = await readFileContentForImport(file);
+            const imported = await importPortfolioFromAnyFormat(content, preferredType, file.name);
+            importedItems.push({
+              fileName: file.name,
+              rawText: content,
+              entities: imported.entities,
+              usedAi: imported.usedAi,
+              localQuota,
+              aiQuota: imported.quota,
+            });
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : t("Cannot parse this file. Please check the format.", "無法解析此檔案，請檢查格式。");
+            failedMessages.push(`${file.name}: ${message}`);
+
+            // Stop immediately when monthly quota is reached to avoid noisy repeated errors.
+            if (message.includes("Monthly upload limit reached")) {
+              break;
+            }
+          }
+        }
+
+        if (importedItems.length === 0) {
+          setErrorMessage(
+            failedMessages[0] ??
+              t(
+                "Cannot parse uploaded file(s). Please check the format.",
+                "無法解析上傳檔案，請檢查格式。",
+              ),
+          );
+          return;
+        }
+
+        const mergedEntities = mergeImportBatchEntities(importedItems);
+        if (mergedEntities.length === 0) {
+          setErrorMessage(
+            t(
+              "No valid transactions extracted from uploaded file(s).",
+              "上傳檔案中未擷取到有效交易資料。",
+            ),
+          );
+          return;
+        }
+
+        const latestAiQuota = [...importedItems]
+          .reverse()
+          .find((item) => item.aiQuota)?.aiQuota;
+        const sourceFileNames = importedItems.map((item) => item.fileName);
+
+        openImportReview(mergedEntities, {
+          rawText: buildImportBatchRawText(importedItems),
+          fileName:
+            sourceFileNames.length === 1
+              ? sourceFileNames[0]
+              : t(
+                  `${sourceFileNames.length} files`,
+                  `${sourceFileNames.length} 個檔案`,
+                ),
+          fileCount: sourceFileNames.length,
+          fileNames: sourceFileNames,
+          preferredType,
+          localQuota: importedItems[importedItems.length - 1].localQuota,
+          usedAi: importedItems.some((item) => item.usedAi),
+          aiQuota: latestAiQuota,
+        });
+
+        if (failedMessages.length > 0) {
+          setImportStatusMessage(
+            t(
+              `Imported ${importedItems.length}/${files.length} files. Please review and confirm.`,
+              `已匯入 ${importedItems.length}/${files.length} 個檔案。請檢查後確認。`,
+            ),
+          );
+          setErrorMessage(failedMessages.slice(0, 2).join(" | "));
+        } else {
+          setImportStatusMessage(
+            t(
+              "Import parsed. Please review transactions and confirm.",
+              "匯入內容已解析。請先檢查交易並確認。",
+            ),
+          );
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    [importPortfolioFromAnyFormat, openImportReview, t],
+  );
+
   const onFileChange = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
     if (!userType || !event.target.files || event.target.files.length === 0) {
       return;
     }
-
-    const file = event.target.files[0];
-    setLoading(true);
-    setErrorMessage("");
-    setImportStatusMessage("");
-
     try {
-      const localQuota = consumeLocalMonthlyUploadQuota();
-      const content = await readFileContentForImport(file);
-      const imported = await importPortfolioFromAnyFormat(content, userType, file.name);
-      openImportReview(imported.entities, {
-        rawText: content,
-        fileName: file.name,
-        preferredType: userType,
-        localQuota,
-        usedAi: imported.usedAi,
-        aiQuota: imported.quota,
-      });
-      setImportStatusMessage(
-        t(
-          "Import parsed. Please review transactions and confirm.",
-          "匯入內容已解析。請先檢查交易並確認。",
-        ),
-      );
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : t("Cannot parse this file. Please check the format.", "無法解析此檔案，請檢查格式。");
-      setErrorMessage(message);
+      await importFilesWithReview(event.target.files, userType);
     } finally {
-      setLoading(false);
       event.target.value = "";
     }
   };
@@ -3703,41 +4153,56 @@ export default function App(): JSX.Element {
     if (!event.target.files || event.target.files.length === 0) {
       return;
     }
-
-    const file = event.target.files[0];
-    setLoading(true);
-    setErrorMessage("");
-    setImportStatusMessage("");
-
     try {
-      const localQuota = consumeLocalMonthlyUploadQuota();
-      const content = await readFileContentForImport(file);
-      const imported = await importPortfolioFromAnyFormat(content, dataImportType, file.name);
-      openImportReview(imported.entities, {
-        rawText: content,
-        fileName: file.name,
-        preferredType: dataImportType,
-        localQuota,
-        usedAi: imported.usedAi,
-        aiQuota: imported.quota,
-      });
-      setImportStatusMessage(
-        t(
-          "Import parsed. Please review transactions and confirm.",
-          "匯入內容已解析。請先檢查交易並確認。",
-        ),
-      );
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : t("Cannot parse this file. Please check the format.", "無法解析此檔案，請檢查格式。");
-      setErrorMessage(message);
+      await importFilesWithReview(event.target.files, dataImportType);
     } finally {
-      setLoading(false);
       event.target.value = "";
     }
   };
+
+  const onEntryUploadDragOver = useCallback((event: DragEvent<HTMLLabelElement>): void => {
+    event.preventDefault();
+    setEntryUploadDragOver(true);
+  }, []);
+
+  const onEntryUploadDragLeave = useCallback((event: DragEvent<HTMLLabelElement>): void => {
+    event.preventDefault();
+    setEntryUploadDragOver(false);
+  }, []);
+
+  const onEntryUploadDrop = useCallback(
+    async (event: DragEvent<HTMLLabelElement>): Promise<void> => {
+      event.preventDefault();
+      setEntryUploadDragOver(false);
+      if (!userType || loading || !event.dataTransfer.files.length) {
+        return;
+      }
+      await importFilesWithReview(event.dataTransfer.files, userType);
+    },
+    [importFilesWithReview, loading, userType],
+  );
+
+  const onDataUploadDragOver = useCallback((event: DragEvent<HTMLLabelElement>): void => {
+    event.preventDefault();
+    setDataUploadDragOver(true);
+  }, []);
+
+  const onDataUploadDragLeave = useCallback((event: DragEvent<HTMLLabelElement>): void => {
+    event.preventDefault();
+    setDataUploadDragOver(false);
+  }, []);
+
+  const onDataUploadDrop = useCallback(
+    async (event: DragEvent<HTMLLabelElement>): Promise<void> => {
+      event.preventDefault();
+      setDataUploadDragOver(false);
+      if (loading || !event.dataTransfer.files.length) {
+        return;
+      }
+      await importFilesWithReview(event.dataTransfer.files, dataImportType);
+    },
+    [dataImportType, importFilesWithReview, loading],
+  );
 
   const minCustomDate = portfolioBounds ? toDateInputValue(portfolioBounds.minDate) : "";
   const maxCustomDate = portfolioBounds ? toDateInputValue(portfolioBounds.maxDate) : "";
@@ -4219,7 +4684,7 @@ export default function App(): JSX.Element {
         latestPriceBySymbol: {},
       },
     ]);
-    setSelectedPortfolioId(id);
+    setSelectedPortfolioIdWithTrace(id, "portfolio:create");
   };
 
   const renamePortfolio = (): void => {
@@ -4267,7 +4732,7 @@ export default function App(): JSX.Element {
     }
 
     setEntities((previous) => previous.filter((entity) => entity.id !== selectedPortfolioId));
-    setSelectedPortfolioId("all");
+    setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "portfolio:delete");
   };
 
   const dualFormatRecords = useMemo(() => {
@@ -4313,7 +4778,7 @@ export default function App(): JSX.Element {
     }
 
     setEntities([]);
-    setSelectedPortfolioId("all");
+    setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "data:clearAllData");
     setSelectedStockId("");
     setScreen("choose");
     setImportStatusMessage("");
@@ -4339,6 +4804,15 @@ export default function App(): JSX.Element {
     setActiveTab(tab);
     setMenuOpen(false);
   };
+
+  const selectPortfolioFilter = useCallback((portfolioId: string): void => {
+    if (portfolioId === ALL_PORTFOLIO_ID) {
+      manualPortfolioSelectionRef.current = null;
+    } else {
+      manualPortfolioSelectionRef.current = portfolioId;
+    }
+    setSelectedPortfolioIdWithTrace(portfolioId, "portfolio-filter:user-click");
+  }, [setSelectedPortfolioIdWithTrace]);
 
   if (isAuthLoading) {
     return (
@@ -4545,9 +5019,21 @@ export default function App(): JSX.Element {
             {t("Upload", "上傳")} {userType === "stockerx" ? "StockerX" : "Stocker Pro"} {t("File", "檔案")}
           </h1>
           <p className="entry-subtitle">{t("Supports importing files in any format.", "支援任何格式檔案匯入。")}</p>
-          <label className="upload-box">
-            <input type="file" onChange={onFileChange} accept="*/*" />
-            <span>{loading ? t("Reading file...", "正在讀取檔案...") : t("Choose file", "選擇檔案")}</span>
+          <label
+            className={`upload-box ${isEntryUploadDragOver ? "drag-over" : ""}`}
+            onDragOver={onEntryUploadDragOver}
+            onDragLeave={onEntryUploadDragLeave}
+            onDrop={(event) => {
+              void onEntryUploadDrop(event);
+            }}
+          >
+            <input type="file" onChange={onFileChange} accept="*/*" multiple />
+            <span>
+              {loading
+                ? t("Reading file(s)...", "正在讀取檔案...")
+                : t("Choose or drag file(s)", "選擇或拖放檔案")}
+            </span>
+            <small>{t("Multiple files supported.", "支援一次上傳多個檔案。")}</small>
           </label>
           <button type="button" className="back-link" onClick={() => setScreen("choose")}>
             {t("Back", "返回")}
@@ -4629,7 +5115,7 @@ export default function App(): JSX.Element {
                     <button
                       type="button"
                       className={`portfolio-pill ${selectedPortfolioId === "all" ? "active" : ""}`}
-                      onClick={() => setSelectedPortfolioId("all")}
+                      onClick={() => selectPortfolioFilter(ALL_PORTFOLIO_ID)}
                     >
                       {t("All", "全部")}
                     </button>
@@ -4638,7 +5124,7 @@ export default function App(): JSX.Element {
                         type="button"
                         key={entity.id}
                         className={`portfolio-pill ${selectedPortfolioId === entity.id ? "active" : ""}`}
-                        onClick={() => setSelectedPortfolioId(entity.id)}
+                        onClick={() => selectPortfolioFilter(entity.id)}
                       >
                         {entity.name}
                       </button>
@@ -5273,7 +5759,7 @@ export default function App(): JSX.Element {
                     <button
                       type="button"
                       className={`portfolio-pill ${selectedPortfolioId === "all" ? "active" : ""}`}
-                      onClick={() => setSelectedPortfolioId("all")}
+                      onClick={() => selectPortfolioFilter(ALL_PORTFOLIO_ID)}
                     >
                       {t("All", "全部")}
                     </button>
@@ -5282,7 +5768,7 @@ export default function App(): JSX.Element {
                         type="button"
                         key={entity.id}
                         className={`portfolio-pill ${selectedPortfolioId === entity.id ? "active" : ""}`}
-                        onClick={() => setSelectedPortfolioId(entity.id)}
+                        onClick={() => selectPortfolioFilter(entity.id)}
                       >
                         {entity.name}
                       </button>
@@ -5324,13 +5810,22 @@ export default function App(): JSX.Element {
                       <option value="stockerpro">Stocker Pro</option>
                     </select>
                   </label>
-                  <label className="upload-box compact">
+                  <label
+                    className={`upload-box compact ${isDataUploadDragOver ? "drag-over" : ""}`}
+                    onDragOver={onDataUploadDragOver}
+                    onDragLeave={onDataUploadDragLeave}
+                    onDrop={(event) => {
+                      void onDataUploadDrop(event);
+                    }}
+                  >
                     <input
                       type="file"
                       onChange={onDataImportFileChange}
                       accept="*/*"
+                      multiple
                     />
                     <span>{loading ? t("Importing...", "正在匯入...") : t("Import and Replace Data", "匯入並覆蓋資料")}</span>
+                    <small>{t("Supports multi-file drag and drop.", "支援多檔拖放匯入。")}</small>
                   </label>
 
                   <button
@@ -5563,6 +6058,10 @@ export default function App(): JSX.Element {
                 <strong>{importReviewSource?.fileName ?? "-"}</strong>
               </div>
               <div className="import-review-summary-item">
+                <span>{t("File Count", "檔案數")}</span>
+                <strong>{importReviewSource?.fileCount ?? 0}</strong>
+              </div>
+              <div className="import-review-summary-item">
                 <span>{t("AI Quota", "AI 配額")}</span>
                 <strong>
                   {typeof importReviewSource?.aiQuota?.remaining === "number"
@@ -5574,6 +6073,12 @@ export default function App(): JSX.Element {
                 </strong>
               </div>
             </div>
+
+            {importReviewSource && importReviewSource.fileCount > 1 && (
+              <p className="settings-hint import-review-files">
+                {t("Included files:", "包含檔案：")} {importReviewSource.fileNames.join(", ")}
+              </p>
+            )}
 
             <p className="settings-hint">
               {t(
@@ -5810,7 +6315,7 @@ export default function App(): JSX.Element {
               </div>
               <div>
                 <span>{t("Live Price", "即時股價")}</span>
-                <strong>{displayMoney(stockDetailLivePrice, stockDetail.currency)}</strong>
+                <strong>{displayNativeMoney(stockDetailLivePrice, stockDetail.currency)}</strong>
               </div>
               <div>
                 <span>{t("Quote Updated", "報價更新")}</span>
@@ -5826,7 +6331,7 @@ export default function App(): JSX.Element {
               </div>
               <div>
                 <span>{t("Market Value", "市值")}</span>
-                <strong>{displayMoney(stockDetail.marketValue, stockDetail.currency)}</strong>
+                <strong>{displayMoney(stockDetailLiveMarketValue, stockDetail.currency)}</strong>
               </div>
               <div>
                 <span>{t("Total P/L", "總盈虧")}</span>
@@ -5915,7 +6420,7 @@ export default function App(): JSX.Element {
                 tradeMarkers={stockDetailTradeMarkers}
                 label={`${stockDetail.symbol} valuation + profit chart`}
                 valueLabel={t("Price", "價格")}
-                valueFormatter={(value) => displayMoney(value, stockDetail.currency)}
+                valueFormatter={(value) => displayNativeMoney(value, stockDetail.currency)}
                 profitLabel={t("Profit", "收益")}
                 profitFormatter={(value) => displayMoney(value, stockDetail.currency)}
               />

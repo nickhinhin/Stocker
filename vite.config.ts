@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -200,22 +200,76 @@ async function fetchYahooData(payload: Record<string, unknown>): Promise<any> {
   };
 
   if (type === "chart") {
+    const buildYahooSymbolCandidates = (rawSymbol: string): string[] => {
+      const normalized = String(rawSymbol ?? "").trim().toUpperCase();
+      if (!normalized) {
+        return [];
+      }
+      const candidates = [normalized];
+      if (normalized.endsWith("-USDT")) {
+        candidates.push(normalized.replace(/-USDT$/, "-USD"));
+      }
+      return [...new Set(candidates)];
+    };
+
     const symbols = symbol
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean);
     if (symbols.length > 1) {
-      const entries = await Promise.all(
+      const settled = await Promise.allSettled(
         symbols.map(async (item) => {
-          const chartUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${item}?range=${range}&interval=${interval}`;
-          const chartData = await fetchJson(chartUrl);
-          return [item.toUpperCase(), chartData] as const;
+          const requestedSymbol = item.toUpperCase();
+          const symbolCandidates = buildYahooSymbolCandidates(item);
+          let lastError: unknown = null;
+
+          for (const candidateSymbol of symbolCandidates) {
+            try {
+              const chartUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${candidateSymbol}?range=${range}&interval=${interval}`;
+              const chartData = await fetchJson(chartUrl);
+              return [requestedSymbol, chartData] as const;
+            } catch (error) {
+              lastError = error;
+            }
+          }
+
+          throw lastError ?? new Error(`Unable to fetch chart for ${requestedSymbol}.`);
         }),
       );
 
+      const successEntries = settled
+        .filter((item): item is PromiseFulfilledResult<readonly [string, unknown]> => item.status === "fulfilled")
+        .map((item) => item.value);
+      const failedSymbols = settled
+        .map((item, index) => ({ item, symbol: symbols[index].toUpperCase() }))
+        .filter(({ item }) => item.status === "rejected")
+        .map(({ symbol }) => symbol);
+
+      if (successEntries.length === 0) {
+        throw new Error(
+          `No chart data returned from Yahoo for requested symbols. Failed: ${failedSymbols.join(", ")}`,
+        );
+      }
+
       return {
-        chartBatch: Object.fromEntries(entries),
+        chartBatch: Object.fromEntries(successEntries),
+        chartErrors: failedSymbols,
       };
+    }
+
+    if (symbols.length === 1) {
+      const requestedSymbol = symbols[0].toUpperCase();
+      const symbolCandidates = buildYahooSymbolCandidates(symbols[0]);
+      let lastError: unknown = null;
+      for (const candidateSymbol of symbolCandidates) {
+        try {
+          const chartUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${candidateSymbol}?range=${range}&interval=${interval}`;
+          return await fetchJson(chartUrl);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError ?? new Error(`Unable to fetch chart for ${requestedSymbol}.`);
     }
   }
 
@@ -591,6 +645,17 @@ function localFunctionPlugin() {
   };
 }
 
-export default defineConfig({
-  plugins: [react(), localFunctionPlugin()],
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+
+  // Ensure local server middleware can read values from .env/.env.local via process.env.
+  Object.entries(env).forEach(([key, value]) => {
+    if (typeof process.env[key] === "undefined") {
+      process.env[key] = value;
+    }
+  });
+
+  return {
+    plugins: [react(), localFunctionPlugin()],
+  };
 });

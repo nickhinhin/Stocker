@@ -56,7 +56,12 @@ export default function PieChart({
   const hostRef = useRef<HTMLDivElement>(null);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number; lines: string[] } | null>(null);
-  const filtered = segments.filter((segment) => segment.value > 0);
+  const filtered = segments
+    .filter((segment) => segment.value > 0)
+    .map((segment) => ({
+      ...segment,
+      label: String(segment.label ?? "").trim() || "Other",
+    }));
 
   if (filtered.length === 0) {
     return (
@@ -104,6 +109,34 @@ export default function PieChart({
             const endAngle = currentAngle + angle;
             currentAngle = endAngle;
 
+            const percent = (segment.value / total) * 100;
+            const tooltipLines = [
+              segment.label,
+              `${valueLabel}: ${formatValue(segment.value)}`,
+              `${percent.toFixed(1)}%`,
+            ];
+            const isFullCircle = percent >= 99.999;
+
+            if (isFullCircle) {
+              return (
+                <circle
+                  key={segment.label}
+                  cx="110"
+                  cy="110"
+                  r="70"
+                  fill="none"
+                  stroke={segment.color}
+                  strokeWidth="36"
+                  className={`pie-slice ${index === hoveredIndex ? "selected" : ""}`}
+                  onMouseEnter={(event) => {
+                    setHoveredIndex(index);
+                    showTooltip(event, tooltipLines);
+                  }}
+                  onMouseMove={(event) => showTooltip(event, tooltipLines)}
+                />
+              );
+            }
+
             return (
               <path
                 key={segment.label}
@@ -112,19 +145,9 @@ export default function PieChart({
                 className={`pie-slice ${index === hoveredIndex ? "selected" : ""}`}
                 onMouseEnter={(event) => {
                   setHoveredIndex(index);
-                  showTooltip(event, [
-                    segment.label,
-                    `${valueLabel}: ${formatValue(segment.value)}`,
-                    `${((segment.value / total) * 100).toFixed(1)}%`,
-                  ]);
+                  showTooltip(event, tooltipLines);
                 }}
-                onMouseMove={(event) =>
-                  showTooltip(event, [
-                    segment.label,
-                    `${valueLabel}: ${formatValue(segment.value)}`,
-                    `${((segment.value / total) * 100).toFixed(1)}%`,
-                  ])
-                }
+                onMouseMove={(event) => showTooltip(event, tooltipLines)}
               />
             );
           })}

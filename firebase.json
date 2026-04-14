@@ -1,4 +1,7 @@
 {
+  "functions": {
+    "source": "functions"
+  },
   "hosting": {
     "site": "stocking-eafe1",
     "public": "dist",
@@ -8,6 +11,10 @@
       "**/node_modules/**"
     ],
     "rewrites": [
+      {
+        "source": "/api/local-functions/fetch-stock-data",
+        "function": "fetchStockDataHttp"
+      },
       {
         "source": "**",
         "destination": "/index.html"

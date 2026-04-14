@@ -144,6 +144,38 @@ function isStockTransaction(tx: NormalizedTransaction): boolean {
   return tx.symbol !== tx.currency;
 }
 
+function normalizeSymbolCode(symbol: string): string {
+  return String(symbol ?? "").trim().toUpperCase();
+}
+
+function buildHistoricalSymbolCandidates(symbol: string): string[] {
+  const normalized = normalizeSymbolCode(symbol);
+  if (!normalized) {
+    return [];
+  }
+  const candidates = [normalized];
+  if (normalized.endsWith("-USDT")) {
+    candidates.push(normalized.replace(/-USDT$/, "-USD"));
+  }
+  return [...new Set(candidates)];
+}
+
+function resolveHistoricalSeriesBySymbol(
+  historicalPriceBySymbol: Record<string, PricePoint[]> | undefined,
+  symbol: string,
+): PricePoint[] | undefined {
+  if (!historicalPriceBySymbol) {
+    return undefined;
+  }
+  for (const candidate of buildHistoricalSymbolCandidates(symbol)) {
+    const series = historicalPriceBySymbol[candidate];
+    if (Array.isArray(series) && series.length > 0) {
+      return series;
+    }
+  }
+  return undefined;
+}
+
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
 }
@@ -267,12 +299,18 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
         return;
       }
 
-      const key = `${tx.symbol}__${tx.currency}`;
+      const symbol = normalizeSymbolCode(tx.symbol);
+      const currency = String(tx.currency ?? "").trim().toUpperCase();
+      if (!symbol || !currency) {
+        return;
+      }
+
+      const key = `${symbol}__${currency}`;
       if (!groups.has(key)) {
         groups.set(key, {
           id: key,
-          symbol: tx.symbol,
-          currency: tx.currency,
+          symbol,
+          currency,
           transactions: [],
           latestPrice: 0,
           latestPriceDate: 0,
@@ -294,14 +332,15 @@ function collectStockGroups(entities: EntityDataset[]): StockGroup[] {
   });
 
   groups.forEach((group) => {
-    if (group.latestPrice > 0) {
-      return;
-    }
+    // Always prioritize synced live quote when available.
+    // This keeps market value / P&L aligned with "Live Price" in UI.
     for (const entity of entities) {
-      const fallbackPrice = entity.latestPriceBySymbol[group.symbol];
-      if (fallbackPrice && fallbackPrice > 0) {
-        group.latestPrice = fallbackPrice;
-        break;
+      for (const candidate of buildHistoricalSymbolCandidates(group.symbol)) {
+        const livePrice = entity.latestPriceBySymbol[candidate];
+        if (typeof livePrice === "number" && Number.isFinite(livePrice) && livePrice > 0) {
+          group.latestPrice = livePrice;
+          return;
+        }
       }
     }
   });
@@ -857,7 +896,7 @@ export function calculatePortfolioSummary(
   const yesterday = addDays(today, -1);
   const dailyProfit = round2(
     groups.reduce((total, group) => {
-      const history = options?.historicalPriceBySymbol?.[group.symbol];
+      const history = resolveHistoricalSeriesBySymbol(options?.historicalPriceBySymbol, group.symbol);
       const todayHistoricalPrice = resolveRecentHistoricalMarketPriceAtDate(history, today, 5);
       const yesterdayHistoricalPrice = resolveRecentHistoricalMarketPriceAtDate(
         history,
@@ -1127,7 +1166,7 @@ export function calculateMonthlyProfitSeries(
     let totalProfit = 0;
     for (const group of groups) {
       const historicalPrice = resolveHistoricalMarketPriceAtDate(
-        options?.historicalPriceBySymbol?.[group.symbol],
+        resolveHistoricalSeriesBySymbol(options?.historicalPriceBySymbol, group.symbol),
         cursor,
       );
       const marketPrice = isToday && group.latestPrice > 0 ? group.latestPrice : historicalPrice;
@@ -1379,14 +1418,12 @@ export function calculatePortfolioOverviewSeries(
     let totalProfit = 0;
     let stockMarketValue = 0;
 
-    const isFinalPoint = cursor.getTime() === end.getTime();
     groups.forEach((group) => {
       const historicalPrice = resolveHistoricalMarketPriceAtDate(
-        options?.historicalPriceBySymbol?.[group.symbol],
+        resolveHistoricalSeriesBySymbol(options?.historicalPriceBySymbol, group.symbol),
         cursor,
       );
-      const marketPriceForPoint =
-        isFinalPoint && group.latestPrice > 0 ? group.latestPrice : historicalPrice;
+      const marketPriceForPoint = historicalPrice ?? (group.latestPrice > 0 ? group.latestPrice : undefined);
       const metrics = evaluateStockAtDate(group, cursor, marketPriceForPoint);
       totalProfit += applyConversion(metrics.totalProfit, group.currency, options);
       stockMarketValue += applyConversion(metrics.marketValue, group.currency, options);
@@ -1423,10 +1460,10 @@ export function calculatePortfolioOverviewSeries(
 
     groups.forEach((group) => {
       const historicalPrice = resolveHistoricalMarketPriceAtDate(
-        options?.historicalPriceBySymbol?.[group.symbol],
+        resolveHistoricalSeriesBySymbol(options?.historicalPriceBySymbol, group.symbol),
         end,
       );
-      const marketPriceForPoint = group.latestPrice > 0 ? group.latestPrice : historicalPrice;
+      const marketPriceForPoint = historicalPrice ?? (group.latestPrice > 0 ? group.latestPrice : undefined);
       const metrics = evaluateStockAtDate(group, end, marketPriceForPoint);
       totalProfit += applyConversion(metrics.totalProfit, group.currency, options);
       stockMarketValue += applyConversion(metrics.marketValue, group.currency, options);

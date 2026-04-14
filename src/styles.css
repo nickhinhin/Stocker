@@ -329,6 +329,7 @@ body {
   background: var(--surface);
   display: block;
   cursor: pointer;
+  transition: border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .upload-box input {
@@ -337,6 +338,20 @@ body {
 
 .upload-box span {
   font-weight: 700;
+}
+
+.upload-box small {
+  margin-top: 6px;
+  display: block;
+  color: #6d7887;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.upload-box.drag-over {
+  border-color: #6b96c5;
+  background: #eef5fe;
+  box-shadow: 0 0 0 3px rgba(73, 125, 187, 0.12);
 }
 
 .back-link {
@@ -898,11 +913,12 @@ body {
   gap: 5px;
   max-width: 460px;
   margin: 0 auto;
+  min-width: 0;
 }
 
 .pie-legend-head {
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) minmax(110px, auto) minmax(70px, auto);
+  grid-template-columns: 10px minmax(56px, 1fr) minmax(0, 130px) minmax(58px, 74px);
   gap: 10px;
   align-items: center;
   padding: 0 6px 5px;
@@ -924,12 +940,13 @@ body {
 
 .pie-legend-row {
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) minmax(110px, auto) minmax(70px, auto);
+  grid-template-columns: 10px minmax(56px, 1fr) minmax(0, 130px) minmax(58px, 74px);
   gap: 10px;
   align-items: center;
   font-size: 12px;
   border-radius: 8px;
   padding: 4px 6px;
+  min-width: 0;
 }
 
 .pie-legend-hover {
@@ -957,6 +974,9 @@ body {
   font-variant-numeric: tabular-nums;
   text-align: right;
   font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pie-legend-row strong {
@@ -966,7 +986,9 @@ body {
   background: #edf3f9;
   border-radius: 999px;
   padding: 2px 8px;
-  min-width: 62px;
+  min-width: 0;
+  white-space: nowrap;
+  justify-self: end;
 }
 
 .bar-chart-wrap {
@@ -1249,6 +1271,11 @@ body {
   padding: 12px;
 }
 
+.upload-box.compact small {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
 .cash-balance-list {
   margin-top: 14px;
 }
@@ -1363,6 +1390,10 @@ body {
 
 .import-review-feedback {
   margin-top: 2px;
+}
+
+.import-review-files {
+  margin-top: 6px;
 }
 
 .import-review-feedback textarea {
