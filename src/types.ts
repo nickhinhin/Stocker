@@ -20,6 +20,63 @@ export interface NormalizedTransaction {
   fee: number;
   currency: string;
   note?: string;
+  stockerProMeta?: StockerProTransactionMeta;
+}
+
+export interface StockerProPortfolioMeta {
+  id: number;
+  webId?: string;
+  name: string;
+  tags: unknown;
+  note: string | null;
+  displayCurrencyType: string;
+  displayOrder: number | null;
+}
+
+export interface StockerProAssetMeta {
+  id: number;
+  currencyType: string;
+  assetType: string | null;
+  symbol: string;
+  tags: unknown;
+  note: string | null;
+  assetName: string | null;
+  portfolioId: number;
+  region: string | null;
+  displayOrder: number | null;
+}
+
+export interface StockerProPositionMeta {
+  id: number;
+  assetId: number;
+  type: string | null;
+  cumulativeCost: number | null;
+}
+
+export interface StockerProCashAssetMeta {
+  id: number;
+  currencyType: string;
+  portfolioId: number;
+}
+
+export interface StockerProTransactionMeta {
+  id?: number;
+  webTxId?: string;
+  assetType?: string | null;
+  positionId?: number | null;
+  portfolioId: number;
+  region?: string | null;
+  tags?: unknown;
+  isAutoDividend?: boolean | null;
+  exDividendDate?: unknown;
+}
+
+export interface StockerProEntityMeta {
+  portfolio: StockerProPortfolioMeta;
+  assetsBySymbol: Record<string, StockerProAssetMeta>;
+  positionsById: Record<number, StockerProPositionMeta>;
+  positionIdsByAssetId: Record<number, number[]>;
+  cashAssetsByCurrency: Record<string, StockerProCashAssetMeta>;
 }
 
 export interface EntityDataset {
@@ -28,6 +85,7 @@ export interface EntityDataset {
   currency: string;
   transactions: NormalizedTransaction[];
   latestPriceBySymbol: Record<string, number>;
+  stockerProMeta?: StockerProEntityMeta;
 }
 
 export interface EntityMetrics {

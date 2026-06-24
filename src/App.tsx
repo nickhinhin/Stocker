@@ -1,48 +1,99 @@
-import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
-import { doc, getDoc, onSnapshot, runTransaction, serverTimestamp } from "firebase/firestore";
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  type User,
+} from "firebase/auth";
+import {
+  doc,
+  getDoc,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp,
+} from "firebase/firestore";
 import { deflate, inflate } from "pako";
+import {
+  ChangeEvent,
+  DragEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import stockerWordmark from "./assets/stocker-wordmark.png";
 import AreaChart from "./components/AreaChart";
 import BarChart from "./components/BarChart";
 import HeatmapGrid from "./components/HeatmapGrid";
 import MultiLineChart from "./components/MultiLineChart";
 import PieChart from "./components/PieChart";
-import PortfolioOverviewChart, { type PortfolioOverviewMetric } from "./components/PortfolioOverviewChart";
+import PortfolioOverviewChart, {
+  type PortfolioOverviewMetric,
+} from "./components/PortfolioOverviewChart";
 import PriceChart, { PriceChartTradeMarker } from "./components/PriceChart";
 import {
-  type CalculationConversionOptions,
-  ChartRangePreset,
-  type ChartSlice,
   calculateAssetAllocationSegments,
-  calculatePortfolioOverviewSeries,
   calculateCashBalances,
   calculateCurrencyExposureSegments,
   calculateDividendCalendarSeries,
   calculateDrawdownSeries,
   calculateInsightMetrics,
-  calculateMonthlyCashFlowSeries,
-  calculateMonthlyFeeSeries,
   calculateMonthlyBuySeries,
-  calculateMonthlyProfitSeries,
+  calculateMonthlyCashFlowSeries,
   calculateMonthlyDividendSeries,
+  calculateMonthlyFeeSeries,
+  calculateMonthlyProfitSeries,
   calculateMonthlySellSeries,
   calculateNormalizedCompareSeries,
-  calculatePortfolioSummary,
+  calculatePortfolioOverviewSeries,
   calculatePortfolioProfitSeries,
+  calculatePortfolioSummary,
   calculateRebalanceSuggestions,
   calculateSeriesForStock,
   calculateStockBreakdown,
   calculateTransactionHeatmap,
+  type CalculationConversionOptions,
+  ChartRangePreset,
+  type ChartSlice,
   getStockDateBounds,
 } from "./lib/calculations";
-import { buildDualFormatRecords, normalizeAiPayloadToEntities, parseInputByType } from "./lib/formatParser";
-import { firebaseAuth, firebaseDatabaseCollection, firestoreDb, googleProvider } from "./lib/firebaseClient";
-import { fetchLocalStockData, normalizePortfolioWithAi } from "./lib/localFunctionApi";
-import stockerWordmark from "./assets/stocker-wordmark.png";
-import { EntityDataset, NormalizedTransaction, PricePoint, ProfitPoint, TxType, UserType } from "./types";
+import {
+  firebaseAuth,
+  firebaseDatabaseCollection,
+  firestoreDb,
+  googleProvider,
+} from "./lib/firebaseClient";
+import {
+  buildDualFormatRecords,
+  normalizeAiPayloadToEntities,
+  parseInputByType,
+} from "./lib/formatParser";
+import {
+  fetchLocalStockData,
+  normalizePortfolioWithAi,
+} from "./lib/localFunctionApi";
+import {
+  EntityDataset,
+  NormalizedTransaction,
+  PricePoint,
+  ProfitPoint,
+  StockerProAssetMeta,
+  StockerProCashAssetMeta,
+  StockerProEntityMeta,
+  StockerProPortfolioMeta,
+  StockerProPositionMeta,
+  TxType,
+  UserType,
+} from "./types";
 
 type Screen = "choose" | "upload" | "dashboard";
-type DashboardTab = "dashboard" | "analysis" | "holdings" | "transactions" | "data" | "settings";
+type DashboardTab =
+  | "dashboard"
+  | "analysis"
+  | "holdings"
+  | "transactions"
+  | "data"
+  | "settings";
 type DateFilterPreset = "all" | "today" | "week" | "month" | "year" | "custom";
 type Locale = "en" | "zh-HK";
 type PortfolioLineId = "totalMarketValue" | "totalProfit" | "totalReturnPct";
@@ -66,6 +117,7 @@ type TransactionDistrict =
 interface TransactionRow extends NormalizedTransaction {
   portfolioId: string;
   portfolioName: string;
+  assetName?: string | null;
 }
 
 interface TransactionDraft {
@@ -161,6 +213,12 @@ const STOCK_PRICE_TRANSACTION_TYPES = new Set<TxType>([
   "DIVIDEND_SHARE",
   "FEE",
 ]);
+const REQUIRED_ASSET_SYMBOL_TYPES = new Set<TxType>([
+  "BUY",
+  "SELL",
+  "DIVIDEND_CASH",
+  "DIVIDEND_SHARE",
+]);
 
 const FIXED_USD_FX_RATES: Record<string, number> = {
   USD: 1,
@@ -187,14 +245,21 @@ interface UploadQuotaSnapshot {
   limit: number;
 }
 
-function buildSafePortfolioId(rawId: string, fallbackSeed: string, usedIds: Set<string>): string {
+function buildSafePortfolioId(
+  rawId: string,
+  fallbackSeed: string,
+  usedIds: Set<string>,
+): string {
   const trimmed = rawId.trim();
   let candidate = trimmed || fallbackSeed;
   if (candidate.toLowerCase() === ALL_PORTFOLIO_ID) {
     candidate = fallbackSeed;
   }
   let counter = 2;
-  while (usedIds.has(candidate) || candidate.toLowerCase() === ALL_PORTFOLIO_ID) {
+  while (
+    usedIds.has(candidate) ||
+    candidate.toLowerCase() === ALL_PORTFOLIO_ID
+  ) {
     candidate = `${fallbackSeed}-${counter}`;
     counter += 1;
   }
@@ -212,11 +277,15 @@ function consumeLocalMonthlyUploadQuota(): UploadQuotaSnapshot {
 
   try {
     const raw = localStorage.getItem(UPLOAD_QUOTA_STORAGE_KEY);
-    const parsed = raw ? (JSON.parse(raw) as { month?: string; used?: number }) : null;
+    const parsed = raw
+      ? (JSON.parse(raw) as { month?: string; used?: number })
+      : null;
     const sameMonth = parsed?.month === month;
     const currentUsed = sameMonth ? Number(parsed?.used ?? 0) : 0;
     if (currentUsed >= MONTHLY_UPLOAD_LIMIT) {
-      throw new Error(`Monthly upload limit reached (${MONTHLY_UPLOAD_LIMIT}).`);
+      throw new Error(
+        `Monthly upload limit reached (${MONTHLY_UPLOAD_LIMIT}).`,
+      );
     }
 
     const nextUsed = currentUsed + 1;
@@ -235,7 +304,10 @@ function consumeLocalMonthlyUploadQuota(): UploadQuotaSnapshot {
       limit: MONTHLY_UPLOAD_LIMIT,
     };
   } catch (error) {
-    if (error instanceof Error && error.message.includes("Monthly upload limit reached")) {
+    if (
+      error instanceof Error &&
+      error.message.includes("Monthly upload limit reached")
+    ) {
       throw error;
     }
     return {
@@ -266,7 +338,10 @@ function syncTrace(event: string, payload?: Record<string, unknown>): void {
     console.info(`[SYNC_TRACE] ${stamp} ${event}`, payload);
     try {
       const serialized = JSON.stringify(payload);
-      const limited = serialized.length > 4000 ? `${serialized.slice(0, 4000)}...` : serialized;
+      const limited =
+        serialized.length > 4000
+          ? `${serialized.slice(0, 4000)}...`
+          : serialized;
       console.info(`[SYNC_TRACE_JSON] ${stamp} ${event} ${limited}`);
     } catch {
       // Ignore payload serialization errors in debug logging.
@@ -310,10 +385,25 @@ const TIME_RANGE_OPTIONS: { value: ChartRangePreset; label: string }[] = [
   { value: "CUSTOM", label: "Custom" },
 ];
 
-const PORTFOLIO_LINE_OPTIONS: { value: PortfolioLineId; label: string; labelZh: string; color: string }[] = [
-  { value: "totalMarketValue", label: "Market Value", labelZh: "市值", color: "#14B8A6" },
+const PORTFOLIO_LINE_OPTIONS: {
+  value: PortfolioLineId;
+  label: string;
+  labelZh: string;
+  color: string;
+}[] = [
+  {
+    value: "totalMarketValue",
+    label: "Market Value",
+    labelZh: "市值",
+    color: "#14B8A6",
+  },
   { value: "totalProfit", label: "Profit", labelZh: "收益", color: "#7C3AED" },
-  { value: "totalReturnPct", label: "Profit %", labelZh: "收益率", color: "#F59E0B" },
+  {
+    value: "totalReturnPct",
+    label: "Profit %",
+    labelZh: "收益率",
+    color: "#F59E0B",
+  },
 ];
 
 const TIME_RANGE_TITLES: Record<ChartRangePreset, string> = {
@@ -352,7 +442,10 @@ const DATE_FILTER_OPTIONS: { value: DateFilterPreset; label: string }[] = [
   { value: "custom", label: "Custom" },
 ];
 
-const TRANSACTION_TYPE_OPTIONS: { value: TransactionTypeFilter; label: string }[] = [
+const TRANSACTION_TYPE_OPTIONS: {
+  value: TransactionTypeFilter;
+  label: string;
+}[] = [
   { value: "all", label: "All" },
   { value: "BUY", label: "BUY" },
   { value: "SELL", label: "SELL" },
@@ -389,7 +482,10 @@ const ALLOWED_TRANSACTION_DISTRICTS = new Set<TransactionDistrict>(
   TRANSACTION_DISTRICT_OPTIONS.map((option) => option.value),
 );
 
-const DISTRICT_CURRENCY_MAP: Record<Exclude<TransactionDistrict, "OTHER">, string> = {
+const DISTRICT_CURRENCY_MAP: Record<
+  Exclude<TransactionDistrict, "OTHER">,
+  string
+> = {
   US: "USD",
   HK: "HKD",
   CRYPTO: "USD",
@@ -492,7 +588,12 @@ function inferCountryFromSymbol(symbol: string, currency: string): string {
 function inferCategoryFromSymbol(symbol: string): string {
   const upper = symbol.toUpperCase();
 
-  if (upper.includes("-USD") || upper.includes("USDT") || upper.includes("BTC") || upper.includes("ETH")) {
+  if (
+    upper.includes("-USD") ||
+    upper.includes("USDT") ||
+    upper.includes("BTC") ||
+    upper.includes("ETH")
+  ) {
     return "Crypto";
   }
   if (upper.includes("REIT")) {
@@ -501,7 +602,11 @@ function inferCategoryFromSymbol(symbol: string): string {
   if (upper.endsWith("ADR")) {
     return "ADR";
   }
-  if (upper.endsWith("ETF") || upper.includes(" ETF") || ETF_SYMBOL_HINTS.has(upper)) {
+  if (
+    upper.endsWith("ETF") ||
+    upper.includes(" ETF") ||
+    ETF_SYMBOL_HINTS.has(upper)
+  ) {
     return "ETF";
   }
   return "Stock";
@@ -536,14 +641,18 @@ function normalizeCurrencyCode(code: string | undefined | null): string {
     .toUpperCase();
 }
 
-function normalizeTransactionDistrict(value: string | undefined | null): TransactionDistrict {
+function normalizeTransactionDistrict(
+  value: string | undefined | null,
+): TransactionDistrict {
   const normalized = String(value ?? "")
     .trim()
     .toUpperCase() as TransactionDistrict;
   return ALLOWED_TRANSACTION_DISTRICTS.has(normalized) ? normalized : "OTHER";
 }
 
-function getAutoCurrencyByDistrict(district: TransactionDistrict): string | null {
+function getAutoCurrencyByDistrict(
+  district: TransactionDistrict,
+): string | null {
   const normalizedDistrict = normalizeTransactionDistrict(district);
   if (normalizedDistrict === "OTHER") {
     return null;
@@ -551,12 +660,20 @@ function getAutoCurrencyByDistrict(district: TransactionDistrict): string | null
   return DISTRICT_CURRENCY_MAP[normalizedDistrict] ?? null;
 }
 
-function inferDistrictFromCurrency(currency: string, symbol?: string): TransactionDistrict {
+function inferDistrictFromCurrency(
+  currency: string,
+  symbol?: string,
+): TransactionDistrict {
   const upperSymbol = String(symbol ?? "")
     .trim()
     .toUpperCase();
 
-  if (upperSymbol.includes("-USD") || upperSymbol.includes("USDT") || upperSymbol.includes("BTC") || upperSymbol.includes("ETH")) {
+  if (
+    upperSymbol.includes("-USD") ||
+    upperSymbol.includes("USDT") ||
+    upperSymbol.includes("BTC") ||
+    upperSymbol.includes("ETH")
+  ) {
     return "CRYPTO";
   }
   if (upperSymbol.endsWith(".SZ")) {
@@ -648,22 +765,38 @@ function buildFxRatePairMapFromUsdRates(
   currencies: string[],
 ): Record<string, number> {
   const pairMap: Record<string, number> = {};
-  const uniqueCurrencies = [...new Set(currencies
-    .map((currency) => normalizeCurrencyCode(currency))
-    .filter((currency) => currency && currency !== "AUTO"))];
+  const uniqueCurrencies = [
+    ...new Set(
+      currencies
+        .map((currency) => normalizeCurrencyCode(currency))
+        .filter((currency) => currency && currency !== "AUTO"),
+    ),
+  ];
   if (!uniqueCurrencies.includes("USD")) {
     uniqueCurrencies.push("USD");
   }
 
   uniqueCurrencies.forEach((from) => {
     const fromPerUsd = usdRateByCurrency[from];
-    if (!(typeof fromPerUsd === "number" && Number.isFinite(fromPerUsd) && fromPerUsd > 0)) {
+    if (
+      !(
+        typeof fromPerUsd === "number" &&
+        Number.isFinite(fromPerUsd) &&
+        fromPerUsd > 0
+      )
+    ) {
       return;
     }
 
     uniqueCurrencies.forEach((to) => {
       const toPerUsd = usdRateByCurrency[to];
-      if (!(typeof toPerUsd === "number" && Number.isFinite(toPerUsd) && toPerUsd > 0)) {
+      if (
+        !(
+          typeof toPerUsd === "number" &&
+          Number.isFinite(toPerUsd) &&
+          toPerUsd > 0
+        )
+      ) {
         return;
       }
       pairMap[`${from}->${to}`] = toPerUsd / fromPerUsd;
@@ -680,15 +813,26 @@ interface FxRateFetchResult {
   liveCurrencies: string[];
 }
 
-async function fetchFrankfurterFxRates(currencies: string[]): Promise<FxRateFetchResult> {
-  const normalizedCurrencies = [...new Set(currencies
-    .map((currency) => normalizeCurrencyCode(currency))
-    .filter((currency) => currency && currency !== "AUTO" && isValidCurrencyCode(currency)))];
+async function fetchFrankfurterFxRates(
+  currencies: string[],
+): Promise<FxRateFetchResult> {
+  const normalizedCurrencies = [
+    ...new Set(
+      currencies
+        .map((currency) => normalizeCurrencyCode(currency))
+        .filter(
+          (currency) =>
+            currency && currency !== "AUTO" && isValidCurrencyCode(currency),
+        ),
+    ),
+  ];
   if (!normalizedCurrencies.includes("USD")) {
     normalizedCurrencies.push("USD");
   }
 
-  const requestedCurrencies = normalizedCurrencies.filter((currency) => currency !== "USD");
+  const requestedCurrencies = normalizedCurrencies.filter(
+    (currency) => currency !== "USD",
+  );
   const usdRateByCurrency: Record<string, number> = { USD: 1 };
   const liveCurrencies: string[] = [];
 
@@ -696,12 +840,16 @@ async function fetchFrankfurterFxRates(currencies: string[]): Promise<FxRateFetc
     const params = new URLSearchParams({
       base: "USD",
     });
-    const response = await fetch(`${FRANKFURTER_LATEST_URL}?${params.toString()}`);
+    const response = await fetch(
+      `${FRANKFURTER_LATEST_URL}?${params.toString()}`,
+    );
     if (!response.ok) {
       throw new Error(`Frankfurter FX request failed (${response.status}).`);
     }
 
-    const payload = (await response.json()) as { rates?: Record<string, number> };
+    const payload = (await response.json()) as {
+      rates?: Record<string, number>;
+    };
     Object.entries(payload.rates ?? {}).forEach(([currency, rawRate]) => {
       const normalized = normalizeCurrencyCode(currency);
       const rate = Number(rawRate);
@@ -721,14 +869,23 @@ async function fetchFrankfurterFxRates(currencies: string[]): Promise<FxRateFetc
       return;
     }
     const fallback = FIXED_USD_FX_RATES[currency];
-    if (typeof fallback === "number" && Number.isFinite(fallback) && fallback > 0) {
+    if (
+      typeof fallback === "number" &&
+      Number.isFinite(fallback) &&
+      fallback > 0
+    ) {
       usdRateByCurrency[currency] = fallback;
       fallbackCurrencies.push(currency);
     }
   });
 
-  const missingCurrencies = normalizedCurrencies.filter((currency) => !(currency in usdRateByCurrency));
-  const pairMap = buildFxRatePairMapFromUsdRates(usdRateByCurrency, normalizedCurrencies);
+  const missingCurrencies = normalizedCurrencies.filter(
+    (currency) => !(currency in usdRateByCurrency),
+  );
+  const pairMap = buildFxRatePairMapFromUsdRates(
+    usdRateByCurrency,
+    normalizedCurrencies,
+  );
 
   return {
     pairMap,
@@ -795,7 +952,13 @@ function scoreTextCandidate(text: string): number {
       replacementCount += 1;
       continue;
     }
-    if (code === 9 || code === 10 || code === 13 || (code >= 32 && code <= 126) || code >= 160) {
+    if (
+      code === 9 ||
+      code === 10 ||
+      code === 13 ||
+      (code >= 32 && code <= 126) ||
+      code >= 160
+    ) {
       readableCount += 1;
     }
   }
@@ -806,7 +969,10 @@ function scoreTextCandidate(text: string): number {
   const nullPenalty = nullCount / safeLength;
   const lengthFactor = Math.min(1, trimmedLength / 200);
 
-  return Math.max(0, readableRatio - replacementPenalty * 1.6 - nullPenalty * 1.8) * lengthFactor;
+  return (
+    Math.max(0, readableRatio - replacementPenalty * 1.6 - nullPenalty * 1.8) *
+    lengthFactor
+  );
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -839,7 +1005,9 @@ function decodeBase64ToString(base64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
-async function parseRemoteDatabasePayload(rawData: string): Promise<EntityDataset[]> {
+async function parseRemoteDatabasePayload(
+  rawData: string,
+): Promise<EntityDataset[]> {
   const text = rawData.trim();
   if (!text) {
     return [];
@@ -909,7 +1077,9 @@ async function readFileContentForImport(file: File): Promise<string> {
     return bestText;
   }
 
-  const base64Sample = bytesToBase64(bytes.slice(0, Math.min(bytes.length, 80_000)));
+  const base64Sample = bytesToBase64(
+    bytes.slice(0, Math.min(bytes.length, 80_000)),
+  );
   return [
     "[STOCKER_UNIVERSAL_IMPORT_BINARY]",
     `fileName: ${file.name}`,
@@ -959,12 +1129,84 @@ function startOfDay(date: Date): Date {
   return next;
 }
 
-function sortTransactionsByDateAsc(transactions: NormalizedTransaction[]): NormalizedTransaction[] {
+function sortTransactionsByDateAsc(
+  transactions: NormalizedTransaction[],
+): NormalizedTransaction[] {
   return [...transactions].sort((a, b) => a.date.getTime() - b.date.getTime());
 }
 
 function shouldUseCurrencyAsSymbol(type: TxType): boolean {
-  return type === "CASH" || type === "CASH_CONVERT" || type === "FEE" || type === "INTEREST";
+  return (
+    type === "CASH" ||
+    type === "CASH_CONVERT" ||
+    type === "FEE" ||
+    type === "INTEREST"
+  );
+}
+
+function isAssetSymbolValue(symbol: string, currency: string): boolean {
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  if (!normalizedSymbol) {
+    return false;
+  }
+  return normalizedSymbol !== currency.trim().toUpperCase();
+}
+
+function allowsSymbolInput(type: TxType): boolean {
+  return REQUIRED_ASSET_SYMBOL_TYPES.has(type) || type === "FEE";
+}
+
+function requiresAssetSymbol(type: TxType): boolean {
+  return REQUIRED_ASSET_SYMBOL_TYPES.has(type);
+}
+
+function shouldDisplayAssetSymbol(
+  type: TxType,
+  symbol: string,
+  currency: string,
+): boolean {
+  if (REQUIRED_ASSET_SYMBOL_TYPES.has(type)) {
+    return true;
+  }
+  if (type === "FEE") {
+    return isAssetSymbolValue(symbol, currency);
+  }
+  return false;
+}
+
+function resolveAssetNameForTransaction(
+  entity: EntityDataset,
+  tx: NormalizedTransaction,
+): string | null {
+  const assetsBySymbol = entity.stockerProMeta?.assetsBySymbol;
+  if (!assetsBySymbol) {
+    return null;
+  }
+
+  const normalizedSymbol = tx.symbol.trim().toUpperCase();
+  const normalizedCurrency = tx.currency.trim().toUpperCase();
+  const directKey = `${normalizedSymbol}|${normalizedCurrency}`;
+  const direct = assetsBySymbol[directKey]?.assetName;
+  if (direct != null && direct.trim()) {
+    return direct.trim();
+  }
+
+  const fallbackAsset = Object.values(assetsBySymbol).find((asset) => {
+    return asset.symbol.trim().toUpperCase() === normalizedSymbol;
+  });
+  const fallbackName = fallbackAsset?.assetName;
+  if (fallbackName != null && fallbackName.trim()) {
+    return fallbackName.trim();
+  }
+  return null;
+}
+
+function getTransactionSymbolDisplayText(row: TransactionRow): string {
+  if (!shouldDisplayAssetSymbol(row.type, row.symbol, row.currency)) {
+    return "-";
+  }
+  const trimmedAssetName = row.assetName?.trim();
+  return trimmedAssetName ? trimmedAssetName : row.symbol;
 }
 
 function getTransactionNetCashFlow(tx: NormalizedTransaction): number {
@@ -994,7 +1236,9 @@ function getTransactionNetCashFlow(tx: NormalizedTransaction): number {
   return 0;
 }
 
-function buildLatestPriceBySymbol(transactions: NormalizedTransaction[]): Record<string, number> {
+function buildLatestPriceBySymbol(
+  transactions: NormalizedTransaction[],
+): Record<string, number> {
   const latest = new Map<string, { date: number; price: number }>();
 
   for (const tx of transactions) {
@@ -1023,11 +1267,7 @@ function isStockSymbolTransaction(tx: NormalizedTransaction): boolean {
   if (!STOCK_PRICE_TRANSACTION_TYPES.has(tx.type)) {
     return false;
   }
-  const symbol = tx.symbol.trim().toUpperCase();
-  if (!symbol) {
-    return false;
-  }
-  return symbol !== tx.currency.trim().toUpperCase();
+  return isAssetSymbolValue(tx.symbol, tx.currency);
 }
 
 function collectPortfolioStockSymbols(entities: EntityDataset[]): string[] {
@@ -1166,15 +1406,22 @@ function extractYahooChartPriceSeries(payload: unknown): PricePoint[] {
     return [];
   }
 
-  const timestamps = Array.isArray(firstResult.timestamp) ? firstResult.timestamp : [];
+  const timestamps = Array.isArray(firstResult.timestamp)
+    ? firstResult.timestamp
+    : [];
   const indicators = asRecord(firstResult.indicators);
   const quoteRows = Array.isArray(indicators?.quote) ? indicators.quote : [];
   const firstQuote = quoteRows.length > 0 ? asRecord(quoteRows[0]) : null;
   const closeValues = Array.isArray(firstQuote?.close) ? firstQuote.close : [];
 
-  const adjustedRows = Array.isArray(indicators?.adjclose) ? indicators.adjclose : [];
-  const firstAdjusted = adjustedRows.length > 0 ? asRecord(adjustedRows[0]) : null;
-  const adjustedCloseValues = Array.isArray(firstAdjusted?.adjclose) ? firstAdjusted.adjclose : [];
+  const adjustedRows = Array.isArray(indicators?.adjclose)
+    ? indicators.adjclose
+    : [];
+  const firstAdjusted =
+    adjustedRows.length > 0 ? asRecord(adjustedRows[0]) : null;
+  const adjustedCloseValues = Array.isArray(firstAdjusted?.adjclose)
+    ? firstAdjusted.adjclose
+    : [];
 
   const points: PricePoint[] = [];
   for (let index = 0; index < timestamps.length; index += 1) {
@@ -1183,7 +1430,9 @@ function extractYahooChartPriceSeries(payload: unknown): PricePoint[] {
       continue;
     }
 
-    const closePrice = parseQuoteNumber(closeValues[index]) ?? parseQuoteNumber(adjustedCloseValues[index]);
+    const closePrice =
+      parseQuoteNumber(closeValues[index]) ??
+      parseQuoteNumber(adjustedCloseValues[index]);
     if (!closePrice) {
       continue;
     }
@@ -1197,7 +1446,9 @@ function extractYahooChartPriceSeries(payload: unknown): PricePoint[] {
   return points.sort((a, b) => a.date.getTime() - b.date.getTime());
 }
 
-function extractYahooChartPriceSeriesBatch(payload: unknown): Record<string, PricePoint[]> {
+function extractYahooChartPriceSeriesBatch(
+  payload: unknown,
+): Record<string, PricePoint[]> {
   const payloadRecord = asRecord(payload);
   const source = payloadRecord?.data ?? payload;
   const sourceRecord = asRecord(source);
@@ -1223,7 +1474,10 @@ function extractYahooChartPriceSeriesBatch(payload: unknown): Record<string, Pri
   return result;
 }
 
-function resolveYahooChartRequest(preset: ChartRangePreset): { range: string; interval: string } {
+function resolveYahooChartRequest(preset: ChartRangePreset): {
+  range: string;
+  interval: string;
+} {
   if (preset === "1W") {
     return { range: "7d", interval: "15m" };
   }
@@ -1258,8 +1512,12 @@ function filterPriceSeriesByCustomRange(
     return points;
   }
 
-  const startMs = start ? startOfDay(start).getTime() : Number.NEGATIVE_INFINITY;
-  const endMs = end ? startOfDay(end).getTime() + 86_399_999 : Number.POSITIVE_INFINITY;
+  const startMs = start
+    ? startOfDay(start).getTime()
+    : Number.NEGATIVE_INFINITY;
+  const endMs = end
+    ? startOfDay(end).getTime() + 86_399_999
+    : Number.POSITIVE_INFINITY;
   return points.filter((point) => {
     const time = point.date.getTime();
     return time >= startMs && time <= endMs;
@@ -1271,7 +1529,12 @@ function buildFallbackPriceSeries(
   symbol: string,
 ): PricePoint[] {
   return transactions
-    .filter((tx) => tx.symbol === symbol && tx.price > 0 && (tx.type === "BUY" || tx.type === "SELL"))
+    .filter(
+      (tx) =>
+        tx.symbol === symbol &&
+        tx.price > 0 &&
+        (tx.type === "BUY" || tx.type === "SELL"),
+    )
     .map((tx) => ({
       date: tx.date,
       price: tx.price,
@@ -1291,8 +1554,12 @@ function calculateProfitSeriesFromPriceSeries(
     return [];
   }
 
-  const sortedPrices = [...priceSeries].sort((a, b) => a.date.getTime() - b.date.getTime());
-  const sortedTransactions = [...transactions].sort((a, b) => a.date.getTime() - b.date.getTime());
+  const sortedPrices = [...priceSeries].sort(
+    (a, b) => a.date.getTime() - b.date.getTime(),
+  );
+  const sortedTransactions = [...transactions].sort(
+    (a, b) => a.date.getTime() - b.date.getTime(),
+  );
 
   let txIndex = 0;
   const state = {
@@ -1334,10 +1601,15 @@ function calculateProfitSeriesFromPriceSeries(
       txIndex += 1;
     }
 
-    const buyAvg = state.purchasedShares > 0 ? state.purchaseTotal / state.purchasedShares : 0;
-    const sellAvg = state.soldShares > 0 ? state.sellingTotal / state.soldShares : 0;
+    const buyAvg =
+      state.purchasedShares > 0
+        ? state.purchaseTotal / state.purchasedShares
+        : 0;
+    const sellAvg =
+      state.soldShares > 0 ? state.sellingTotal / state.soldShares : 0;
     const matchedShares = Math.min(state.purchasedShares, state.soldShares);
-    const netTradeProfit = state.soldShares > 0 ? (sellAvg - buyAvg) * matchedShares : 0;
+    const netTradeProfit =
+      state.soldShares > 0 ? (sellAvg - buyAvg) * matchedShares : 0;
     const realizedProfit = netTradeProfit + state.dividends - state.fees;
     const activeShares = state.purchasedShares - state.soldShares;
 
@@ -1380,11 +1652,16 @@ function isDateInPresetRange(
     const day = start.getDay();
     const offset = day === 0 ? 6 : day - 1;
     start.setDate(today.getDate() - offset);
-    return target.getTime() >= start.getTime() && target.getTime() <= today.getTime();
+    return (
+      target.getTime() >= start.getTime() && target.getTime() <= today.getTime()
+    );
   }
 
   if (preset === "month") {
-    return target.getFullYear() === today.getFullYear() && target.getMonth() === today.getMonth();
+    return (
+      target.getFullYear() === today.getFullYear() &&
+      target.getMonth() === today.getMonth()
+    );
   }
 
   if (preset === "year") {
@@ -1454,20 +1731,24 @@ function deserializeEntities(raw: string): EntityDataset[] {
       ? (entityRaw.transactions as Array<Record<string, unknown>>)
       : [];
 
-    const transactions: NormalizedTransaction[] = transactionsRaw.map((txRaw, txIndex) => {
-      const txType = String(txRaw.type ?? "CASH").toUpperCase() as TxType;
-      return {
-        id: String(txRaw.id ?? `tx-${entityIndex}-${txIndex}`),
-        date: new Date(String(txRaw.date ?? new Date().toISOString())),
-        symbol: String(txRaw.symbol ?? "").toUpperCase(),
-        type: txType,
-        shares: Number(txRaw.shares ?? 0),
-        price: Number(txRaw.price ?? 0),
-        fee: Number(txRaw.fee ?? 0),
-        currency: String(txRaw.currency ?? entityRaw.currency ?? "USD").toUpperCase(),
-        note: String(txRaw.note ?? ""),
-      };
-    });
+    const transactions: NormalizedTransaction[] = transactionsRaw.map(
+      (txRaw, txIndex) => {
+        const txType = String(txRaw.type ?? "CASH").toUpperCase() as TxType;
+        return {
+          id: String(txRaw.id ?? `tx-${entityIndex}-${txIndex}`),
+          date: new Date(String(txRaw.date ?? new Date().toISOString())),
+          symbol: String(txRaw.symbol ?? "").toUpperCase(),
+          type: txType,
+          shares: Number(txRaw.shares ?? 0),
+          price: Number(txRaw.price ?? 0),
+          fee: Number(txRaw.fee ?? 0),
+          currency: String(
+            txRaw.currency ?? entityRaw.currency ?? "USD",
+          ).toUpperCase(),
+          note: String(txRaw.note ?? ""),
+        };
+      },
+    );
 
     return {
       id: String(entityRaw.id ?? `portfolio-${entityIndex + 1}`),
@@ -1492,11 +1773,274 @@ function safeDeserializeEntities(raw: string): EntityDataset[] {
   }
 }
 
+function clonePortfolioMeta(
+  meta: StockerProPortfolioMeta,
+): StockerProPortfolioMeta {
+  return {
+    ...meta,
+    name: String(meta.name ?? ""),
+    displayCurrencyType: String(
+      meta.displayCurrencyType ?? "USD",
+    ).toUpperCase(),
+  };
+}
+
+function cloneAssetMeta(meta: StockerProAssetMeta): StockerProAssetMeta {
+  return {
+    ...meta,
+    symbol: meta.symbol.trim().toUpperCase(),
+    currencyType: meta.currencyType.trim().toUpperCase(),
+    assetName: meta.assetName == null ? null : String(meta.assetName),
+    displayOrder:
+      meta.displayOrder == null ? null : Math.trunc(Number(meta.displayOrder)),
+  };
+}
+
+function clonePositionMeta(
+  meta: StockerProPositionMeta,
+): StockerProPositionMeta {
+  return {
+    ...meta,
+    cumulativeCost:
+      meta.cumulativeCost == null ? null : Number(meta.cumulativeCost),
+  };
+}
+
+function cloneCashAssetMeta(
+  meta: StockerProCashAssetMeta,
+): StockerProCashAssetMeta {
+  return {
+    ...meta,
+    currencyType: meta.currencyType.trim().toUpperCase(),
+  };
+}
+
+function cloneStockerProMeta(
+  meta: StockerProEntityMeta | undefined,
+): StockerProEntityMeta | undefined {
+  if (!meta) {
+    return undefined;
+  }
+  return {
+    portfolio: clonePortfolioMeta(meta.portfolio),
+    assetsBySymbol: Object.fromEntries(
+      Object.entries(meta.assetsBySymbol).map(([key, asset]) => [
+        key,
+        cloneAssetMeta(asset),
+      ]),
+    ),
+    positionsById: Object.fromEntries(
+      Object.entries(meta.positionsById).map(([key, position]) => [
+        Number(key),
+        clonePositionMeta(position),
+      ]),
+    ) as Record<number, StockerProPositionMeta>,
+    positionIdsByAssetId: Object.fromEntries(
+      Object.entries(meta.positionIdsByAssetId).map(([key, ids]) => [
+        Number(key),
+        [...ids],
+      ]),
+    ) as Record<number, number[]>,
+    cashAssetsByCurrency: Object.fromEntries(
+      Object.entries(meta.cashAssetsByCurrency).map(([key, cash]) => [
+        key,
+        cloneCashAssetMeta(cash),
+      ]),
+    ),
+  };
+}
+
+function mergeValueByThreeWay<T>(
+  baseValue: T | undefined,
+  localValue: T | undefined,
+  remoteValue: T | undefined,
+): T | undefined {
+  const localTouched =
+    localValue !== undefined && !Object.is(localValue, baseValue);
+  const remoteTouched =
+    remoteValue !== undefined && !Object.is(remoteValue, baseValue);
+  if (localTouched) {
+    return localValue;
+  }
+  if (remoteTouched) {
+    return remoteValue;
+  }
+  if (localValue !== undefined) {
+    return localValue;
+  }
+  if (remoteValue !== undefined) {
+    return remoteValue;
+  }
+  return baseValue;
+}
+
+function mergeAssetNameByThreeWay(
+  baseValue: string | null | undefined,
+  localValue: string | null | undefined,
+  remoteValue: string | null | undefined,
+): string | null {
+  const resolved = mergeValueByThreeWay(baseValue, localValue, remoteValue);
+  if ((remoteValue == null || remoteValue === "") && localValue != null) {
+    return localValue;
+  }
+  return resolved == null ? null : resolved;
+}
+
+function mergeStockerProMetaByThreeWay(
+  baseMeta: StockerProEntityMeta | undefined,
+  localMeta: StockerProEntityMeta | undefined,
+  remoteMeta: StockerProEntityMeta | undefined,
+): StockerProEntityMeta | undefined {
+  if (!baseMeta && !localMeta && !remoteMeta) {
+    return undefined;
+  }
+
+  const fallbackPortfolio: StockerProPortfolioMeta = localMeta?.portfolio ??
+    remoteMeta?.portfolio ??
+    baseMeta?.portfolio ?? {
+      id: 0,
+      name: "",
+      tags: null,
+      note: "",
+      displayCurrencyType: "USD",
+      displayOrder: null,
+    };
+
+  const mergedPortfolio: StockerProPortfolioMeta = {
+    ...clonePortfolioMeta(fallbackPortfolio),
+    name:
+      mergeValueByThreeWay(
+        baseMeta?.portfolio.name,
+        localMeta?.portfolio.name,
+        remoteMeta?.portfolio.name,
+      ) ?? "",
+    tags: mergeValueByThreeWay(
+      baseMeta?.portfolio.tags,
+      localMeta?.portfolio.tags,
+      remoteMeta?.portfolio.tags,
+    ),
+    note:
+      mergeValueByThreeWay(
+        baseMeta?.portfolio.note,
+        localMeta?.portfolio.note,
+        remoteMeta?.portfolio.note,
+      ) ?? "",
+    displayCurrencyType:
+      mergeValueByThreeWay(
+        baseMeta?.portfolio.displayCurrencyType,
+        localMeta?.portfolio.displayCurrencyType,
+        remoteMeta?.portfolio.displayCurrencyType,
+      ) ?? fallbackPortfolio.displayCurrencyType,
+    displayOrder:
+      mergeValueByThreeWay(
+        baseMeta?.portfolio.displayOrder,
+        localMeta?.portfolio.displayOrder,
+        remoteMeta?.portfolio.displayOrder,
+      ) ?? null,
+  };
+
+  const mergedAssetsBySymbol: Record<string, StockerProAssetMeta> = {};
+  const assetKeys = new Set<string>([
+    ...Object.keys(baseMeta?.assetsBySymbol ?? {}),
+    ...Object.keys(localMeta?.assetsBySymbol ?? {}),
+    ...Object.keys(remoteMeta?.assetsBySymbol ?? {}),
+  ]);
+  assetKeys.forEach((assetKey) => {
+    const baseAsset = baseMeta?.assetsBySymbol[assetKey];
+    const localAsset = localMeta?.assetsBySymbol[assetKey];
+    const remoteAsset = remoteMeta?.assetsBySymbol[assetKey];
+    const fallbackAsset = localAsset ?? remoteAsset ?? baseAsset;
+    if (!fallbackAsset) {
+      return;
+    }
+    mergedAssetsBySymbol[assetKey] = {
+      ...cloneAssetMeta(fallbackAsset),
+      assetName: mergeAssetNameByThreeWay(
+        baseAsset?.assetName,
+        localAsset?.assetName,
+        remoteAsset?.assetName,
+      ),
+      displayOrder:
+        mergeValueByThreeWay(
+          baseAsset?.displayOrder,
+          localAsset?.displayOrder,
+          remoteAsset?.displayOrder,
+        ) ?? null,
+    };
+  });
+
+  const mergedPositionsById: Record<number, StockerProPositionMeta> = {};
+  const positionIds = new Set<number>([
+    ...Object.keys(baseMeta?.positionsById ?? {}).map((id) => Number(id)),
+    ...Object.keys(localMeta?.positionsById ?? {}).map((id) => Number(id)),
+    ...Object.keys(remoteMeta?.positionsById ?? {}).map((id) => Number(id)),
+  ]);
+  positionIds.forEach((positionId) => {
+    const basePosition = baseMeta?.positionsById[positionId];
+    const localPosition = localMeta?.positionsById[positionId];
+    const remotePosition = remoteMeta?.positionsById[positionId];
+    const fallbackPosition = localPosition ?? remotePosition ?? basePosition;
+    if (!fallbackPosition) {
+      return;
+    }
+    mergedPositionsById[positionId] = clonePositionMeta(fallbackPosition);
+  });
+
+  const mergedPositionIdsByAssetId: Record<number, number[]> = {};
+  const positionAssetIds = new Set<number>([
+    ...Object.keys(baseMeta?.positionIdsByAssetId ?? {}).map((id) =>
+      Number(id),
+    ),
+    ...Object.keys(localMeta?.positionIdsByAssetId ?? {}).map((id) =>
+      Number(id),
+    ),
+    ...Object.keys(remoteMeta?.positionIdsByAssetId ?? {}).map((id) =>
+      Number(id),
+    ),
+  ]);
+  positionAssetIds.forEach((assetId) => {
+    const baseIds = baseMeta?.positionIdsByAssetId[assetId];
+    const localIds = localMeta?.positionIdsByAssetId[assetId];
+    const remoteIds = remoteMeta?.positionIdsByAssetId[assetId];
+    const chosenIds = mergeValueByThreeWay(baseIds, localIds, remoteIds);
+    if (chosenIds) {
+      mergedPositionIdsByAssetId[assetId] = [...chosenIds];
+    }
+  });
+
+  const mergedCashAssetsByCurrency: Record<string, StockerProCashAssetMeta> =
+    {};
+  const cashCurrencies = new Set<string>([
+    ...Object.keys(baseMeta?.cashAssetsByCurrency ?? {}),
+    ...Object.keys(localMeta?.cashAssetsByCurrency ?? {}),
+    ...Object.keys(remoteMeta?.cashAssetsByCurrency ?? {}),
+  ]);
+  cashCurrencies.forEach((currency) => {
+    const baseCash = baseMeta?.cashAssetsByCurrency[currency];
+    const localCash = localMeta?.cashAssetsByCurrency[currency];
+    const remoteCash = remoteMeta?.cashAssetsByCurrency[currency];
+    const chosen = mergeValueByThreeWay(baseCash, localCash, remoteCash);
+    if (chosen) {
+      mergedCashAssetsByCurrency[currency] = cloneCashAssetMeta(chosen);
+    }
+  });
+
+  return {
+    portfolio: mergedPortfolio,
+    assetsBySymbol: mergedAssetsBySymbol,
+    positionsById: mergedPositionsById,
+    positionIdsByAssetId: mergedPositionIdsByAssetId,
+    cashAssetsByCurrency: mergedCashAssetsByCurrency,
+  };
+}
+
 function normalizeTransactionForSync(
   tx: NormalizedTransaction,
   fallbackId: string,
 ): NormalizedTransaction {
-  const txDate = Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date();
+  const txDate = Number.isFinite(tx.date.getTime())
+    ? new Date(tx.date)
+    : new Date();
   return {
     ...tx,
     id: (tx.id || fallbackId).trim() || fallbackId,
@@ -1507,7 +2051,10 @@ function normalizeTransactionForSync(
   };
 }
 
-function normalizeEntityForSync(entity: EntityDataset, index: number): EntityDataset {
+function normalizeEntityForSync(
+  entity: EntityDataset,
+  index: number,
+): EntityDataset {
   const fallbackId = `portfolio-${index + 1}`;
   const safeId =
     entity.id.trim() && entity.id.trim().toLowerCase() !== ALL_PORTFOLIO_ID
@@ -1527,6 +2074,7 @@ function normalizeEntityForSync(entity: EntityDataset, index: number): EntityDat
     currency: normalizeCurrencyCode(entity.currency) || "USD",
     transactions: normalizedTransactions,
     latestPriceBySymbol: buildLatestPriceBySymbol(normalizedTransactions),
+    stockerProMeta: cloneStockerProMeta(entity.stockerProMeta),
   };
 }
 
@@ -1548,7 +2096,9 @@ function mergeTransactionsByThreeWay(
   localTransactions: NormalizedTransaction[],
   remoteTransactions: NormalizedTransaction[],
 ): NormalizedTransaction[] {
-  const byId = (rows: NormalizedTransaction[]): Map<string, NormalizedTransaction> => {
+  const byId = (
+    rows: NormalizedTransaction[],
+  ): Map<string, NormalizedTransaction> => {
     const map = new Map<string, NormalizedTransaction>();
     rows.forEach((row) => {
       map.set(row.id, row);
@@ -1577,7 +2127,9 @@ function mergeTransactionsByThreeWay(
         // Same ID added on both sides: choose the newer timestamp snapshot.
         mergedMap.set(
           txId,
-          localTx.date.getTime() >= remoteTx.date.getTime() ? localTx : remoteTx,
+          localTx.date.getTime() >= remoteTx.date.getTime()
+            ? localTx
+            : remoteTx,
         );
       } else if (localTx) {
         mergedMap.set(txId, localTx);
@@ -1690,6 +2242,11 @@ function mergeEntitiesByThreeWay(
       localEntity.transactions,
       remoteEntity?.transactions ?? [],
     );
+    const mergedStockerProMeta = mergeStockerProMetaByThreeWay(
+      baseEntity.stockerProMeta,
+      localEntity.stockerProMeta,
+      remoteEntity?.stockerProMeta,
+    );
 
     const name =
       baseEntity.name !== localEntity.name
@@ -1706,6 +2263,7 @@ function mergeEntitiesByThreeWay(
       currency,
       transactions: mergedTransactions,
       latestPriceBySymbol: buildLatestPriceBySymbol(mergedTransactions),
+      stockerProMeta: mergedStockerProMeta,
     });
   });
 
@@ -1735,7 +2293,10 @@ function mergeEntitiesByThreeWay(
 }
 
 function buildSyncSummary(entities: EntityDataset[]): Record<string, unknown> {
-  const txCount = entities.reduce((total, entity) => total + entity.transactions.length, 0);
+  const txCount = entities.reduce(
+    (total, entity) => total + entity.transactions.length,
+    0,
+  );
   const latestTxMs = entities
     .flatMap((entity) => entity.transactions.map((tx) => tx.date.getTime()))
     .filter((ms) => Number.isFinite(ms))
@@ -1743,8 +2304,7 @@ function buildSyncSummary(entities: EntityDataset[]): Record<string, unknown> {
   return {
     portfolios: entities.length,
     transactions: txCount,
-    latestTxAt:
-      latestTxMs > 0 ? new Date(latestTxMs).toISOString() : null,
+    latestTxAt: latestTxMs > 0 ? new Date(latestTxMs).toISOString() : null,
   };
 }
 
@@ -1764,14 +2324,21 @@ function normalizeReviewEntities(entities: EntityDataset[]): EntityDataset[] {
   return entities
     .map((entity, index) => {
       const portfolioCurrency = normalizeCurrencyCode(entity.currency) || "USD";
-      const portfolioId = buildSafePortfolioId(entity.id, `portfolio-${index + 1}`, usedPortfolioIds);
+      const portfolioId = buildSafePortfolioId(
+        entity.id,
+        `portfolio-${index + 1}`,
+        usedPortfolioIds,
+      );
       const portfolioName = entity.name.trim() || `Portfolio ${index + 1}`;
 
       const transactions = entity.transactions
         .map((tx, txIndex) => {
-          const date = Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date();
+          const date = Number.isFinite(tx.date.getTime())
+            ? new Date(tx.date)
+            : new Date();
           const type = tx.type;
-          const currency = normalizeCurrencyCode(tx.currency) || portfolioCurrency;
+          const currency =
+            normalizeCurrencyCode(tx.currency) || portfolioCurrency;
           let symbol = tx.symbol.trim().toUpperCase();
           if (shouldUseCurrencyAsSymbol(type) && !symbol) {
             symbol = currency;
@@ -1803,18 +2370,27 @@ function normalizeReviewEntities(entities: EntityDataset[]): EntityDataset[] {
         latestPriceBySymbol: buildLatestPriceBySymbol(sorted),
       };
     })
-    .filter((entity) => entity.transactions.length > 0 || entity.name.trim().length > 0);
+    .filter(
+      (entity) =>
+        entity.transactions.length > 0 || entity.name.trim().length > 0,
+    );
 }
 
-function normalizePortfolioIdsForUi(
-  entities: EntityDataset[],
-): { normalizedEntities: EntityDataset[]; idMap: Map<string, string>; changed: boolean } {
+function normalizePortfolioIdsForUi(entities: EntityDataset[]): {
+  normalizedEntities: EntityDataset[];
+  idMap: Map<string, string>;
+  changed: boolean;
+} {
   const usedIds = new Set<string>();
   const idMap = new Map<string, string>();
   let changed = false;
 
   const normalizedEntities = entities.map((entity, index) => {
-    const safeId = buildSafePortfolioId(entity.id, `portfolio-${index + 1}`, usedIds);
+    const safeId = buildSafePortfolioId(
+      entity.id,
+      `portfolio-${index + 1}`,
+      usedIds,
+    );
     if (safeId !== entity.id) {
       changed = true;
     }
@@ -1836,10 +2412,7 @@ function buildImportBatchRawText(items: ImportBatchItem[]): string {
   }
   return items
     .map((item) =>
-      [
-        `[STOCKER_IMPORT_FILE] ${item.fileName}`,
-        item.rawText,
-      ].join("\n"),
+      [`[STOCKER_IMPORT_FILE] ${item.fileName}`, item.rawText].join("\n"),
     )
     .join("\n\n");
 }
@@ -1853,13 +2426,18 @@ function mergeImportBatchEntities(items: ImportBatchItem[]): EntityDataset[] {
     item.entities.forEach((entity, entityIndex) => {
       const currency = normalizeCurrencyCode(entity.currency) || "USD";
       const trimmedId = entity.id.trim();
-      const portfolioName = entity.name.trim() || `Portfolio ${portfolioMap.size + 1}`;
+      const portfolioName =
+        entity.name.trim() || `Portfolio ${portfolioMap.size + 1}`;
       const portfolioKey = trimmedId
         ? `id:${trimmedId.toUpperCase()}`
         : `name:${portfolioName.toLowerCase()}|currency:${currency}`;
 
       if (!portfolioMap.has(portfolioKey)) {
-        const safeId = buildSafePortfolioId(trimmedId, `portfolio-import-${portfolioMap.size + 1}`, usedPortfolioIds);
+        const safeId = buildSafePortfolioId(
+          trimmedId,
+          `portfolio-import-${portfolioMap.size + 1}`,
+          usedPortfolioIds,
+        );
         portfolioMap.set(portfolioKey, {
           id: safeId,
           name: portfolioName,
@@ -1877,7 +2455,9 @@ function mergeImportBatchEntities(items: ImportBatchItem[]): EntityDataset[] {
       }
 
       entity.transactions.forEach((tx) => {
-        const date = Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date();
+        const date = Number.isFinite(tx.date.getTime())
+          ? new Date(tx.date)
+          : new Date();
         const symbol = tx.symbol.trim().toUpperCase();
         const txCurrency = normalizeCurrencyCode(tx.currency) || currency;
 
@@ -1906,7 +2486,9 @@ function mergeImportBatchEntities(items: ImportBatchItem[]): EntityDataset[] {
         signatures.add(signature);
 
         const uniqueIndex = targetPortfolio.transactions.length + 1;
-        const dateKey = Number.isFinite(date.getTime()) ? date.getTime() : Date.now();
+        const dateKey = Number.isFinite(date.getTime())
+          ? date.getTime()
+          : Date.now();
         targetPortfolio.transactions.push({
           id: `imp-${targetPortfolio.id}-${itemIndex + 1}-${entityIndex + 1}-${uniqueIndex}-${dateKey}`,
           ...normalizedTxBase,
@@ -1915,10 +2497,15 @@ function mergeImportBatchEntities(items: ImportBatchItem[]): EntityDataset[] {
     });
   });
 
-  return Array.from(portfolioMap.values()).map((entity, index) => normalizeEntityForSync(entity, index));
+  return Array.from(portfolioMap.values()).map((entity, index) =>
+    normalizeEntityForSync(entity, index),
+  );
 }
 
-function buildDefaultDraft(portfolioId: string, currency: string): TransactionDraft {
+function buildDefaultDraft(
+  portfolioId: string,
+  currency: string,
+): TransactionDraft {
   const normalizedCurrency = normalizeCurrencyCode(currency) || "USD";
   const district = inferDistrictFromCurrency(normalizedCurrency);
   return {
@@ -1946,24 +2533,30 @@ export default function App(): JSX.Element {
   const [selectedRange, setSelectedRange] = useState<ChartRangePreset>("1Y");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
-  const [selectedPortfolioLineId, setSelectedPortfolioLineId] = useState<PortfolioLineId>(
-    "totalMarketValue",
-  );
+  const [selectedPortfolioLineId, setSelectedPortfolioLineId] =
+    useState<PortfolioLineId>("totalMarketValue");
 
-  const [txTypeFilter, setTxTypeFilter] = useState<TransactionTypeFilter>("all");
+  const [txTypeFilter, setTxTypeFilter] =
+    useState<TransactionTypeFilter>("all");
   const [txDateFilter, setTxDateFilter] = useState<DateFilterPreset>("all");
   const [txCustomStart, setTxCustomStart] = useState("");
   const [txCustomEnd, setTxCustomEnd] = useState("");
   const [txKeyword, setTxKeyword] = useState("");
 
   const [holdingSearch, setHoldingSearch] = useState("");
-  const [holdingSort, setHoldingSort] = useState<"marketValue" | "profit" | "symbol">("marketValue");
+  const [holdingSort, setHoldingSort] = useState<
+    "marketValue" | "profit" | "symbol"
+  >("marketValue");
 
   const [isTxModalOpen, setTxModalOpen] = useState(false);
-  const [editingTransaction, setEditingTransaction] = useState<TransactionRow | null>(null);
-  const [draft, setDraft] = useState<TransactionDraft>(buildDefaultDraft("", "USD"));
+  const [editingTransaction, setEditingTransaction] =
+    useState<TransactionRow | null>(null);
+  const [draft, setDraft] = useState<TransactionDraft>(
+    buildDefaultDraft("", "USD"),
+  );
   const [transactionError, setTransactionError] = useState("");
-  const [pendingCashReview, setPendingCashReview] = useState<PendingCashReview | null>(null);
+  const [pendingCashReview, setPendingCashReview] =
+    useState<PendingCashReview | null>(null);
   const [pendingCashAmount, setPendingCashAmount] = useState("");
 
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1973,17 +2566,24 @@ export default function App(): JSX.Element {
   const [isEntryUploadDragOver, setEntryUploadDragOver] = useState(false);
   const [isDataUploadDragOver, setDataUploadDragOver] = useState(false);
   const [isImportReviewOpen, setImportReviewOpen] = useState(false);
-  const [importReviewEntities, setImportReviewEntities] = useState<EntityDataset[]>([]);
-  const [importReviewSource, setImportReviewSource] = useState<ImportReviewSource | null>(null);
+  const [importReviewEntities, setImportReviewEntities] = useState<
+    EntityDataset[]
+  >([]);
+  const [importReviewSource, setImportReviewSource] =
+    useState<ImportReviewSource | null>(null);
   const [importReviewFeedback, setImportReviewFeedback] = useState("");
   const [importReviewError, setImportReviewError] = useState("");
   const [isImportReviewAdjusting, setImportReviewAdjusting] = useState(false);
   const [dataImportType, setDataImportType] = useState<UserType>("stockerpro");
   const [settings, setSettings] = useState<WebSettings>(DEFAULT_SETTINGS);
-  const [selectedStockDetailId, setSelectedStockDetailId] = useState<string | null>(null);
+  const [selectedStockDetailId, setSelectedStockDetailId] = useState<
+    string | null
+  >(null);
   const [isQuoteSyncing, setQuoteSyncing] = useState(false);
   const [quoteSyncError, setQuoteSyncError] = useState("");
-  const [quoteLastUpdatedAt, setQuoteLastUpdatedAt] = useState<Date | null>(null);
+  const [quoteLastUpdatedAt, setQuoteLastUpdatedAt] = useState<Date | null>(
+    null,
+  );
   const [quoteSyncedCount, setQuoteSyncedCount] = useState(0);
   const [fxRateByPair, setFxRateByPair] = useState<Record<string, number>>({});
   const [fxSyncError, setFxSyncError] = useState("");
@@ -1994,9 +2594,14 @@ export default function App(): JSX.Element {
   const [valuationCustomEnd, setValuationCustomEnd] = useState("");
   const [isValuationSyncing, setValuationSyncing] = useState(false);
   const [valuationSyncError, setValuationSyncError] = useState("");
-  const [valuationLastUpdatedAt, setValuationLastUpdatedAt] = useState<Date | null>(null);
-  const [valuationSeriesCache, setValuationSeriesCache] = useState<Record<string, PricePoint[]>>({});
-  const [portfolioHistoryBySymbol, setPortfolioHistoryBySymbol] = useState<Record<string, PricePoint[]>>({});
+  const [valuationLastUpdatedAt, setValuationLastUpdatedAt] =
+    useState<Date | null>(null);
+  const [valuationSeriesCache, setValuationSeriesCache] = useState<
+    Record<string, PricePoint[]>
+  >({});
+  const [portfolioHistoryBySymbol, setPortfolioHistoryBySymbol] = useState<
+    Record<string, PricePoint[]>
+  >({});
   const [authUser, setAuthUser] = useState<User | null>(null);
   const [isAuthLoading, setAuthLoading] = useState(true);
   const [hasAcceptedBetaRisk, setHasAcceptedBetaRisk] = useState(false);
@@ -2031,11 +2636,16 @@ export default function App(): JSX.Element {
 
   const isZh = settings.language === "zh-HK";
   const localeTag = isZh ? "zh-HK" : "en-US";
-  const t = useCallback((en: string, zh: string): string => (isZh ? zh : en), [isZh]);
+  const t = useCallback(
+    (en: string, zh: string): string => (isZh ? zh : en),
+    [isZh],
+  );
   const rangeTitle = (preset: ChartRangePreset): string =>
     isZh ? TIME_RANGE_TITLES_ZH[preset] : TIME_RANGE_TITLES[preset];
-  const dateFilterLabel = (preset: DateFilterPreset, fallback: string): string =>
-    isZh ? DATE_FILTER_LABELS_ZH[preset] : fallback;
+  const dateFilterLabel = (
+    preset: DateFilterPreset,
+    fallback: string,
+  ): string => (isZh ? DATE_FILTER_LABELS_ZH[preset] : fallback);
   const setSelectedPortfolioIdWithTrace = useCallback(
     (nextPortfolioId: string, reason: string): void => {
       selectedPortfolioSetReasonRef.current = reason;
@@ -2090,18 +2700,28 @@ export default function App(): JSX.Element {
         ...buildSyncSummary(localEntities),
       });
       try {
-        const docRef = doc(firestoreDb, firebaseDatabaseCollection, signedInUser.uid);
-        const baseEntities = safeDeserializeEntities(lastCloudSerializedRef.current);
+        const docRef = doc(
+          firestoreDb,
+          firebaseDatabaseCollection,
+          signedInUser.uid,
+        );
+        const baseEntities = safeDeserializeEntities(
+          lastCloudSerializedRef.current,
+        );
         syncTrace("persist:base", buildSyncSummary(baseEntities));
 
         const result = await runTransaction(
           firestoreDb,
-          async (transaction): Promise<{
+          async (
+            transaction,
+          ): Promise<{
             mergedEntities: EntityDataset[];
             mergedSerialized: string;
           }> => {
             const snapshot = await transaction.get(docRef);
-            const snapshotData = snapshot.data() as Record<string, unknown> | undefined;
+            const snapshotData = snapshot.data() as
+              | Record<string, unknown>
+              | undefined;
             const remoteDataValue = snapshotData?.data;
             const remoteRaw =
               typeof remoteDataValue === "string"
@@ -2122,10 +2742,12 @@ export default function App(): JSX.Element {
               localEntities,
               remoteEntities,
             );
-            const mergedSerialized = serializeEntitiesForCloudSync(mergedEntities);
+            const mergedSerialized =
+              serializeEntitiesForCloudSync(mergedEntities);
             syncTrace("persist:merged", buildSyncSummary(mergedEntities));
             const { stockerProJson } = buildDualFormatRecords(mergedEntities);
-            const compressed = await compressStringToDeflateBase64(stockerProJson);
+            const compressed =
+              await compressStringToDeflateBase64(stockerProJson);
             const payload: Record<string, unknown> = {
               data: compressed,
               updatedAt: serverTimestamp(),
@@ -2146,18 +2768,16 @@ export default function App(): JSX.Element {
         lastCloudSerializedRef.current = result.mergedSerialized;
 
         if (result.mergedSerialized !== serializedEntities) {
-          syncTrace("persist:local-reconciled", buildSyncSummary(result.mergedEntities));
+          syncTrace(
+            "persist:local-reconciled",
+            buildSyncSummary(result.mergedEntities),
+          );
           setEntities(result.mergedEntities);
         }
 
         const syncedAt = new Date();
         setCloudLastSyncedAt(syncedAt);
-        setCloudStatusMessage(
-          t(
-            "Cloud synced.",
-            "雲端已同步。",
-          ),
-        );
+        setCloudStatusMessage(t("Cloud synced.", "雲端已同步。"));
         syncTrace("persist:done", {
           uid: signedInUser.uid,
           syncedAt: syncedAt.toISOString(),
@@ -2189,18 +2809,30 @@ export default function App(): JSX.Element {
       let readyForSync = true;
 
       try {
-        const docRef = doc(firestoreDb, firebaseDatabaseCollection, signedInUser.uid);
+        const docRef = doc(
+          firestoreDb,
+          firebaseDatabaseCollection,
+          signedInUser.uid,
+        );
         const snapshot = await getDoc(docRef);
 
         if (!snapshot.exists()) {
           cloudDocExistsRef.current = false;
           setEntities([]);
-          setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "loadCloudData:no-document");
+          setSelectedPortfolioIdWithTrace(
+            ALL_PORTFOLIO_ID,
+            "loadCloudData:no-document",
+          );
           setSelectedStockId("");
           setSelectedStockDetailId(null);
           setScreen("choose");
           setUserType(null);
-          setCloudStatusMessage(t("No cloud data yet. Your next changes will create it.", "雲端暫時冇資料，你下一次更改會建立。"));
+          setCloudStatusMessage(
+            t(
+              "No cloud data yet. Your next changes will create it.",
+              "雲端暫時冇資料，你下一次更改會建立。",
+            ),
+          );
           setCloudReady(true);
           return;
         }
@@ -2218,7 +2850,10 @@ export default function App(): JSX.Element {
         const parsedEntities = await parseRemoteDatabasePayload(remoteRaw);
         if (parsedEntities.length > 0) {
           setEntities(parsedEntities);
-          setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "loadCloudData:parsed-entities");
+          setSelectedPortfolioIdWithTrace(
+            ALL_PORTFOLIO_ID,
+            "loadCloudData:parsed-entities",
+          );
           setSelectedStockId("");
           setSelectedStockDetailId(null);
           setSelectedRange("1Y");
@@ -2228,7 +2863,9 @@ export default function App(): JSX.Element {
             if (normalizeCurrencyCode(previous.displayCurrency) !== "AUTO") {
               return previous;
             }
-            const preferred = normalizeCurrencyCode(parsedEntities[0]?.currency);
+            const preferred = normalizeCurrencyCode(
+              parsedEntities[0]?.currency,
+            );
             if (!preferred || preferred === "AUTO") {
               return previous;
             }
@@ -2237,11 +2874,17 @@ export default function App(): JSX.Element {
               displayCurrency: preferred,
             };
           });
-          lastCloudSerializedRef.current = serializeEntitiesForCloudSync(parsedEntities);
-          setCloudStatusMessage(t("Cloud portfolio loaded.", "已載入雲端投資組合。"));
+          lastCloudSerializedRef.current =
+            serializeEntitiesForCloudSync(parsedEntities);
+          setCloudStatusMessage(
+            t("Cloud portfolio loaded.", "已載入雲端投資組合。"),
+          );
         } else {
           setEntities([]);
-          setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "loadCloudData:parsed-empty");
+          setSelectedPortfolioIdWithTrace(
+            ALL_PORTFOLIO_ID,
+            "loadCloudData:parsed-empty",
+          );
           setSelectedStockId("");
           setSelectedStockDetailId(null);
           setScreen("choose");
@@ -2255,7 +2898,9 @@ export default function App(): JSX.Element {
           readyForSync = false;
         }
 
-        const updatedAt = snapshotData.updatedAt as { toDate?: () => Date } | undefined;
+        const updatedAt = snapshotData.updatedAt as
+          | { toDate?: () => Date }
+          | undefined;
         if (updatedAt && typeof updatedAt.toDate === "function") {
           const updatedAtDate = updatedAt.toDate();
           setCloudLastSyncedAt(updatedAtDate);
@@ -2402,7 +3047,9 @@ export default function App(): JSX.Element {
 
           cloudDocExistsRef.current = true;
           const snapshotData = snapshot.data() as Record<string, unknown>;
-          const updatedAt = snapshotData.updatedAt as { toDate?: () => Date } | undefined;
+          const updatedAt = snapshotData.updatedAt as
+            | { toDate?: () => Date }
+            | undefined;
           if (!updatedAt || typeof updatedAt.toDate !== "function") {
             return;
           }
@@ -2440,7 +3087,8 @@ export default function App(): JSX.Element {
             ...buildSyncSummary(remoteEntities),
           });
 
-          const remoteSerialized = serializeEntitiesForCloudSync(remoteEntities);
+          const remoteSerialized =
+            serializeEntitiesForCloudSync(remoteEntities);
           if (!remoteSerialized.trim()) {
             syncTrace("snapshot:empty-serialized", { uid: authUser.uid });
             return;
@@ -2463,20 +3111,25 @@ export default function App(): JSX.Element {
               ...buildSyncSummary(mergedEntities),
             });
             setEntities(mergedEntities);
-            setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "snapshot:apply-non-dashboard");
+            setSelectedPortfolioIdWithTrace(
+              ALL_PORTFOLIO_ID,
+              "snapshot:apply-non-dashboard",
+            );
             setSelectedStockId("");
             setSelectedStockDetailId(null);
             setUserType("stockerpro");
             setScreen("dashboard");
           } else {
             setEntities((currentEntities) => {
-              const localSerialized = serializeEntitiesForCloudSync(currentEntities);
+              const localSerialized =
+                serializeEntitiesForCloudSync(currentEntities);
               const mergedEntities = mergeEntitiesByThreeWay(
                 baseEntities,
                 currentEntities,
                 remoteEntities,
               );
-              const mergedSerialized = serializeEntitiesForCloudSync(mergedEntities);
+              const mergedSerialized =
+                serializeEntitiesForCloudSync(mergedEntities);
               if (mergedSerialized === localSerialized) {
                 syncTrace("snapshot:no-change", { uid: authUser.uid });
                 return currentEntities;
@@ -2560,7 +3213,12 @@ export default function App(): JSX.Element {
   }, [entities, screen]);
 
   useEffect(() => {
-    if (!authUser || isAuthLoading || !isCloudReady || cloudHydratingRef.current) {
+    if (
+      !authUser ||
+      isAuthLoading ||
+      !isCloudReady ||
+      cloudHydratingRef.current
+    ) {
       return;
     }
     if (screen !== "dashboard") {
@@ -2579,7 +3237,14 @@ export default function App(): JSX.Element {
     };
     syncTrace("persist:queued", buildSyncSummary(entities));
     void drainCloudPersistQueue();
-  }, [authUser, drainCloudPersistQueue, entities, isAuthLoading, isCloudReady, screen]);
+  }, [
+    authUser,
+    drainCloudPersistQueue,
+    entities,
+    isAuthLoading,
+    isCloudReady,
+    screen,
+  ]);
 
   const filteredEntities = useMemo(() => {
     if (selectedPortfolioId === "all") {
@@ -2596,11 +3261,18 @@ export default function App(): JSX.Element {
   const convertAmountToDisplay = useCallback(
     (value: number, sourceCurrency: string): number => {
       const from = normalizeCurrencyCode(sourceCurrency) || "USD";
-      if (normalizedDisplayCurrency === "AUTO" || from === normalizedDisplayCurrency) {
+      if (
+        normalizedDisplayCurrency === "AUTO" ||
+        from === normalizedDisplayCurrency
+      ) {
         return value;
       }
 
-      const rate = resolveFxRateFromPairMap(fxRateByPair, from, normalizedDisplayCurrency);
+      const rate = resolveFxRateFromPairMap(
+        fxRateByPair,
+        from,
+        normalizedDisplayCurrency,
+      );
       if (rate && Number.isFinite(rate) && rate > 0) {
         return value * rate;
       }
@@ -2610,7 +3282,9 @@ export default function App(): JSX.Element {
     [fxRateByPair, normalizedDisplayCurrency],
   );
 
-  const calculationConversion = useMemo<CalculationConversionOptions | undefined>(() => {
+  const calculationConversion = useMemo<
+    CalculationConversionOptions | undefined
+  >(() => {
     if (normalizedDisplayCurrency === "AUTO") {
       return undefined;
     }
@@ -2620,8 +3294,13 @@ export default function App(): JSX.Element {
     };
   }, [convertAmountToDisplay, normalizedDisplayCurrency]);
 
-  const portfolioOverviewCalculationOptions = useMemo<CalculationConversionOptions | undefined>(() => {
-    if (!calculationConversion && Object.keys(portfolioHistoryBySymbol).length === 0) {
+  const portfolioOverviewCalculationOptions = useMemo<
+    CalculationConversionOptions | undefined
+  >(() => {
+    if (
+      !calculationConversion &&
+      Object.keys(portfolioHistoryBySymbol).length === 0
+    ) {
       return undefined;
     }
     return {
@@ -2631,7 +3310,11 @@ export default function App(): JSX.Element {
   }, [calculationConversion, portfolioHistoryBySymbol]);
 
   const portfolioSummary = useMemo(
-    () => calculatePortfolioSummary(filteredEntities, portfolioOverviewCalculationOptions),
+    () =>
+      calculatePortfolioSummary(
+        filteredEntities,
+        portfolioOverviewCalculationOptions,
+      ),
     [filteredEntities, portfolioOverviewCalculationOptions],
   );
 
@@ -2643,7 +3326,9 @@ export default function App(): JSX.Element {
     const discoveredCurrencies = new Set<string>();
     entities.forEach((entity) => {
       discoveredCurrencies.add(normalizeCurrencyCode(entity.currency));
-      entity.transactions.forEach((tx) => discoveredCurrencies.add(normalizeCurrencyCode(tx.currency)));
+      entity.transactions.forEach((tx) =>
+        discoveredCurrencies.add(normalizeCurrencyCode(tx.currency)),
+      );
     });
 
     const sample100ByCurrency: Record<string, number> = {};
@@ -2651,7 +3336,8 @@ export default function App(): JSX.Element {
       .filter((currency) => currency && currency !== normalizedDisplayCurrency)
       .slice(0, 10)
       .forEach((currency) => {
-        sample100ByCurrency[`${currency}->${normalizedDisplayCurrency}`] = convertAmountToDisplay(100, currency);
+        sample100ByCurrency[`${currency}->${normalizedDisplayCurrency}`] =
+          convertAmountToDisplay(100, currency);
       });
 
     const rawSummary = calculatePortfolioSummary(filteredEntities);
@@ -2705,7 +3391,10 @@ export default function App(): JSX.Element {
     });
 
     return [...available]
-      .filter((currency) => currency && currency !== "AUTO" && isValidCurrencyCode(currency))
+      .filter(
+        (currency) =>
+          currency && currency !== "AUTO" && isValidCurrencyCode(currency),
+      )
       .sort((a, b) => a.localeCompare(b));
   }, [
     entities,
@@ -2794,7 +3483,9 @@ export default function App(): JSX.Element {
 
   const displayedClosedStocks = useMemo(() => {
     const keyword = holdingSearch.trim().toUpperCase();
-    return closedStocks.filter((item) => (keyword ? item.symbol.includes(keyword) : true));
+    return closedStocks.filter((item) =>
+      keyword ? item.symbol.includes(keyword) : true,
+    );
   }, [closedStocks, holdingSearch]);
 
   const selectedStock =
@@ -2813,9 +3504,12 @@ export default function App(): JSX.Element {
     }
 
     const firstDate = sortedDates[0];
-    const firstModernDate = sortedDates.find((date) => date.getFullYear() > 1970);
+    const firstModernDate = sortedDates.find(
+      (date) => date.getFullYear() > 1970,
+    );
     const gapYears = firstModernDate
-      ? (firstModernDate.getTime() - firstDate.getTime()) / (86_400_000 * 365.25)
+      ? (firstModernDate.getTime() - firstDate.getTime()) /
+        (86_400_000 * 365.25)
       : 0;
     const minDate =
       firstModernDate && firstDate.getFullYear() <= 1970 && gapYears >= 20
@@ -2837,6 +3531,7 @@ export default function App(): JSX.Element {
           ...tx,
           portfolioId: entity.id,
           portfolioName: entity.name,
+          assetName: resolveAssetNameForTransaction(entity, tx),
         });
       });
     });
@@ -2852,7 +3547,12 @@ export default function App(): JSX.Element {
         return false;
       }
 
-      const passDate = isDateInPresetRange(tx.date, txDateFilter, txCustomStart, txCustomEnd);
+      const passDate = isDateInPresetRange(
+        tx.date,
+        txDateFilter,
+        txCustomStart,
+        txCustomEnd,
+      );
       if (!passDate) {
         return false;
       }
@@ -2867,10 +3567,21 @@ export default function App(): JSX.Element {
         (tx.note ?? "").toUpperCase().includes(keyword)
       );
     });
-  }, [allTransactions, txCustomEnd, txCustomStart, txDateFilter, txKeyword, txTypeFilter]);
+  }, [
+    allTransactions,
+    txCustomEnd,
+    txCustomStart,
+    txDateFilter,
+    txKeyword,
+    txTypeFilter,
+  ]);
 
   const transactionNetValue = useMemo(
-    () => filteredTransactions.reduce((total, tx) => total + getTransactionNetCashFlow(tx), 0),
+    () =>
+      filteredTransactions.reduce(
+        (total, tx) => total + getTransactionNetCashFlow(tx),
+        0,
+      ),
     [filteredTransactions],
   );
 
@@ -2896,8 +3607,10 @@ export default function App(): JSX.Element {
   const currentRange = useMemo(
     () => ({
       preset: selectedRange,
-      startDate: selectedRange === "CUSTOM" ? parseDateInput(customStart) : undefined,
-      endDate: selectedRange === "CUSTOM" ? parseDateInput(customEnd) : undefined,
+      startDate:
+        selectedRange === "CUSTOM" ? parseDateInput(customStart) : undefined,
+      endDate:
+        selectedRange === "CUSTOM" ? parseDateInput(customEnd) : undefined,
     }),
     [customEnd, customStart, selectedRange],
   );
@@ -2920,35 +3633,62 @@ export default function App(): JSX.Element {
     [portfolioOverviewSeries],
   );
   const assetAllocation = useMemo(
-    () => calculateAssetAllocationSegments(filteredEntities, 8, calculationConversion),
+    () =>
+      calculateAssetAllocationSegments(
+        filteredEntities,
+        8,
+        calculationConversion,
+      ),
     [calculationConversion, filteredEntities],
   );
   const currencyExposure = useMemo(
-    () => calculateCurrencyExposureSegments(filteredEntities, calculationConversion),
+    () =>
+      calculateCurrencyExposureSegments(
+        filteredEntities,
+        calculationConversion,
+      ),
     [calculationConversion, filteredEntities],
   );
   const monthlyDividendSeries = useMemo(
-    () => calculateMonthlyDividendSeries(filteredEntities, 18, calculationConversion),
+    () =>
+      calculateMonthlyDividendSeries(
+        filteredEntities,
+        18,
+        calculationConversion,
+      ),
     [calculationConversion, filteredEntities],
   );
   const monthlyBuySeries = useMemo(
-    () => calculateMonthlyBuySeries(filteredEntities, 18, calculationConversion),
+    () =>
+      calculateMonthlyBuySeries(filteredEntities, 18, calculationConversion),
     [calculationConversion, filteredEntities],
   );
   const monthlySellSeries = useMemo(
-    () => calculateMonthlySellSeries(filteredEntities, 18, calculationConversion),
+    () =>
+      calculateMonthlySellSeries(filteredEntities, 18, calculationConversion),
     [calculationConversion, filteredEntities],
   );
   const monthlyFeeSeries = useMemo(
-    () => calculateMonthlyFeeSeries(filteredEntities, 18, calculationConversion),
+    () =>
+      calculateMonthlyFeeSeries(filteredEntities, 18, calculationConversion),
     [calculationConversion, filteredEntities],
   );
   const monthlyCashFlowSeries = useMemo(
-    () => calculateMonthlyCashFlowSeries(filteredEntities, 18, calculationConversion),
+    () =>
+      calculateMonthlyCashFlowSeries(
+        filteredEntities,
+        18,
+        calculationConversion,
+      ),
     [calculationConversion, filteredEntities],
   );
   const monthlyProfitBarSeries = useMemo(
-    () => calculateMonthlyProfitSeries(filteredEntities, 18, portfolioOverviewCalculationOptions),
+    () =>
+      calculateMonthlyProfitSeries(
+        filteredEntities,
+        18,
+        portfolioOverviewCalculationOptions,
+      ),
     [filteredEntities, portfolioOverviewCalculationOptions],
   );
   const compareSeries = useMemo(
@@ -2993,7 +3733,9 @@ export default function App(): JSX.Element {
     return stockBreakdown
       .map((item) => ({
         ...item,
-        convertedMarketValue: Math.abs(convertAmountToDisplay(item.marketValue, item.currency)),
+        convertedMarketValue: Math.abs(
+          convertAmountToDisplay(item.marketValue, item.currency),
+        ),
       }))
       .filter((item) => item.convertedMarketValue > 0)
       .sort((a, b) => b.convertedMarketValue - a.convertedMarketValue)
@@ -3007,7 +3749,9 @@ export default function App(): JSX.Element {
   const stockCountryDistribution = useMemo(() => {
     const grouped = new Map<string, number>();
     stockBreakdown.forEach((item) => {
-      const value = Math.abs(convertAmountToDisplay(item.marketValue, item.currency));
+      const value = Math.abs(
+        convertAmountToDisplay(item.marketValue, item.currency),
+      );
       if (value <= 0) {
         return;
       }
@@ -3020,7 +3764,9 @@ export default function App(): JSX.Element {
   const stockCategoryDistribution = useMemo(() => {
     const grouped = new Map<string, number>();
     stockBreakdown.forEach((item) => {
-      const value = Math.abs(convertAmountToDisplay(item.marketValue, item.currency));
+      const value = Math.abs(
+        convertAmountToDisplay(item.marketValue, item.currency),
+      );
       if (value <= 0) {
         return;
       }
@@ -3034,14 +3780,22 @@ export default function App(): JSX.Element {
     if (!selectedStockDetailId) {
       return null;
     }
-    return stockBreakdown.find((item) => item.id === selectedStockDetailId) ?? null;
+    return (
+      stockBreakdown.find((item) => item.id === selectedStockDetailId) ?? null
+    );
   }, [selectedStockDetailId, stockBreakdown]);
 
   const stockDetailRange = useMemo(
     () => ({
       preset: valuationRange,
-      startDate: valuationRange === "CUSTOM" ? parseDateInput(valuationCustomStart) : undefined,
-      endDate: valuationRange === "CUSTOM" ? parseDateInput(valuationCustomEnd) : undefined,
+      startDate:
+        valuationRange === "CUSTOM"
+          ? parseDateInput(valuationCustomStart)
+          : undefined,
+      endDate:
+        valuationRange === "CUSTOM"
+          ? parseDateInput(valuationCustomEnd)
+          : undefined,
     }),
     [valuationCustomEnd, valuationCustomStart, valuationRange],
   );
@@ -3064,8 +3818,10 @@ export default function App(): JSX.Element {
     if (!stockDetail) {
       return "";
     }
-    const customStartKey = valuationRange === "CUSTOM" ? valuationCustomStart || "none" : "range";
-    const customEndKey = valuationRange === "CUSTOM" ? valuationCustomEnd || "none" : "range";
+    const customStartKey =
+      valuationRange === "CUSTOM" ? valuationCustomStart || "none" : "range";
+    const customEndKey =
+      valuationRange === "CUSTOM" ? valuationCustomEnd || "none" : "range";
     return [
       stockDetail.symbol.toUpperCase(),
       valuationRange,
@@ -3078,7 +3834,9 @@ export default function App(): JSX.Element {
     if (!stockDetail) {
       return [];
     }
-    const cached = valuationCacheKey ? valuationSeriesCache[valuationCacheKey] : undefined;
+    const cached = valuationCacheKey
+      ? valuationSeriesCache[valuationCacheKey]
+      : undefined;
     if (cached && cached.length > 0) {
       return cached;
     }
@@ -3107,7 +3865,8 @@ export default function App(): JSX.Element {
       return 0;
     }
     const first = stockDetailValuationSeries[0].price;
-    const last = stockDetailValuationSeries[stockDetailValuationSeries.length - 1].price;
+    const last =
+      stockDetailValuationSeries[stockDetailValuationSeries.length - 1].price;
     if (first <= 0) {
       return 0;
     }
@@ -3119,9 +3878,16 @@ export default function App(): JSX.Element {
       return [];
     }
     if (stockDetailValuationSeries.length > 0) {
-      return calculateProfitSeriesFromPriceSeries(stockDetailValuationSeries, stockDetailTransactions);
+      return calculateProfitSeriesFromPriceSeries(
+        stockDetailValuationSeries,
+        stockDetailTransactions,
+      );
     }
-    return calculateSeriesForStock(filteredEntities, stockDetail.id, stockDetailRange);
+    return calculateSeriesForStock(
+      filteredEntities,
+      stockDetail.id,
+      stockDetailRange,
+    );
   }, [
     filteredEntities,
     stockDetail,
@@ -3135,8 +3901,10 @@ export default function App(): JSX.Element {
       ...stockDetailValuationSeries.map((item) => item.date.getTime()),
       ...stockDetailSeries.map((item) => item.date.getTime()),
     ];
-    const minTime = timeline.length > 0 ? Math.min(...timeline) : Number.NEGATIVE_INFINITY;
-    const maxTime = timeline.length > 0 ? Math.max(...timeline) : Number.POSITIVE_INFINITY;
+    const minTime =
+      timeline.length > 0 ? Math.min(...timeline) : Number.NEGATIVE_INFINITY;
+    const maxTime =
+      timeline.length > 0 ? Math.max(...timeline) : Number.POSITIVE_INFINITY;
 
     return stockDetailTransactions
       .filter((tx) => {
@@ -3146,13 +3914,15 @@ export default function App(): JSX.Element {
         const time = tx.date.getTime();
         return time >= minTime && time <= maxTime;
       })
-      .map((tx): PriceChartTradeMarker => ({
-        id: tx.id,
-        date: tx.date,
-        type: tx.type === "BUY" ? "BUY" : "SELL",
-        shares: tx.shares,
-        price: tx.price,
-      }))
+      .map(
+        (tx): PriceChartTradeMarker => ({
+          id: tx.id,
+          date: tx.date,
+          type: tx.type === "BUY" ? "BUY" : "SELL",
+          shares: tx.shares,
+          price: tx.price,
+        }),
+      )
       .sort((a, b) => a.date.getTime() - b.date.getTime());
   }, [stockDetailSeries, stockDetailTransactions, stockDetailValuationSeries]);
 
@@ -3165,14 +3935,22 @@ export default function App(): JSX.Element {
     // prefer quote inside filtered entities first, then fallback to all entities.
     for (const entity of filteredEntities) {
       const livePrice = entity.latestPriceBySymbol[stockDetail.symbol];
-      if (typeof livePrice === "number" && Number.isFinite(livePrice) && livePrice > 0) {
+      if (
+        typeof livePrice === "number" &&
+        Number.isFinite(livePrice) &&
+        livePrice > 0
+      ) {
         return livePrice;
       }
     }
 
     for (const entity of entities) {
       const livePrice = entity.latestPriceBySymbol[stockDetail.symbol];
-      if (typeof livePrice === "number" && Number.isFinite(livePrice) && livePrice > 0) {
+      if (
+        typeof livePrice === "number" &&
+        Number.isFinite(livePrice) &&
+        livePrice > 0
+      ) {
         return livePrice;
       }
     }
@@ -3194,10 +3972,14 @@ export default function App(): JSX.Element {
       }
 
       const stockSymbols = portfolioStockSymbolKey
-        ? portfolioStockSymbolKey.split("|").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean)
+        ? portfolioStockSymbolKey
+            .split("|")
+            .map((symbol) => symbol.trim().toUpperCase())
+            .filter(Boolean)
         : [];
       const requestSymbols = [...new Set(stockSymbols)];
-      const shouldSyncFx = normalizedDisplayCurrency !== "AUTO" && fxSourceCurrencies.length > 0;
+      const shouldSyncFx =
+        normalizedDisplayCurrency !== "AUTO" && fxSourceCurrencies.length > 0;
       if (requestSymbols.length === 0 && !shouldSyncFx) {
         if (trigger === "manual") {
           setQuoteSyncError(
@@ -3215,10 +3997,16 @@ export default function App(): JSX.Element {
 
       const now = Date.now();
       const elapsedMs = now - quoteLastRequestedAtRef.current;
-      if (quoteLastRequestedAtRef.current > 0 && elapsedMs < STOCK_QUOTE_MIN_REQUEST_GAP_MS) {
+      if (
+        quoteLastRequestedAtRef.current > 0 &&
+        elapsedMs < STOCK_QUOTE_MIN_REQUEST_GAP_MS
+      ) {
         setQuoteSyncError("");
         if (trigger === "auto" && quoteRetryTimeoutRef.current === null) {
-          const waitMs = Math.max(250, STOCK_QUOTE_MIN_REQUEST_GAP_MS - elapsedMs + 50);
+          const waitMs = Math.max(
+            250,
+            STOCK_QUOTE_MIN_REQUEST_GAP_MS - elapsedMs + 50,
+          );
           quoteRetryTimeoutRef.current = window.setTimeout(() => {
             quoteRetryTimeoutRef.current = null;
             void refreshPortfolioQuotes("auto");
@@ -3253,10 +4041,16 @@ export default function App(): JSX.Element {
                 quoteSymbols: Object.keys(latestPriceMap).slice(0, 50),
               });
             }
-            const syncedSymbols = Object.keys(latestPriceMap).filter((symbol) => {
-              const value = latestPriceMap[symbol];
-              return typeof value === "number" && Number.isFinite(value) && value > 0;
-            });
+            const syncedSymbols = Object.keys(latestPriceMap).filter(
+              (symbol) => {
+                const value = latestPriceMap[symbol];
+                return (
+                  typeof value === "number" &&
+                  Number.isFinite(value) &&
+                  value > 0
+                );
+              },
+            );
             if (syncedSymbols.length === 0) {
               throw new Error(
                 isZh
@@ -3279,9 +4073,14 @@ export default function App(): JSX.Element {
                 }
 
                 let changed = false;
-                const nextLatestPriceBySymbol = { ...entity.latestPriceBySymbol };
+                const nextLatestPriceBySymbol = {
+                  ...entity.latestPriceBySymbol,
+                };
                 entitySymbols.forEach((symbol) => {
-                  const latestPrice = resolveQuotedPriceBySymbol(latestPriceMap, symbol);
+                  const latestPrice = resolveQuotedPriceBySymbol(
+                    latestPriceMap,
+                    symbol,
+                  );
                   if (
                     typeof latestPrice === "number" &&
                     Number.isFinite(latestPrice) &&
@@ -3293,13 +4092,22 @@ export default function App(): JSX.Element {
                   }
                 });
 
-                return changed ? { ...entity, latestPriceBySymbol: nextLatestPriceBySymbol } : entity;
+                return changed
+                  ? { ...entity, latestPriceBySymbol: nextLatestPriceBySymbol }
+                  : entity;
               }),
             );
 
             const syncedStockCount = stockSymbols.filter((symbol) => {
-              const latestPrice = resolveQuotedPriceBySymbol(latestPriceMap, symbol);
-              return !!(typeof latestPrice === "number" && Number.isFinite(latestPrice) && latestPrice > 0);
+              const latestPrice = resolveQuotedPriceBySymbol(
+                latestPriceMap,
+                symbol,
+              );
+              return !!(
+                typeof latestPrice === "number" &&
+                Number.isFinite(latestPrice) &&
+                latestPrice > 0
+              );
             }).length;
             setQuoteSyncedCount(syncedStockCount);
             setQuoteLastUpdatedAt(new Date());
@@ -3345,14 +4153,16 @@ export default function App(): JSX.Element {
           setFxSyncedCount(Object.keys(fxResult.pairMap).length);
           setFxLastUpdatedAt(new Date());
 
-          const missingCurrencies = fxSourceCurrencies.filter((sourceCurrency) => {
-            const rate = resolveFxRateFromPairMap(
-              fxResult.pairMap,
-              sourceCurrency,
-              normalizedDisplayCurrency,
-            );
-            return !(rate && Number.isFinite(rate) && rate > 0);
-          });
+          const missingCurrencies = fxSourceCurrencies.filter(
+            (sourceCurrency) => {
+              const rate = resolveFxRateFromPairMap(
+                fxResult.pairMap,
+                sourceCurrency,
+                normalizedDisplayCurrency,
+              );
+              return !(rate && Number.isFinite(rate) && rate > 0);
+            },
+          );
 
           setFxSyncError(
             missingCurrencies.length > 0
@@ -3384,14 +4194,16 @@ export default function App(): JSX.Element {
           setFxSyncedCount(Object.keys(fallbackPairMap).length);
           setFxLastUpdatedAt(new Date());
 
-          const missingCurrencies = fxSourceCurrencies.filter((sourceCurrency) => {
-            const rate = resolveFxRateFromPairMap(
-              fallbackPairMap,
-              sourceCurrency,
-              normalizedDisplayCurrency,
-            );
-            return !(rate && Number.isFinite(rate) && rate > 0);
-          });
+          const missingCurrencies = fxSourceCurrencies.filter(
+            (sourceCurrency) => {
+              const rate = resolveFxRateFromPairMap(
+                fallbackPairMap,
+                sourceCurrency,
+                normalizedDisplayCurrency,
+              );
+              return !(rate && Number.isFinite(rate) && rate > 0);
+            },
+          );
           setFxSyncError(
             missingCurrencies.length > 0
               ? isZh
@@ -3425,15 +4237,19 @@ export default function App(): JSX.Element {
             : isZh
               ? "更新股票報價失敗。"
               : "Failed to refresh stock quotes.";
-        setQuoteSyncError(
-          resolvedErrorMessage,
-        );
+        setQuoteSyncError(resolvedErrorMessage);
       } finally {
         quoteSyncInFlightRef.current = false;
         setQuoteSyncing(false);
       }
     },
-    [fxSourceCurrencies, isZh, normalizedDisplayCurrency, portfolioStockSymbolKey, screen],
+    [
+      fxSourceCurrencies,
+      isZh,
+      normalizedDisplayCurrency,
+      portfolioStockSymbolKey,
+      screen,
+    ],
   );
 
   const refreshPortfolioHistory = useCallback(
@@ -3442,7 +4258,9 @@ export default function App(): JSX.Element {
         return;
       }
 
-      const stockSymbols = portfolioStockSymbolKey ? portfolioStockSymbolKey.split("|") : [];
+      const stockSymbols = portfolioStockSymbolKey
+        ? portfolioStockSymbolKey.split("|")
+        : [];
       if (stockSymbols.length === 0) {
         setPortfolioHistoryBySymbol({});
         return;
@@ -3465,7 +4283,8 @@ export default function App(): JSX.Element {
       portfolioHistorySyncInFlightRef.current = true;
 
       try {
-        const chartRangePreset = selectedRange === "CUSTOM" ? "ALL" : selectedRange;
+        const chartRangePreset =
+          selectedRange === "CUSTOM" ? "ALL" : selectedRange;
         const request = resolveYahooChartRequest(chartRangePreset);
         const payload = await fetchLocalStockData<unknown>({
           type: "chart",
@@ -3475,14 +4294,19 @@ export default function App(): JSX.Element {
         });
 
         const batchSeries = extractYahooChartPriceSeriesBatch(payload);
-        if (Object.keys(batchSeries).length === 0 && stockSymbols.length === 1) {
+        if (
+          Object.keys(batchSeries).length === 0 &&
+          stockSymbols.length === 1
+        ) {
           const singleSeries = extractYahooChartPriceSeries(payload);
           if (singleSeries.length > 0) {
             batchSeries[stockSymbols[0]] = singleSeries;
           }
         }
 
-        const allTransactions = filteredEntities.flatMap((entity) => entity.transactions);
+        const allTransactions = filteredEntities.flatMap(
+          (entity) => entity.transactions,
+        );
         const nextHistoryBySymbol: Record<string, PricePoint[]> = {};
         stockSymbols.forEach((symbol) => {
           const normalizedSymbol = symbol.trim().toUpperCase();
@@ -3490,7 +4314,9 @@ export default function App(): JSX.Element {
             batchSeries[normalizedSymbol] ??
             buildYahooSymbolCandidates(normalizedSymbol)
               .map((candidate) => batchSeries[candidate])
-              .find((candidateSeries): candidateSeries is PricePoint[] => Array.isArray(candidateSeries)) ??
+              .find((candidateSeries): candidateSeries is PricePoint[] =>
+                Array.isArray(candidateSeries),
+              ) ??
             [];
           const filteredSeries = filterPriceSeriesByCustomRange(
             sourceSeries,
@@ -3504,7 +4330,8 @@ export default function App(): JSX.Element {
             customStart,
             customEnd,
           );
-          const finalSeries = filteredSeries.length > 0 ? filteredSeries : fallbackSeries;
+          const finalSeries =
+            filteredSeries.length > 0 ? filteredSeries : fallbackSeries;
           if (finalSeries.length > 0) {
             nextHistoryBySymbol[normalizedSymbol] = finalSeries;
           }
@@ -3512,7 +4339,11 @@ export default function App(): JSX.Element {
 
         setPortfolioHistoryBySymbol(nextHistoryBySymbol);
       } catch (error) {
-        if (trigger === "manual" && error instanceof Error && !isRateLimitMessage(error.message)) {
+        if (
+          trigger === "manual" &&
+          error instanceof Error &&
+          !isRateLimitMessage(error.message)
+        ) {
           setQuoteSyncError(error.message);
         }
       } finally {
@@ -3577,7 +4408,10 @@ export default function App(): JSX.Element {
         setValuationLastUpdatedAt(new Date());
         setValuationSyncError(
           series.length === 0
-            ? t("No valuation data returned for this stock.", "此股票未有可用估價圖資料。")
+            ? t(
+                "No valuation data returned for this stock.",
+                "此股票未有可用估價圖資料。",
+              )
             : "",
         );
       } catch (error) {
@@ -3618,7 +4452,10 @@ export default function App(): JSX.Element {
 
   const quoteStatusText = useMemo(() => {
     if (!portfolioStockSymbolKey && fxSourceCurrencies.length === 0) {
-      return t("No stocks available for quote sync.", "目前冇可同步股價嘅股票。");
+      return t(
+        "No stocks available for quote sync.",
+        "目前冇可同步股價嘅股票。",
+      );
     }
     if (isQuoteSyncing) {
       return t("Syncing latest stock quotes...", "正在同步最新股票報價...");
@@ -3659,8 +4496,18 @@ export default function App(): JSX.Element {
       return t("Waiting for valuation chart data.", "等待估價圖資料。");
     }
     const agoText = formatAgo(valuationLastUpdatedAt, settings.language);
-    return isZh ? `估價圖更新：${agoText}` : `Valuation chart update: ${agoText}`;
-  }, [isValuationSyncing, isZh, settings.language, stockDetail, t, valuationLastUpdatedAt, valuationSyncError]);
+    return isZh
+      ? `估價圖更新：${agoText}`
+      : `Valuation chart update: ${agoText}`;
+  }, [
+    isValuationSyncing,
+    isZh,
+    settings.language,
+    stockDetail,
+    t,
+    valuationLastUpdatedAt,
+    valuationSyncError,
+  ]);
 
   const displayCurrencyStatusText = useMemo(() => {
     if (normalizedDisplayCurrency === "AUTO") {
@@ -3676,7 +4523,10 @@ export default function App(): JSX.Element {
       return fxSyncError;
     }
     if (fxSourceCurrencies.length === 0) {
-      return t("No conversion needed for current data.", "目前資料唔需要換算。");
+      return t(
+        "No conversion needed for current data.",
+        "目前資料唔需要換算。",
+      );
     }
     if (!fxLastUpdatedAt) {
       return t("Waiting for first FX sync.", "等待首次匯率同步。");
@@ -3705,11 +4555,15 @@ export default function App(): JSX.Element {
     }
 
     const sourceCurrency = normalizeCurrencyCode(currency) || "USD";
-    if (normalizedDisplayCurrency === "AUTO" || sourceCurrency === normalizedDisplayCurrency) {
+    if (
+      normalizedDisplayCurrency === "AUTO" ||
+      sourceCurrency === normalizedDisplayCurrency
+    ) {
       return formatCurrency(value, sourceCurrency);
     }
 
-    const fxRate = fxRateByPair[`${sourceCurrency}->${normalizedDisplayCurrency}`];
+    const fxRate =
+      fxRateByPair[`${sourceCurrency}->${normalizedDisplayCurrency}`];
     if (typeof fxRate === "number" && Number.isFinite(fxRate) && fxRate > 0) {
       return formatCurrency(value * fxRate, normalizedDisplayCurrency);
     }
@@ -3720,42 +4574,53 @@ export default function App(): JSX.Element {
   const displayPercent = (value: number): string =>
     settings.showObscure ? "•••%" : formatPercent(value);
 
-  const displayNativeMoney = useCallback((value: number, currency: string): string => {
-    if (settings.showObscure) {
-      return "••••";
-    }
-    const normalizedCurrency = normalizeCurrencyCode(currency) || "USD";
-    return formatCurrency(value, normalizedCurrency);
-  }, [settings.showObscure]);
+  const displayNativeMoney = useCallback(
+    (value: number, currency: string): string => {
+      if (settings.showObscure) {
+        return "••••";
+      }
+      const normalizedCurrency = normalizeCurrencyCode(currency) || "USD";
+      return formatCurrency(value, normalizedCurrency);
+    },
+    [settings.showObscure],
+  );
 
   const selectedPortfolioLineOption = useMemo(
     () =>
-      PORTFOLIO_LINE_OPTIONS.find((option) => option.value === selectedPortfolioLineId) ??
-      PORTFOLIO_LINE_OPTIONS[0],
+      PORTFOLIO_LINE_OPTIONS.find(
+        (option) => option.value === selectedPortfolioLineId,
+      ) ?? PORTFOLIO_LINE_OPTIONS[0],
     [selectedPortfolioLineId],
   );
 
-  const portfolioOverviewPrimaryMetric = useMemo<PortfolioOverviewMetric>(() => {
-    const option = selectedPortfolioLineOption;
-    return {
-      id: option.value,
-      label: isZh ? option.labelZh : option.label,
-      color: option.color,
-      getValue: (point) => {
-        if (option.value === "totalMarketValue") {
-          return point.totalMarketValue;
-        }
-        if (option.value === "totalProfit") {
-          return point.totalProfit;
-        }
-        return point.totalReturnPct;
-      },
-      formatValue: (value: number) =>
-        option.value === "totalReturnPct"
-          ? displayPercent(value)
-          : displayMoney(value, portfolioSummary.currency),
-    };
-  }, [displayMoney, displayPercent, isZh, portfolioSummary.currency, selectedPortfolioLineOption]);
+  const portfolioOverviewPrimaryMetric =
+    useMemo<PortfolioOverviewMetric>(() => {
+      const option = selectedPortfolioLineOption;
+      return {
+        id: option.value,
+        label: isZh ? option.labelZh : option.label,
+        color: option.color,
+        getValue: (point) => {
+          if (option.value === "totalMarketValue") {
+            return point.totalMarketValue;
+          }
+          if (option.value === "totalProfit") {
+            return point.totalProfit;
+          }
+          return point.totalReturnPct;
+        },
+        formatValue: (value: number) =>
+          option.value === "totalReturnPct"
+            ? displayPercent(value)
+            : displayMoney(value, portfolioSummary.currency),
+      };
+    }, [
+      displayMoney,
+      displayPercent,
+      isZh,
+      portfolioSummary.currency,
+      selectedPortfolioLineOption,
+    ]);
 
   const portfolioOverviewMetrics: PortfolioOverviewMetric[] = useMemo(
     () => [portfolioOverviewPrimaryMetric],
@@ -3825,10 +4690,17 @@ export default function App(): JSX.Element {
       return;
     }
     void refreshValuationChart("auto");
-  }, [isValuationSyncing, refreshValuationChart, stockDetail, valuationCacheKey, valuationSeriesCache]);
+  }, [
+    isValuationSyncing,
+    refreshValuationChart,
+    stockDetail,
+    valuationCacheKey,
+    valuationSeriesCache,
+  ]);
 
   useEffect(() => {
-    const { normalizedEntities, idMap, changed } = normalizePortfolioIdsForUi(entities);
+    const { normalizedEntities, idMap, changed } =
+      normalizePortfolioIdsForUi(entities);
     if (!changed) {
       return;
     }
@@ -3836,7 +4708,10 @@ export default function App(): JSX.Element {
     if (selectedPortfolioId !== ALL_PORTFOLIO_ID) {
       const remappedId = idMap.get(selectedPortfolioId);
       if (remappedId && remappedId !== selectedPortfolioId) {
-        setSelectedPortfolioIdWithTrace(remappedId, "normalizePortfolioIdsForUi:remap");
+        setSelectedPortfolioIdWithTrace(
+          remappedId,
+          "normalizePortfolioIdsForUi:remap",
+        );
       }
     }
   }, [entities, selectedPortfolioId, setSelectedPortfolioIdWithTrace]);
@@ -3886,7 +4761,12 @@ export default function App(): JSX.Element {
     }
 
     void refreshPortfolioQuotes("auto");
-  }, [fxSourceCurrencies.length, portfolioStockSymbolKey, refreshPortfolioQuotes, screen]);
+  }, [
+    fxSourceCurrencies.length,
+    portfolioStockSymbolKey,
+    refreshPortfolioQuotes,
+    screen,
+  ]);
 
   useEffect(() => {
     portfolioHistoryAutoRequestedRef.current = false;
@@ -3923,23 +4803,39 @@ export default function App(): JSX.Element {
       return;
     }
     void refreshPortfolioHistory("auto");
-  }, [customEnd, customStart, portfolioStockSymbolKey, refreshPortfolioHistory, screen, selectedRange]);
+  }, [
+    customEnd,
+    customStart,
+    portfolioStockSymbolKey,
+    refreshPortfolioHistory,
+    screen,
+    selectedRange,
+  ]);
 
-  const applyImportedEntities = useCallback((parsed: EntityDataset[]): void => {
-    setEntities(parsed);
-    setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "import:applyImportedEntities");
-    setSelectedStockId("");
-    setSelectedRange("1Y");
-    setScreen("dashboard");
-  }, [setSelectedPortfolioIdWithTrace]);
+  const applyImportedEntities = useCallback(
+    (parsed: EntityDataset[]): void => {
+      setEntities(parsed);
+      setSelectedPortfolioIdWithTrace(
+        ALL_PORTFOLIO_ID,
+        "import:applyImportedEntities",
+      );
+      setSelectedStockId("");
+      setSelectedRange("1Y");
+      setScreen("dashboard");
+    },
+    [setSelectedPortfolioIdWithTrace],
+  );
 
-  const openImportReview = useCallback((parsed: EntityDataset[], source: ImportReviewSource): void => {
-    setImportReviewEntities(cloneEntitiesForReview(parsed));
-    setImportReviewSource(source);
-    setImportReviewFeedback("");
-    setImportReviewError("");
-    setImportReviewOpen(true);
-  }, []);
+  const openImportReview = useCallback(
+    (parsed: EntityDataset[], source: ImportReviewSource): void => {
+      setImportReviewEntities(cloneEntitiesForReview(parsed));
+      setImportReviewSource(source);
+      setImportReviewFeedback("");
+      setImportReviewError("");
+      setImportReviewOpen(true);
+    },
+    [],
+  );
 
   const closeImportReview = useCallback((): void => {
     setImportReviewOpen(false);
@@ -3956,13 +4852,19 @@ export default function App(): JSX.Element {
       preferredType: UserType,
       fileName: string,
       options?: ImportPortfolioOptions,
-    ): Promise<{ entities: EntityDataset[]; usedAi: boolean; quota?: AiImportResponse["quota"] }> => {
+    ): Promise<{
+      entities: EntityDataset[];
+      usedAi: boolean;
+      quota?: AiImportResponse["quota"];
+    }> => {
       const forceAi = options?.forceAi === true;
       if (!forceAi) {
-        const fallbackType: UserType = preferredType === "stockerx" ? "stockerpro" : "stockerx";
-        const tryTypes: UserType[] = preferredType === fallbackType
-          ? [preferredType]
-          : [preferredType, fallbackType];
+        const fallbackType: UserType =
+          preferredType === "stockerx" ? "stockerpro" : "stockerx";
+        const tryTypes: UserType[] =
+          preferredType === fallbackType
+            ? [preferredType]
+            : [preferredType, fallbackType];
 
         for (const candidateType of tryTypes) {
           try {
@@ -3986,7 +4888,9 @@ export default function App(): JSX.Element {
         userInstruction: options?.userInstruction,
         currentNormalized: options?.currentNormalized,
       });
-      const normalized = normalizeAiPayloadToEntities(aiPayload.normalized ?? {});
+      const normalized = normalizeAiPayloadToEntities(
+        aiPayload.normalized ?? {},
+      );
       if (normalized.length === 0) {
         throw new Error(
           t(
@@ -4012,7 +4916,8 @@ export default function App(): JSX.Element {
 
     if (type === "new") {
       const newEntities = await parseInputByType("", "new");
-      const preferredCurrency = settings.defaultCurrency.trim().toUpperCase() || "USD";
+      const preferredCurrency =
+        settings.defaultCurrency.trim().toUpperCase() || "USD";
       setEntities(
         newEntities.map((entity) => ({
           ...entity,
@@ -4030,7 +4935,10 @@ export default function App(): JSX.Element {
   };
 
   const importFilesWithReview = useCallback(
-    async (rawFiles: FileList | File[], preferredType: UserType): Promise<void> => {
+    async (
+      rawFiles: FileList | File[],
+      preferredType: UserType,
+    ): Promise<void> => {
       const files = Array.from(rawFiles);
       if (files.length === 0) {
         return;
@@ -4048,7 +4956,11 @@ export default function App(): JSX.Element {
           try {
             const localQuota = consumeLocalMonthlyUploadQuota();
             const content = await readFileContentForImport(file);
-            const imported = await importPortfolioFromAnyFormat(content, preferredType, file.name);
+            const imported = await importPortfolioFromAnyFormat(
+              content,
+              preferredType,
+              file.name,
+            );
             importedItems.push({
               fileName: file.name,
               rawText: content,
@@ -4061,7 +4973,10 @@ export default function App(): JSX.Element {
             const message =
               error instanceof Error
                 ? error.message
-                : t("Cannot parse this file. Please check the format.", "無法解析此檔案，請檢查格式。");
+                : t(
+                    "Cannot parse this file. Please check the format.",
+                    "無法解析此檔案，請檢查格式。",
+                  );
             failedMessages.push(`${file.name}: ${message}`);
 
             // Stop immediately when monthly quota is reached to avoid noisy repeated errors.
@@ -4138,7 +5053,9 @@ export default function App(): JSX.Element {
     [importPortfolioFromAnyFormat, openImportReview, t],
   );
 
-  const onFileChange = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+  const onFileChange = async (
+    event: ChangeEvent<HTMLInputElement>,
+  ): Promise<void> => {
     if (!userType || !event.target.files || event.target.files.length === 0) {
       return;
     }
@@ -4149,7 +5066,9 @@ export default function App(): JSX.Element {
     }
   };
 
-  const onDataImportFileChange = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+  const onDataImportFileChange = async (
+    event: ChangeEvent<HTMLInputElement>,
+  ): Promise<void> => {
     if (!event.target.files || event.target.files.length === 0) {
       return;
     }
@@ -4160,15 +5079,21 @@ export default function App(): JSX.Element {
     }
   };
 
-  const onEntryUploadDragOver = useCallback((event: DragEvent<HTMLLabelElement>): void => {
-    event.preventDefault();
-    setEntryUploadDragOver(true);
-  }, []);
+  const onEntryUploadDragOver = useCallback(
+    (event: DragEvent<HTMLLabelElement>): void => {
+      event.preventDefault();
+      setEntryUploadDragOver(true);
+    },
+    [],
+  );
 
-  const onEntryUploadDragLeave = useCallback((event: DragEvent<HTMLLabelElement>): void => {
-    event.preventDefault();
-    setEntryUploadDragOver(false);
-  }, []);
+  const onEntryUploadDragLeave = useCallback(
+    (event: DragEvent<HTMLLabelElement>): void => {
+      event.preventDefault();
+      setEntryUploadDragOver(false);
+    },
+    [],
+  );
 
   const onEntryUploadDrop = useCallback(
     async (event: DragEvent<HTMLLabelElement>): Promise<void> => {
@@ -4182,15 +5107,21 @@ export default function App(): JSX.Element {
     [importFilesWithReview, loading, userType],
   );
 
-  const onDataUploadDragOver = useCallback((event: DragEvent<HTMLLabelElement>): void => {
-    event.preventDefault();
-    setDataUploadDragOver(true);
-  }, []);
+  const onDataUploadDragOver = useCallback(
+    (event: DragEvent<HTMLLabelElement>): void => {
+      event.preventDefault();
+      setDataUploadDragOver(true);
+    },
+    [],
+  );
 
-  const onDataUploadDragLeave = useCallback((event: DragEvent<HTMLLabelElement>): void => {
-    event.preventDefault();
-    setDataUploadDragOver(false);
-  }, []);
+  const onDataUploadDragLeave = useCallback(
+    (event: DragEvent<HTMLLabelElement>): void => {
+      event.preventDefault();
+      setDataUploadDragOver(false);
+    },
+    [],
+  );
 
   const onDataUploadDrop = useCallback(
     async (event: DragEvent<HTMLLabelElement>): Promise<void> => {
@@ -4204,10 +5135,18 @@ export default function App(): JSX.Element {
     [dataImportType, importFilesWithReview, loading],
   );
 
-  const minCustomDate = portfolioBounds ? toDateInputValue(portfolioBounds.minDate) : "";
-  const maxCustomDate = portfolioBounds ? toDateInputValue(portfolioBounds.maxDate) : "";
-  const minValuationCustomDate = stockDetailBounds ? toDateInputValue(stockDetailBounds.minDate) : "";
-  const maxValuationCustomDate = stockDetailBounds ? toDateInputValue(stockDetailBounds.maxDate) : "";
+  const minCustomDate = portfolioBounds
+    ? toDateInputValue(portfolioBounds.minDate)
+    : "";
+  const maxCustomDate = portfolioBounds
+    ? toDateInputValue(portfolioBounds.maxDate)
+    : "";
+  const minValuationCustomDate = stockDetailBounds
+    ? toDateInputValue(stockDetailBounds.minDate)
+    : "";
+  const maxValuationCustomDate = stockDetailBounds
+    ? toDateInputValue(stockDetailBounds.maxDate)
+    : "";
 
   const onCustomStartChange = (event: ChangeEvent<HTMLInputElement>): void => {
     const nextStart = event.target.value;
@@ -4229,7 +5168,9 @@ export default function App(): JSX.Element {
     setSelectedPortfolioLineId(lineId);
   };
 
-  const onValuationCustomStartChange = (event: ChangeEvent<HTMLInputElement>): void => {
+  const onValuationCustomStartChange = (
+    event: ChangeEvent<HTMLInputElement>,
+  ): void => {
     const nextStart = event.target.value;
     setValuationCustomStart(nextStart);
     if (valuationCustomEnd && nextStart && nextStart > valuationCustomEnd) {
@@ -4237,7 +5178,9 @@ export default function App(): JSX.Element {
     }
   };
 
-  const onValuationCustomEndChange = (event: ChangeEvent<HTMLInputElement>): void => {
+  const onValuationCustomEndChange = (
+    event: ChangeEvent<HTMLInputElement>,
+  ): void => {
     const nextEnd = event.target.value;
     setValuationCustomEnd(nextEnd);
     if (valuationCustomStart && nextEnd && nextEnd < valuationCustomStart) {
@@ -4272,26 +5215,38 @@ export default function App(): JSX.Element {
   );
 
   const moveImportReviewTransaction = useCallback(
-    (sourcePortfolioId: string, targetPortfolioId: string, transactionId: string): void => {
+    (
+      sourcePortfolioId: string,
+      targetPortfolioId: string,
+      transactionId: string,
+    ): void => {
       if (sourcePortfolioId === targetPortfolioId) {
         return;
       }
 
       setImportReviewEntities((previous) => {
-        const source = previous.find((entity) => entity.id === sourcePortfolioId);
-        const target = previous.find((entity) => entity.id === targetPortfolioId);
+        const source = previous.find(
+          (entity) => entity.id === sourcePortfolioId,
+        );
+        const target = previous.find(
+          (entity) => entity.id === targetPortfolioId,
+        );
         if (!source || !target) {
           return previous;
         }
 
-        const moving = source.transactions.find((tx) => tx.id === transactionId);
+        const moving = source.transactions.find(
+          (tx) => tx.id === transactionId,
+        );
         if (!moving) {
           return previous;
         }
 
         return previous.map((entity) => {
           if (entity.id === sourcePortfolioId) {
-            const nextTransactions = entity.transactions.filter((tx) => tx.id !== transactionId);
+            const nextTransactions = entity.transactions.filter(
+              (tx) => tx.id !== transactionId,
+            );
             return {
               ...entity,
               transactions: nextTransactions,
@@ -4322,21 +5277,26 @@ export default function App(): JSX.Element {
     [],
   );
 
-  const deleteImportReviewTransaction = useCallback((portfolioId: string, transactionId: string): void => {
-    setImportReviewEntities((previous) =>
-      previous.map((entity) => {
-        if (entity.id !== portfolioId) {
-          return entity;
-        }
-        const nextTransactions = entity.transactions.filter((tx) => tx.id !== transactionId);
-        return {
-          ...entity,
-          transactions: nextTransactions,
-          latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
-        };
-      }),
-    );
-  }, []);
+  const deleteImportReviewTransaction = useCallback(
+    (portfolioId: string, transactionId: string): void => {
+      setImportReviewEntities((previous) =>
+        previous.map((entity) => {
+          if (entity.id !== portfolioId) {
+            return entity;
+          }
+          const nextTransactions = entity.transactions.filter(
+            (tx) => tx.id !== transactionId,
+          );
+          return {
+            ...entity,
+            transactions: nextTransactions,
+            latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+          };
+        }),
+      );
+    },
+    [],
+  );
 
   const confirmImportReview = useCallback((): void => {
     if (!importReviewSource) {
@@ -4345,7 +5305,10 @@ export default function App(): JSX.Element {
     }
 
     const normalized = normalizeReviewEntities(importReviewEntities);
-    if (normalized.length === 0 || normalized.every((entity) => entity.transactions.length === 0)) {
+    if (
+      normalized.length === 0 ||
+      normalized.every((entity) => entity.transactions.length === 0)
+    ) {
       setImportReviewError(
         t(
           "No valid transactions left. Please edit at least one row before confirming.",
@@ -4364,7 +5327,10 @@ export default function App(): JSX.Element {
               `Imported via AI normalization. Remaining AI imports this month: ${remaining}.`,
               `已透過 AI 轉換匯入。本月 AI 匯入剩餘：${remaining} 次。`,
             )
-          : t("Imported via AI normalization fallback.", "已透過 AI 轉換備援成功匯入。"),
+          : t(
+              "Imported via AI normalization fallback.",
+              "已透過 AI 轉換備援成功匯入。",
+            ),
       );
     } else {
       setImportStatusMessage(
@@ -4375,7 +5341,13 @@ export default function App(): JSX.Element {
       );
     }
     closeImportReview();
-  }, [applyImportedEntities, closeImportReview, importReviewEntities, importReviewSource, t]);
+  }, [
+    applyImportedEntities,
+    closeImportReview,
+    importReviewEntities,
+    importReviewSource,
+    t,
+  ]);
 
   const adjustImportReviewWithPrompt = useCallback(async (): Promise<void> => {
     if (!importReviewSource) {
@@ -4436,26 +5408,43 @@ export default function App(): JSX.Element {
       setImportReviewError(
         error instanceof Error
           ? error.message
-          : t("Unable to adjust now. Please try again.", "暫時無法調整，請稍後再試。"),
+          : t(
+              "Unable to adjust now. Please try again.",
+              "暫時無法調整，請稍後再試。",
+            ),
       );
     } finally {
       setImportReviewAdjusting(false);
     }
-  }, [importPortfolioFromAnyFormat, importReviewEntities, importReviewFeedback, importReviewSource, t]);
+  }, [
+    importPortfolioFromAnyFormat,
+    importReviewEntities,
+    importReviewFeedback,
+    importReviewSource,
+    t,
+  ]);
 
   const openCreateTransaction = (): void => {
     if (entities.length === 0) {
-      setTransactionError(t("Please create/import a portfolio first.", "請先建立或匯入投資組合。"));
+      setTransactionError(
+        t(
+          "Please create/import a portfolio first.",
+          "請先建立或匯入投資組合。",
+        ),
+      );
       return;
     }
 
     const fallbackPortfolio =
       selectedPortfolioId === "all"
         ? entities[0]
-        : entities.find((entity) => entity.id === selectedPortfolioId) ?? entities[0];
+        : (entities.find((entity) => entity.id === selectedPortfolioId) ??
+          entities[0]);
 
     setEditingTransaction(null);
-    setDraft(buildDefaultDraft(fallbackPortfolio.id, fallbackPortfolio.currency));
+    setDraft(
+      buildDefaultDraft(fallbackPortfolio.id, fallbackPortfolio.currency),
+    );
     setTransactionError("");
     setPendingCashReview(null);
     setPendingCashAmount("");
@@ -4552,7 +5541,10 @@ export default function App(): JSX.Element {
       return;
     }
     const userInputAmount = parseNumberish(pendingCashAmount);
-    const adjustedCashAmount = Math.max(0, Math.min(pendingCashReview.shortfall, userInputAmount));
+    const adjustedCashAmount = Math.max(
+      0,
+      Math.min(pendingCashReview.shortfall, userInputAmount),
+    );
     applyTransactionWithCashAdjustment(
       pendingCashReview.portfolioId,
       pendingCashReview.transaction,
@@ -4563,9 +5555,13 @@ export default function App(): JSX.Element {
   };
 
   const saveTransaction = (): void => {
-    const targetPortfolio = entities.find((entity) => entity.id === draft.portfolioId);
+    const targetPortfolio = entities.find(
+      (entity) => entity.id === draft.portfolioId,
+    );
     if (!targetPortfolio) {
-      setTransactionError(t("Please select a portfolio.", "請先選擇投資組合。"));
+      setTransactionError(
+        t("Please select a portfolio.", "請先選擇投資組合。"),
+      );
       return;
     }
 
@@ -4583,14 +5579,20 @@ export default function App(): JSX.Element {
       return;
     }
 
+    const requireSymbol = requiresAssetSymbol(draft.type);
     let symbol = draft.symbol.trim().toUpperCase();
     if (shouldUseCurrencyAsSymbol(draft.type) && !symbol) {
       symbol = currency;
     }
 
-    if (!symbol) {
+    if (requireSymbol && !symbol) {
       setTransactionError(t("Symbol is required.", "請輸入股票代號。"));
       return;
+    }
+    if (!allowsSymbolInput(draft.type)) {
+      symbol = currency;
+    } else if (draft.type === "FEE" && !symbol) {
+      symbol = currency;
     }
 
     const transaction: NormalizedTransaction = {
@@ -4607,13 +5609,19 @@ export default function App(): JSX.Element {
 
     const editingTransactionId = editingTransaction?.id ?? null;
     const baseTransactions = editingTransactionId
-      ? targetPortfolio.transactions.filter((tx) => tx.id !== editingTransactionId)
+      ? targetPortfolio.transactions.filter(
+          (tx) => tx.id !== editingTransactionId,
+        )
       : targetPortfolio.transactions;
 
     if (transaction.type === "BUY") {
-      const cashBalances = calculateCashBalances([{ ...targetPortfolio, transactions: baseTransactions }]);
-      const cashBalance = cashBalances.find((item) => item.currency === currency)?.balance ?? 0;
-      const requiredCash = transaction.shares * transaction.price + transaction.fee;
+      const cashBalances = calculateCashBalances([
+        { ...targetPortfolio, transactions: baseTransactions },
+      ]);
+      const cashBalance =
+        cashBalances.find((item) => item.currency === currency)?.balance ?? 0;
+      const requiredCash =
+        transaction.shares * transaction.price + transaction.fee;
       const shortfall = Math.max(0, requiredCash - cashBalance);
 
       if (shortfall > 0.0001) {
@@ -4641,7 +5649,10 @@ export default function App(): JSX.Element {
 
   const deleteTransaction = (row: TransactionRow): void => {
     const shouldDelete = window.confirm(
-      t(`Delete ${row.type} ${row.symbol} transaction?`, `刪除 ${row.symbol} 的 ${row.type} 交易？`),
+      t(
+        `Delete ${row.type} ${row.symbol} transaction?`,
+        `刪除 ${row.symbol} 的 ${row.type} 交易？`,
+      ),
     );
     if (!shouldDelete) {
       return;
@@ -4652,7 +5663,9 @@ export default function App(): JSX.Element {
         if (entity.id !== row.portfolioId) {
           return entity;
         }
-        const nextTransactions = entity.transactions.filter((tx) => tx.id !== row.id);
+        const nextTransactions = entity.transactions.filter(
+          (tx) => tx.id !== row.id,
+        );
         return {
           ...entity,
           transactions: nextTransactions,
@@ -4669,8 +5682,10 @@ export default function App(): JSX.Element {
     }
 
     const currencyInput =
-      window.prompt(t("Portfolio currency (e.g. USD)", "組合貨幣（例如 USD）"), settings.defaultCurrency) ??
-      settings.defaultCurrency;
+      window.prompt(
+        t("Portfolio currency (e.g. USD)", "組合貨幣（例如 USD）"),
+        settings.defaultCurrency,
+      ) ?? settings.defaultCurrency;
     const currency = currencyInput.trim().toUpperCase() || "USD";
     const id = `portfolio-${Date.now()}`;
 
@@ -4697,7 +5712,10 @@ export default function App(): JSX.Element {
       return;
     }
 
-    const nextName = window.prompt(t("New portfolio name", "新的組合名稱"), target.name);
+    const nextName = window.prompt(
+      t("New portfolio name", "新的組合名稱"),
+      target.name,
+    );
     if (!nextName || !nextName.trim()) {
       return;
     }
@@ -4725,13 +5743,18 @@ export default function App(): JSX.Element {
     }
 
     const shouldDelete = window.confirm(
-      t(`Delete portfolio \"${target.name}\"?`, `刪除投資組合「${target.name}」？`),
+      t(
+        `Delete portfolio \"${target.name}\"?`,
+        `刪除投資組合「${target.name}」？`,
+      ),
     );
     if (!shouldDelete) {
       return;
     }
 
-    setEntities((previous) => previous.filter((entity) => entity.id !== selectedPortfolioId));
+    setEntities((previous) =>
+      previous.filter((entity) => entity.id !== selectedPortfolioId),
+    );
     setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "portfolio:delete");
   };
 
@@ -4742,7 +5765,11 @@ export default function App(): JSX.Element {
     return buildDualFormatRecords(entities);
   }, [entities]);
 
-  const exportTextFile = (content: string, fileName: string, mimeType = "application/json"): void => {
+  const exportTextFile = (
+    content: string,
+    fileName: string,
+    mimeType = "application/json",
+  ): void => {
     const blob = new Blob([content], { type: `${mimeType}; charset=utf-8` });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -4761,18 +5788,26 @@ export default function App(): JSX.Element {
     if (!dualFormatRecords) {
       return;
     }
-    exportTextFile(dualFormatRecords.stockerProJson, `stocker-pro-export-${Date.now()}.json`);
+    exportTextFile(
+      dualFormatRecords.stockerProJson,
+      `stocker-pro-export-${Date.now()}.json`,
+    );
   };
 
   const exportStockerXJson = (): void => {
     if (!dualFormatRecords) {
       return;
     }
-    exportTextFile(dualFormatRecords.stockerXJson, `stocker-x-export-${Date.now()}.json`);
+    exportTextFile(
+      dualFormatRecords.stockerXJson,
+      `stocker-x-export-${Date.now()}.json`,
+    );
   };
 
   const clearAllData = (): void => {
-    const shouldClear = window.confirm(t("Clear all local data?", "清除全部本地資料？"));
+    const shouldClear = window.confirm(
+      t("Clear all local data?", "清除全部本地資料？"),
+    );
     if (!shouldClear) {
       return;
     }
@@ -4805,14 +5840,20 @@ export default function App(): JSX.Element {
     setMenuOpen(false);
   };
 
-  const selectPortfolioFilter = useCallback((portfolioId: string): void => {
-    if (portfolioId === ALL_PORTFOLIO_ID) {
-      manualPortfolioSelectionRef.current = null;
-    } else {
-      manualPortfolioSelectionRef.current = portfolioId;
-    }
-    setSelectedPortfolioIdWithTrace(portfolioId, "portfolio-filter:user-click");
-  }, [setSelectedPortfolioIdWithTrace]);
+  const selectPortfolioFilter = useCallback(
+    (portfolioId: string): void => {
+      if (portfolioId === ALL_PORTFOLIO_ID) {
+        manualPortfolioSelectionRef.current = null;
+      } else {
+        manualPortfolioSelectionRef.current = portfolioId;
+      }
+      setSelectedPortfolioIdWithTrace(
+        portfolioId,
+        "portfolio-filter:user-click",
+      );
+    },
+    [setSelectedPortfolioIdWithTrace],
+  );
 
   if (isAuthLoading) {
     return (
@@ -4821,7 +5862,11 @@ export default function App(): JSX.Element {
       >
         <main className="auth-screen">
           <div className="auth-card">
-            <img className="brand-wordmark" src={stockerWordmark} alt="Stocker" />
+            <img
+              className="brand-wordmark"
+              src={stockerWordmark}
+              alt="Stocker"
+            />
             <h1>{t("Connecting to Firebase...", "正在連接 Firebase...")}</h1>
             <p>{t("Please wait a moment.", "請稍候。")}</p>
           </div>
@@ -4837,21 +5882,37 @@ export default function App(): JSX.Element {
       >
         <main className="auth-screen">
           <div className="auth-card">
-            <img className="brand-wordmark" src={stockerWordmark} alt="Stocker" />
-            <h1>{t("Sign In To View Your Portfolio", "登入後查看你嘅投資收益")}</h1>
+            <img
+              className="brand-wordmark"
+              src={stockerWordmark}
+              alt="Stocker"
+            />
+            <h1>
+              {t("Sign In To View Your Portfolio", "登入後查看你嘅投資收益")}
+            </h1>
             <p>
               {t(
                 "Your data will load from Firebase after Google sign-in.",
                 "Google 登入後會自動載入你喺 Firebase 嘅資料。",
               )}
             </p>
-            <button type="button" className="primary-btn auth-btn" onClick={openLoginFlow}>
+            <button
+              type="button"
+              className="primary-btn auth-btn"
+              onClick={openLoginFlow}
+            >
               {t("Sign in with Google", "使用 Google 登入")}
             </button>
-            {cloudErrorMessage && <div className="error-text">{cloudErrorMessage}</div>}
+            {cloudErrorMessage && (
+              <div className="error-text">{cloudErrorMessage}</div>
+            )}
           </div>
           {showBetaConsentModal && (
-            <div className="modal-backdrop" role="presentation" onClick={() => setShowBetaConsentModal(false)}>
+            <div
+              className="modal-backdrop"
+              role="presentation"
+              onClick={() => setShowBetaConsentModal(false)}
+            >
               <div
                 className="modal-card beta-consent-modal"
                 role="dialog"
@@ -4860,7 +5921,8 @@ export default function App(): JSX.Element {
               >
                 <h3>Beta Version Notice / Beta 版本注意事項</h3>
                 <p>
-                  This is a beta version. Data may be lost, and analysis may be inaccurate.
+                  This is a beta version. Data may be lost, and analysis may be
+                  inaccurate.
                   <br />
                   目前為 Beta 版本，資料可能遺失，分析結果亦可能不準確。
                 </p>
@@ -4868,7 +5930,9 @@ export default function App(): JSX.Element {
                   <input
                     type="checkbox"
                     checked={betaConsentChecked}
-                    onChange={(event) => setBetaConsentChecked(event.target.checked)}
+                    onChange={(event) =>
+                      setBetaConsentChecked(event.target.checked)
+                    }
                   />
                   <span>
                     I understand and agree to continue.
@@ -4957,16 +6021,27 @@ export default function App(): JSX.Element {
 
         <div className="header-tools">
           <span className="user-chip" title={authUser.email ?? authUser.uid}>
-            {authUser.displayName || authUser.email || `${authUser.uid.slice(0, 8)}...`}
+            {authUser.displayName ||
+              authUser.email ||
+              `${authUser.uid.slice(0, 8)}...`}
           </span>
           <button
             type="button"
             className="header-tool-btn"
-            onClick={() => updateSetting("language", settings.language === "zh-HK" ? "en" : "zh-HK")}
+            onClick={() =>
+              updateSetting(
+                "language",
+                settings.language === "zh-HK" ? "en" : "zh-HK",
+              )
+            }
           >
             {settings.language === "zh-HK" ? "English" : "繁中"}
           </button>
-          <button type="button" className="header-tool-btn" onClick={() => void onSignOut()}>
+          <button
+            type="button"
+            className="header-tool-btn"
+            onClick={() => void onSignOut()}
+          >
             {t("Sign Out", "登出")}
           </button>
           <button
@@ -4994,20 +6069,47 @@ export default function App(): JSX.Element {
         <main className="entry-screen">
           <h1>{t("Select Your Data Type", "選擇你的資料格式")}</h1>
           <p className="entry-subtitle">
-            {t("Choose your account type first, then upload your exported file.", "先選擇帳戶類型，再上傳匯出檔案。")}
+            {t(
+              "Choose your account type first, then upload your exported file.",
+              "先選擇帳戶類型，再上傳匯出檔案。",
+            )}
           </p>
           <div className="entry-cards">
-            <button type="button" className="entry-card" onClick={() => void selectUserType("stockerx")}>
+            <button
+              type="button"
+              className="entry-card"
+              onClick={() => void selectUserType("stockerx")}
+            >
               <strong>{t("StockerX User", "StockerX 用戶")}</strong>
-              <span>{t("Use StockerX export format", "使用 StockerX 匯出格式")}</span>
+              <span>
+                {t("Use StockerX export format", "使用 StockerX 匯出格式")}
+              </span>
             </button>
-            <button type="button" className="entry-card" onClick={() => void selectUserType("stockerpro")}>
+            <button
+              type="button"
+              className="entry-card"
+              onClick={() => void selectUserType("stockerpro")}
+            >
               <strong>{t("Stocker Pro User", "Stocker Pro 用戶")}</strong>
-              <span>{t("Use Stocker Pro export format", "使用 Stocker Pro 匯出格式")}</span>
+              <span>
+                {t(
+                  "Use Stocker Pro export format",
+                  "使用 Stocker Pro 匯出格式",
+                )}
+              </span>
             </button>
-            <button type="button" className="entry-card" onClick={() => void selectUserType("new")}>
+            <button
+              type="button"
+              className="entry-card"
+              onClick={() => void selectUserType("new")}
+            >
               <strong>{t("I Am New", "我是新用戶")}</strong>
-              <span>{t("Create an empty Stocker Pro profile", "建立空白 Stocker Pro 資料")}</span>
+              <span>
+                {t(
+                  "Create an empty Stocker Pro profile",
+                  "建立空白 Stocker Pro 資料",
+                )}
+              </span>
             </button>
           </div>
         </main>
@@ -5016,9 +6118,16 @@ export default function App(): JSX.Element {
       {screen === "upload" && (
         <main className="upload-screen">
           <h1>
-            {t("Upload", "上傳")} {userType === "stockerx" ? "StockerX" : "Stocker Pro"} {t("File", "檔案")}
+            {t("Upload", "上傳")}{" "}
+            {userType === "stockerx" ? "StockerX" : "Stocker Pro"}{" "}
+            {t("File", "檔案")}
           </h1>
-          <p className="entry-subtitle">{t("Supports importing files in any format.", "支援任何格式檔案匯入。")}</p>
+          <p className="entry-subtitle">
+            {t(
+              "Supports importing files in any format.",
+              "支援任何格式檔案匯入。",
+            )}
+          </p>
           <label
             className={`upload-box ${isEntryUploadDragOver ? "drag-over" : ""}`}
             onDragOver={onEntryUploadDragOver}
@@ -5033,13 +6142,21 @@ export default function App(): JSX.Element {
                 ? t("Reading file(s)...", "正在讀取檔案...")
                 : t("Choose or drag file(s)", "選擇或拖放檔案")}
             </span>
-            <small>{t("Multiple files supported.", "支援一次上傳多個檔案。")}</small>
+            <small>
+              {t("Multiple files supported.", "支援一次上傳多個檔案。")}
+            </small>
           </label>
-          <button type="button" className="back-link" onClick={() => setScreen("choose")}>
+          <button
+            type="button"
+            className="back-link"
+            onClick={() => setScreen("choose")}
+          >
             {t("Back", "返回")}
           </button>
           {errorMessage && <div className="error-text">{errorMessage}</div>}
-          {importStatusMessage && <div className="success-text">{importStatusMessage}</div>}
+          {importStatusMessage && (
+            <div className="success-text">{importStatusMessage}</div>
+          )}
         </main>
       )}
 
@@ -5048,20 +6165,44 @@ export default function App(): JSX.Element {
           <section className="summary-grid">
             <div className="summary-card">
               <span>{t("Total Assets", "總資產")}</span>
-              <strong>{displayMoney(portfolioSummary.totalAssets, portfolioSummary.currency)}</strong>
+              <strong>
+                {displayMoney(
+                  portfolioSummary.totalAssets,
+                  portfolioSummary.currency,
+                )}
+              </strong>
             </div>
             <div className="summary-card">
               <span>{t("Cash Balance", "現金結餘")}</span>
-              <strong>{displayMoney(portfolioSummary.cashBalance, portfolioSummary.currency)}</strong>
+              <strong>
+                {displayMoney(
+                  portfolioSummary.cashBalance,
+                  portfolioSummary.currency,
+                )}
+              </strong>
             </div>
-            <div className={`summary-card ${portfolioSummary.totalProfit >= 0 ? "positive" : "negative"}`}>
+            <div
+              className={`summary-card ${portfolioSummary.totalProfit >= 0 ? "positive" : "negative"}`}
+            >
               <span>{t("Total Profit", "總盈虧")}</span>
-              <strong>{displayMoney(portfolioSummary.totalProfit, portfolioSummary.currency)}</strong>
+              <strong>
+                {displayMoney(
+                  portfolioSummary.totalProfit,
+                  portfolioSummary.currency,
+                )}
+              </strong>
               <small>{displayPercent(portfolioSummary.totalProfitPct)}</small>
             </div>
-            <div className={`summary-card ${portfolioSummary.dailyProfit >= 0 ? "positive" : "negative"}`}>
+            <div
+              className={`summary-card ${portfolioSummary.dailyProfit >= 0 ? "positive" : "negative"}`}
+            >
               <span>{t("Daily Profit", "今日盈虧")}</span>
-              <strong>{displayMoney(portfolioSummary.dailyProfit, portfolioSummary.currency)}</strong>
+              <strong>
+                {displayMoney(
+                  portfolioSummary.dailyProfit,
+                  portfolioSummary.currency,
+                )}
+              </strong>
               <small>{displayPercent(portfolioSummary.dailyProfitPct)}</small>
             </div>
             <div className="summary-card summary-card-currency">
@@ -5069,17 +6210,24 @@ export default function App(): JSX.Element {
               <select
                 value={normalizedDisplayCurrency}
                 onChange={(event) =>
-                  updateSetting("displayCurrency", normalizeCurrencyCode(event.target.value) || "AUTO")
+                  updateSetting(
+                    "displayCurrency",
+                    normalizeCurrencyCode(event.target.value) || "AUTO",
+                  )
                 }
               >
-                <option value="AUTO">{t("Auto (Original)", "自動（原貨幣）")}</option>
+                <option value="AUTO">
+                  {t("Auto (Original)", "自動（原貨幣）")}
+                </option>
                 {displayCurrencyOptions.map((currency) => (
                   <option key={currency} value={currency}>
                     {currency}
                   </option>
                 ))}
               </select>
-              <small className={`summary-card-note ${fxSyncError ? "negative" : ""}`}>
+              <small
+                className={`summary-card-note ${fxSyncError ? "negative" : ""}`}
+              >
                 {displayCurrencyStatusText}
               </small>
             </div>
@@ -5090,9 +6238,14 @@ export default function App(): JSX.Element {
               <section className="chart-panel">
                 <div className="panel-head">
                   <div>
-                    <p className="panel-label">{t("Portfolio Overview", "組合總覽")}</p>
+                    <p className="panel-label">
+                      {t("Portfolio Overview", "組合總覽")}
+                    </p>
                     <h2>
-                      {rangeTitle(selectedRange)} {isZh ? selectedPortfolioLineOption.labelZh : selectedPortfolioLineOption.label}
+                      {rangeTitle(selectedRange)}{" "}
+                      {isZh
+                        ? selectedPortfolioLineOption.labelZh
+                        : selectedPortfolioLineOption.label}
                     </h2>
                   </div>
                   <div
@@ -5101,16 +6254,25 @@ export default function App(): JSX.Element {
                     <strong>
                       {selectedPortfolioLineId === "totalReturnPct"
                         ? displayPercent(portfolioOverviewLatestPrimaryValue)
-                        : displayMoney(portfolioOverviewLatestPrimaryValue, portfolioSummary.currency)}
+                        : displayMoney(
+                            portfolioOverviewLatestPrimaryValue,
+                            portfolioSummary.currency,
+                          )}
                     </strong>
                     {selectedPortfolioLineId !== "totalReturnPct" && (
-                      <span>{displayPercent(portfolioOverviewLatest?.totalReturnPct ?? 0)}</span>
+                      <span>
+                        {displayPercent(
+                          portfolioOverviewLatest?.totalReturnPct ?? 0,
+                        )}
+                      </span>
                     )}
                   </div>
                 </div>
 
                 <div className="portfolio-switcher-wrap">
-                  <div className="portfolio-switcher-title">{t("Portfolio Filter", "組合篩選")}</div>
+                  <div className="portfolio-switcher-title">
+                    {t("Portfolio Filter", "組合篩選")}
+                  </div>
                   <div className="portfolio-switcher">
                     <button
                       type="button"
@@ -5133,7 +6295,9 @@ export default function App(): JSX.Element {
                 </div>
 
                 <div className="time-range-wrap">
-                  <div className="portfolio-switcher-title">{t("P/L Time Range", "盈虧時間範圍")}</div>
+                  <div className="portfolio-switcher-title">
+                    {t("P/L Time Range", "盈虧時間範圍")}
+                  </div>
                   <div className="portfolio-switcher">
                     {TIME_RANGE_OPTIONS.map((option) => (
                       <button
@@ -5177,7 +6341,9 @@ export default function App(): JSX.Element {
                 </div>
 
                 <div className="line-filter-wrap">
-                  <div className="portfolio-switcher-title">{t("Chart Lines", "圖表線條")}</div>
+                  <div className="portfolio-switcher-title">
+                    {t("Chart Lines", "圖表線條")}
+                  </div>
                   <div className="portfolio-switcher">
                     {PORTFOLIO_LINE_OPTIONS.map((option) => {
                       const active = selectedPortfolioLineId === option.value;
@@ -5188,7 +6354,10 @@ export default function App(): JSX.Element {
                           className={`portfolio-pill line-pill ${active ? "active" : ""}`}
                           onClick={() => selectPortfolioLine(option.value)}
                         >
-                          <span className="line-pill-dot" style={{ background: option.color }} />
+                          <span
+                            className="line-pill-dot"
+                            style={{ background: option.color }}
+                          />
                           <span>{isZh ? option.labelZh : option.label}</span>
                         </button>
                       );
@@ -5199,7 +6368,10 @@ export default function App(): JSX.Element {
                 <PortfolioOverviewChart
                   points={portfolioOverviewSeries}
                   metrics={portfolioOverviewMetrics}
-                  noDataLabel={t("No portfolio data yet.", "暫時未有組合資料。")}
+                  noDataLabel={t(
+                    "No portfolio data yet.",
+                    "暫時未有組合資料。",
+                  )}
                 />
 
                 <div className="portfolio-distribution-wrap">
@@ -5259,12 +6431,17 @@ export default function App(): JSX.Element {
                         <div className="row-title">
                           <strong>{item.symbol}</strong>
                           <small>
-                            {item.currency} | {t("Shares", "股數")}: {item.activeShares}
+                            {item.currency} | {t("Shares", "股數")}:{" "}
+                            {item.activeShares}
                           </small>
                         </div>
                       </div>
-                      <div className={`row-right ${item.totalProfit >= 0 ? "positive" : "negative"}`}>
-                        <strong>{displayMoney(item.totalProfit, item.currency)}</strong>
+                      <div
+                        className={`row-right ${item.totalProfit >= 0 ? "positive" : "negative"}`}
+                      >
+                        <strong>
+                          {displayMoney(item.totalProfit, item.currency)}
+                        </strong>
                         <small>{displayPercent(item.totalProfitPct)}</small>
                       </div>
                     </button>
@@ -5276,9 +6453,12 @@ export default function App(): JSX.Element {
                       <button
                         type="button"
                         className="secondary-btn"
-                        onClick={() => setSelectedStockDetailId(selectedStock.id)}
+                        onClick={() =>
+                          setSelectedStockDetailId(selectedStock.id)
+                        }
                       >
-                        {t("Open", "開啟")} {selectedStock.symbol} {t("Detail", "詳情")}
+                        {t("Open", "開啟")} {selectedStock.symbol}{" "}
+                        {t("Detail", "詳情")}
                       </button>
                       <button
                         type="button"
@@ -5286,10 +6466,16 @@ export default function App(): JSX.Element {
                         onClick={() => void refreshPortfolioQuotes("manual")}
                         disabled={isQuoteSyncing || !portfolioStockSymbolKey}
                       >
-                        {isQuoteSyncing ? t("Syncing...", "同步中...") : t("Check Stock Price", "查看股價")}
+                        {isQuoteSyncing
+                          ? t("Syncing...", "同步中...")
+                          : t("Check Stock Price", "查看股價")}
                       </button>
                     </div>
-                    <p className={`quote-sync-note ${quoteSyncError ? "error" : ""}`}>{quoteStatusText}</p>
+                    <p
+                      className={`quote-sync-note ${quoteSyncError ? "error" : ""}`}
+                    >
+                      {quoteStatusText}
+                    </p>
                   </div>
                 )}
               </section>
@@ -5317,7 +6503,12 @@ export default function App(): JSX.Element {
                   </div>
                   <div className="insight-card">
                     <span>{t("Avg Profit / Stock", "每股平均盈虧")}</span>
-                    <strong>{displayMoney(insights.avgProfitPerStock, portfolioSummary.currency)}</strong>
+                    <strong>
+                      {displayMoney(
+                        insights.avgProfitPerStock,
+                        portfolioSummary.currency,
+                      )}
+                    </strong>
                   </div>
                   <div className="insight-card">
                     <span>{t("Best Performer", "最佳表現")}</span>
@@ -5329,7 +6520,9 @@ export default function App(): JSX.Element {
                   </div>
                   <div className="insight-card">
                     <span>{t("Max Drawdown", "最大回撤")}</span>
-                    <strong className="negative">{displayPercent(-insights.maxDrawdownPct)}</strong>
+                    <strong className="negative">
+                      {displayPercent(-insights.maxDrawdownPct)}
+                    </strong>
                   </div>
                 </div>
               </section>
@@ -5356,12 +6549,18 @@ export default function App(): JSX.Element {
               <section className="dual-column-grid">
                 <BarChart
                   data={monthlyBuySeries.slice(-12)}
-                  title={t("Monthly Buy Amount (12M)", "每月買入金額（12個月）")}
+                  title={t(
+                    "Monthly Buy Amount (12M)",
+                    "每月買入金額（12個月）",
+                  )}
                   positiveColor="#22a06b"
                 />
                 <BarChart
                   data={monthlySellSeries.slice(-12)}
-                  title={t("Monthly Sell Amount (12M)", "每月賣出金額（12個月）")}
+                  title={t(
+                    "Monthly Sell Amount (12M)",
+                    "每月賣出金額（12個月）",
+                  )}
                   positiveColor="#2f7dd6"
                 />
               </section>
@@ -5373,7 +6572,10 @@ export default function App(): JSX.Element {
                       ? monthlyDividendSeries.slice(-12)
                       : []
                   }
-                  title={t("Monthly Dividend Income (12M)", "每月股息收益（12個月）")}
+                  title={t(
+                    "Monthly Dividend Income (12M)",
+                    "每月股息收益（12個月）",
+                  )}
                   positiveColor="#1f9a72"
                   negativeColor="#c84f4f"
                 />
@@ -5406,7 +6608,10 @@ export default function App(): JSX.Element {
                       ? monthlyProfitBarSeries.slice(-12)
                       : []
                   }
-                  title={t("Monthly Profit Histogram (12M)", "每月收益柱狀圖（12個月）")}
+                  title={t(
+                    "Monthly Profit Histogram (12M)",
+                    "每月收益柱狀圖（12個月）",
+                  )}
                   positiveColor="#1f9a72"
                   negativeColor="#d14e4e"
                 />
@@ -5415,12 +6620,18 @@ export default function App(): JSX.Element {
               <section className="table-panel">
                 <MultiLineChart
                   series={compareSeries}
-                  title={t("Top Stock Comparison (Indexed = 100)", "主要股票比較（基準=100）")}
+                  title={t(
+                    "Top Stock Comparison (Indexed = 100)",
+                    "主要股票比較（基準=100）",
+                  )}
                 />
               </section>
 
               <section className="table-panel">
-                <AreaChart points={portfolioProfitSeries} label={t("Portfolio profit chart", "組合盈虧圖")} />
+                <AreaChart
+                  points={portfolioProfitSeries}
+                  label={t("Portfolio profit chart", "組合盈虧圖")}
+                />
               </section>
 
               <section className="dual-column-grid">
@@ -5432,7 +6643,10 @@ export default function App(): JSX.Element {
                 />
                 <BarChart
                   data={dividendCalendarSeries}
-                  title={t("Dividend Seasonality (By Month)", "股息季節性（按月份）")}
+                  title={t(
+                    "Dividend Seasonality (By Month)",
+                    "股息季節性（按月份）",
+                  )}
                   positiveColor="#1f9a72"
                 />
               </section>
@@ -5440,13 +6654,21 @@ export default function App(): JSX.Element {
               <section className="table-panel">
                 <HeatmapGrid
                   data={transactionHeatmap}
-                  title={t("Transaction Activity Heatmap (12M x Type)", "交易活躍熱力圖（12個月 x 類型）")}
+                  title={t(
+                    "Transaction Activity Heatmap (12M x Type)",
+                    "交易活躍熱力圖（12個月 x 類型）",
+                  )}
                 />
               </section>
 
               <section className="table-panel">
                 <div className="panel-head slim">
-                  <h3>{t("Rebalance Suggestions (Equal Weight Baseline)", "再平衡建議（等權重基準）")}</h3>
+                  <h3>
+                    {t(
+                      "Rebalance Suggestions (Equal Weight Baseline)",
+                      "再平衡建議（等權重基準）",
+                    )}
+                  </h3>
                 </div>
                 <div className="table-scroll">
                   <table className="data-table rebalance-table">
@@ -5464,7 +6686,11 @@ export default function App(): JSX.Element {
                           <td>{item.symbol}</td>
                           <td>{displayPercent(item.currentWeightPct)}</td>
                           <td>{displayPercent(item.targetWeightPct)}</td>
-                          <td className={item.diffPct >= 0 ? "negative" : "positive"}>
+                          <td
+                            className={
+                              item.diffPct >= 0 ? "negative" : "positive"
+                            }
+                          >
                             {displayPercent(item.diffPct)}
                           </td>
                         </tr>
@@ -5480,7 +6706,6 @@ export default function App(): JSX.Element {
                   </table>
                 </div>
               </section>
-
             </section>
           )}
 
@@ -5488,7 +6713,10 @@ export default function App(): JSX.Element {
             <section className="dual-column-grid" id="holdings">
               <section className="table-panel">
                 <div className="panel-head slim">
-                  <h3>{t("Holding Stocks", "持倉股票")} ({displayedHoldingStocks.length})</h3>
+                  <h3>
+                    {t("Holding Stocks", "持倉股票")} (
+                    {displayedHoldingStocks.length})
+                  </h3>
                 </div>
                 <div className="filters-row">
                   <label>
@@ -5504,11 +6732,20 @@ export default function App(): JSX.Element {
                     <select
                       value={holdingSort}
                       onChange={(event) =>
-                        setHoldingSort(event.target.value as "marketValue" | "profit" | "symbol")
+                        setHoldingSort(
+                          event.target.value as
+                            | "marketValue"
+                            | "profit"
+                            | "symbol",
+                        )
                       }
                     >
-                      <option value="marketValue">{t("Market Value", "市值")}</option>
-                      <option value="profit">{t("Total Profit", "總盈虧")}</option>
+                      <option value="marketValue">
+                        {t("Market Value", "市值")}
+                      </option>
+                      <option value="profit">
+                        {t("Total Profit", "總盈虧")}
+                      </option>
                       <option value="symbol">{t("Symbol", "代號")}</option>
                     </select>
                   </label>
@@ -5529,11 +6766,21 @@ export default function App(): JSX.Element {
                         <tr key={item.id}>
                           <td>{item.symbol}</td>
                           <td>{item.activeShares.toFixed(4)}</td>
-                          <td>{displayMoney(item.marketValue, item.currency)}</td>
-                          <td className={item.totalProfit >= 0 ? "positive" : "negative"}>
+                          <td>
+                            {displayMoney(item.marketValue, item.currency)}
+                          </td>
+                          <td
+                            className={
+                              item.totalProfit >= 0 ? "positive" : "negative"
+                            }
+                          >
                             {displayMoney(item.totalProfit, item.currency)}
                           </td>
-                          <td className={item.holdingProfit >= 0 ? "positive" : "negative"}>
+                          <td
+                            className={
+                              item.holdingProfit >= 0 ? "positive" : "negative"
+                            }
+                          >
                             {displayMoney(item.holdingProfit, item.currency)}
                           </td>
                         </tr>
@@ -5552,7 +6799,10 @@ export default function App(): JSX.Element {
 
               <section className="table-panel">
                 <div className="panel-head slim">
-                  <h3>{t("Closed Stocks", "已平倉股票")} ({displayedClosedStocks.length})</h3>
+                  <h3>
+                    {t("Closed Stocks", "已平倉股票")} (
+                    {displayedClosedStocks.length})
+                  </h3>
                 </div>
                 <div className="table-scroll">
                   <table className="data-table">
@@ -5569,10 +6819,16 @@ export default function App(): JSX.Element {
                       {displayedClosedStocks.map((item) => (
                         <tr key={item.id}>
                           <td>{item.symbol}</td>
-                          <td className={item.realizedProfit >= 0 ? "positive" : "negative"}>
+                          <td
+                            className={
+                              item.realizedProfit >= 0 ? "positive" : "negative"
+                            }
+                          >
                             {displayMoney(item.realizedProfit, item.currency)}
                           </td>
-                          <td>{displayMoney(item.totalDividend, item.currency)}</td>
+                          <td>
+                            {displayMoney(item.totalDividend, item.currency)}
+                          </td>
                           <td>{displayMoney(item.totalFee, item.currency)}</td>
                           <td>{item.transactionCount}</td>
                         </tr>
@@ -5595,7 +6851,11 @@ export default function App(): JSX.Element {
             <section className="table-panel" id="transactions">
               <div className="panel-head slim">
                 <h3>{t("Transactions", "交易紀錄")}</h3>
-                <button type="button" className="primary-btn" onClick={openCreateTransaction}>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={openCreateTransaction}
+                >
                   {t("Add Transaction", "新增交易")}
                 </button>
               </div>
@@ -5606,14 +6866,19 @@ export default function App(): JSX.Element {
                   <input
                     value={txKeyword}
                     onChange={(event) => setTxKeyword(event.target.value)}
-                    placeholder={t("Symbol / portfolio / note", "代號 / 組合 / 備註")}
+                    placeholder={t(
+                      "Symbol / portfolio / note",
+                      "代號 / 組合 / 備註",
+                    )}
                   />
                 </label>
                 <label>
                   {t("Date Range", "日期範圍")}
                   <select
                     value={txDateFilter}
-                    onChange={(event) => setTxDateFilter(event.target.value as DateFilterPreset)}
+                    onChange={(event) =>
+                      setTxDateFilter(event.target.value as DateFilterPreset)
+                    }
                   >
                     {DATE_FILTER_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -5627,7 +6892,11 @@ export default function App(): JSX.Element {
                   {t("Type", "類型")}
                   <select
                     value={txTypeFilter}
-                    onChange={(event) => setTxTypeFilter(event.target.value as TransactionTypeFilter)}
+                    onChange={(event) =>
+                      setTxTypeFilter(
+                        event.target.value as TransactionTypeFilter,
+                      )
+                    }
                   >
                     {TRANSACTION_TYPE_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -5644,7 +6913,9 @@ export default function App(): JSX.Element {
                       <input
                         type="date"
                         value={txCustomStart}
-                        onChange={(event) => setTxCustomStart(event.target.value)}
+                        onChange={(event) =>
+                          setTxCustomStart(event.target.value)
+                        }
                       />
                     </label>
                     <label>
@@ -5659,8 +6930,16 @@ export default function App(): JSX.Element {
                 )}
 
                 <div className="filter-stats">
-                  <span>{t("Count", "筆數")}: {filteredTransactions.length}</span>
-                  <span>{t("Net", "淨額")}: {displayMoney(transactionNetValue, filteredEntities[0]?.currency ?? "USD")}</span>
+                  <span>
+                    {t("Count", "筆數")}: {filteredTransactions.length}
+                  </span>
+                  <span>
+                    {t("Net", "淨額")}:{" "}
+                    {displayMoney(
+                      transactionNetValue,
+                      filteredEntities[0]?.currency ?? "USD",
+                    )}
+                  </span>
                 </div>
               </div>
 
@@ -5685,12 +6964,21 @@ export default function App(): JSX.Element {
                         <td>{row.date.toLocaleDateString(localeTag)}</td>
                         <td>{row.portfolioName}</td>
                         <td>{row.type}</td>
-                        <td>{row.symbol}</td>
+                        <td>{getTransactionSymbolDisplayText(row)}</td>
                         <td>{row.shares.toFixed(4)}</td>
                         <td>{displayMoney(row.price, row.currency)}</td>
                         <td>{displayMoney(row.fee, row.currency)}</td>
-                        <td className={getTransactionNetCashFlow(row) >= 0 ? "positive" : "negative"}>
-                          {displayMoney(getTransactionNetCashFlow(row), row.currency)}
+                        <td
+                          className={
+                            getTransactionNetCashFlow(row) >= 0
+                              ? "positive"
+                              : "negative"
+                          }
+                        >
+                          {displayMoney(
+                            getTransactionNetCashFlow(row),
+                            row.currency,
+                          )}
                         </td>
                         <td>
                           <div className="action-btn-row">
@@ -5732,7 +7020,11 @@ export default function App(): JSX.Element {
                   <h3>{t("Portfolio Management", "投資組合管理")}</h3>
                 </div>
                 <div className="data-tools">
-                  <button type="button" className="primary-btn" onClick={createPortfolio}>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={createPortfolio}
+                  >
                     {t("New Portfolio", "新增組合")}
                   </button>
                   <button
@@ -5754,7 +7046,9 @@ export default function App(): JSX.Element {
                 </div>
 
                 <div className="portfolio-switcher-wrap">
-                  <div className="portfolio-switcher-title">{t("Select Portfolio", "選擇組合")}</div>
+                  <div className="portfolio-switcher-title">
+                    {t("Select Portfolio", "選擇組合")}
+                  </div>
                   <div className="portfolio-switcher">
                     <button
                       type="button"
@@ -5778,11 +7072,15 @@ export default function App(): JSX.Element {
 
                 <div className="cash-balance-list">
                   <h4>{t("Cash Balances", "現金結餘")}</h4>
-                  {cashBalances.length === 0 && <p>{t("No cash balances.", "沒有現金結餘。")}</p>}
+                  {cashBalances.length === 0 && (
+                    <p>{t("No cash balances.", "沒有現金結餘。")}</p>
+                  )}
                   {cashBalances.map((item) => (
                     <div key={item.currency} className="cash-balance-row">
                       <span>{item.currency}</span>
-                      <strong className={item.balance >= 0 ? "positive" : "negative"}>
+                      <strong
+                        className={item.balance >= 0 ? "positive" : "negative"}
+                      >
                         {displayMoney(item.balance, item.currency)}
                       </strong>
                     </div>
@@ -5824,8 +7122,17 @@ export default function App(): JSX.Element {
                       accept="*/*"
                       multiple
                     />
-                    <span>{loading ? t("Importing...", "正在匯入...") : t("Import and Replace Data", "匯入並覆蓋資料")}</span>
-                    <small>{t("Supports multi-file drag and drop.", "支援多檔拖放匯入。")}</small>
+                    <span>
+                      {loading
+                        ? t("Importing...", "正在匯入...")
+                        : t("Import and Replace Data", "匯入並覆蓋資料")}
+                    </span>
+                    <small>
+                      {t(
+                        "Supports multi-file drag and drop.",
+                        "支援多檔拖放匯入。",
+                      )}
+                    </small>
                   </label>
 
                   <button
@@ -5855,7 +7162,11 @@ export default function App(): JSX.Element {
                     {t("Export StockerX JSON", "匯出 StockerX JSON")}
                   </button>
 
-                  <button type="button" className="secondary-btn" onClick={() => setScreen("choose")}>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={() => setScreen("choose")}
+                  >
                     {t("Re-open Entry Setup", "重新打開入口設定")}
                   </button>
 
@@ -5869,8 +7180,12 @@ export default function App(): JSX.Element {
                   </button>
                 </div>
 
-                {errorMessage && <div className="error-text">{errorMessage}</div>}
-                {importStatusMessage && <div className="success-text">{importStatusMessage}</div>}
+                {errorMessage && (
+                  <div className="error-text">{errorMessage}</div>
+                )}
+                {importStatusMessage && (
+                  <div className="success-text">{importStatusMessage}</div>
+                )}
                 <p className="settings-hint">
                   {t(
                     "Each client can upload up to 20 files per month. AI normalization fallback is also quota-protected server-side.",
@@ -5891,50 +7206,81 @@ export default function App(): JSX.Element {
                   <label className="setting-row">
                     <div>
                       <strong>{t("Privacy Mode", "隱私模式")}</strong>
-                      <p>{t("Hide amount and percentage numbers on screen.", "隱藏畫面上的金額與百分比。")}</p>
+                      <p>
+                        {t(
+                          "Hide amount and percentage numbers on screen.",
+                          "隱藏畫面上的金額與百分比。",
+                        )}
+                      </p>
                     </div>
                     <input
                       className="setting-toggle"
                       type="checkbox"
                       checked={settings.showObscure}
-                      onChange={(event) => updateSetting("showObscure", event.target.checked)}
+                      onChange={(event) =>
+                        updateSetting("showObscure", event.target.checked)
+                      }
                     />
                   </label>
                   <label className="setting-row">
                     <div>
                       <strong>{t("Enable Animations", "啟用動畫")}</strong>
-                      <p>{t("Turn transitions and entrance animations on or off.", "開啟或關閉過場與入場動畫。")}</p>
+                      <p>
+                        {t(
+                          "Turn transitions and entrance animations on or off.",
+                          "開啟或關閉過場與入場動畫。",
+                        )}
+                      </p>
                     </div>
                     <input
                       className="setting-toggle"
                       type="checkbox"
                       checked={settings.enableAnimations}
-                      onChange={(event) => updateSetting("enableAnimations", event.target.checked)}
+                      onChange={(event) =>
+                        updateSetting("enableAnimations", event.target.checked)
+                      }
                     />
                   </label>
                   <label className="setting-row">
                     <div>
                       <strong>{t("Compact Tables", "緊湊表格")}</strong>
-                      <p>{t("Use denser rows to display more records in each table.", "用更緊密行距顯示更多資料。")}</p>
+                      <p>
+                        {t(
+                          "Use denser rows to display more records in each table.",
+                          "用更緊密行距顯示更多資料。",
+                        )}
+                      </p>
                     </div>
                     <input
                       className="setting-toggle"
                       type="checkbox"
                       checked={settings.compactTables}
-                      onChange={(event) => updateSetting("compactTables", event.target.checked)}
+                      onChange={(event) =>
+                        updateSetting("compactTables", event.target.checked)
+                      }
                     />
                   </label>
                   <label className="setting-row">
                     <div>
-                      <strong>{t("Include Cash in Allocation", "配置中包含現金")}</strong>
-                      <p>{t("Show cash as a separate asset slice in allocation chart.", "在資產配置圖中把現金獨立顯示。")}</p>
+                      <strong>
+                        {t("Include Cash in Allocation", "配置中包含現金")}
+                      </strong>
+                      <p>
+                        {t(
+                          "Show cash as a separate asset slice in allocation chart.",
+                          "在資產配置圖中把現金獨立顯示。",
+                        )}
+                      </p>
                     </div>
                     <input
                       className="setting-toggle"
                       type="checkbox"
                       checked={settings.showCashInAllocation}
                       onChange={(event) =>
-                        updateSetting("showCashInAllocation", event.target.checked)
+                        updateSetting(
+                          "showCashInAllocation",
+                          event.target.checked,
+                        )
                       }
                     />
                   </label>
@@ -5950,7 +7296,9 @@ export default function App(): JSX.Element {
                     {t("Language", "語言")}
                     <select
                       value={settings.language}
-                      onChange={(event) => updateSetting("language", event.target.value as Locale)}
+                      onChange={(event) =>
+                        updateSetting("language", event.target.value as Locale)
+                      }
                     >
                       <option value="zh-HK">繁體中文</option>
                       <option value="en">English</option>
@@ -5961,7 +7309,10 @@ export default function App(): JSX.Element {
                     <input
                       value={settings.defaultCurrency}
                       onChange={(event) =>
-                        updateSetting("defaultCurrency", event.target.value.toUpperCase())
+                        updateSetting(
+                          "defaultCurrency",
+                          event.target.value.toUpperCase(),
+                        )
                       }
                       placeholder="USD"
                       maxLength={6}
@@ -5972,10 +7323,15 @@ export default function App(): JSX.Element {
                     <select
                       value={normalizedDisplayCurrency}
                       onChange={(event) =>
-                        updateSetting("displayCurrency", normalizeCurrencyCode(event.target.value) || "AUTO")
+                        updateSetting(
+                          "displayCurrency",
+                          normalizeCurrencyCode(event.target.value) || "AUTO",
+                        )
                       }
                     >
-                      <option value="AUTO">{t("Auto (Original)", "自動（原貨幣）")}</option>
+                      <option value="AUTO">
+                        {t("Auto (Original)", "自動（原貨幣）")}
+                      </option>
                       {displayCurrencyOptions.map((currency) => (
                         <option key={currency} value={currency}>
                           {currency}
@@ -6004,9 +7360,15 @@ export default function App(): JSX.Element {
                     "預設值會儲存在本機，而投資資料會於登入後同步到 Firebase。",
                   )}
                 </p>
-                <p className={`settings-hint ${fxSyncError ? "negative" : ""}`}>{displayCurrencyStatusText}</p>
+                <p className={`settings-hint ${fxSyncError ? "negative" : ""}`}>
+                  {displayCurrencyStatusText}
+                </p>
                 <div className="settings-actions">
-                  <button type="button" className="secondary-btn" onClick={resetSettings}>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={resetSettings}
+                  >
                     {t("Reset To Default", "重設為預設")}
                   </button>
                   <button
@@ -6025,7 +7387,11 @@ export default function App(): JSX.Element {
       )}
 
       {isImportReviewOpen && (
-        <div className="modal-backdrop" role="presentation" onClick={closeImportReview}>
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={closeImportReview}
+        >
           <div
             className="modal-card import-review-modal"
             role="dialog"
@@ -6035,10 +7401,18 @@ export default function App(): JSX.Element {
             <div className="panel-head slim">
               <h3>{t("Review Imported Transactions", "檢查匯入交易")}</h3>
               <div className="import-review-head-actions">
-                <button type="button" className="secondary-btn" onClick={closeImportReview}>
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={closeImportReview}
+                >
                   {t("Cancel", "取消")}
                 </button>
-                <button type="button" className="primary-btn" onClick={confirmImportReview}>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={confirmImportReview}
+                >
                   {t("Confirm Import", "確認匯入")}
                 </button>
               </div>
@@ -6076,7 +7450,8 @@ export default function App(): JSX.Element {
 
             {importReviewSource && importReviewSource.fileCount > 1 && (
               <p className="settings-hint import-review-files">
-                {t("Included files:", "包含檔案：")} {importReviewSource.fileNames.join(", ")}
+                {t("Included files:", "包含檔案：")}{" "}
+                {importReviewSource.fileNames.join(", ")}
               </p>
             )}
 
@@ -6110,7 +7485,11 @@ export default function App(): JSX.Element {
                         <select
                           value={row.portfolioId}
                           onChange={(event) =>
-                            moveImportReviewTransaction(row.portfolioId, event.target.value, row.id)
+                            moveImportReviewTransaction(
+                              row.portfolioId,
+                              event.target.value,
+                              row.id,
+                            )
                           }
                         >
                           {importReviewEntities.map((entity) => (
@@ -6129,10 +7508,14 @@ export default function App(): JSX.Element {
                             if (!parsed) {
                               return;
                             }
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              date: parsed,
-                            }));
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                date: parsed,
+                              }),
+                            );
                           }}
                         />
                       </td>
@@ -6140,13 +7523,19 @@ export default function App(): JSX.Element {
                         <select
                           value={row.type}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              type: event.target.value as TxType,
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                type: event.target.value as TxType,
+                              }),
+                            )
                           }
                         >
-                          {TRANSACTION_TYPE_OPTIONS.filter((item) => item.value !== "all").map((option) => (
+                          {TRANSACTION_TYPE_OPTIONS.filter(
+                            (item) => item.value !== "all",
+                          ).map((option) => (
                             <option key={option.value} value={option.value}>
                               {option.label}
                             </option>
@@ -6157,10 +7546,14 @@ export default function App(): JSX.Element {
                         <input
                           value={row.symbol}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              symbol: event.target.value.toUpperCase().trim(),
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                symbol: event.target.value.toUpperCase().trim(),
+                              }),
+                            )
                           }
                         />
                       </td>
@@ -6170,10 +7563,14 @@ export default function App(): JSX.Element {
                           step="0.0001"
                           value={row.shares}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              shares: parseNumberish(event.target.value),
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                shares: parseNumberish(event.target.value),
+                              }),
+                            )
                           }
                         />
                       </td>
@@ -6183,10 +7580,14 @@ export default function App(): JSX.Element {
                           step="0.0001"
                           value={row.price}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              price: parseNumberish(event.target.value),
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                price: parseNumberish(event.target.value),
+                              }),
+                            )
                           }
                         />
                       </td>
@@ -6196,10 +7597,14 @@ export default function App(): JSX.Element {
                           step="0.0001"
                           value={row.fee}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              fee: parseNumberish(event.target.value),
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                fee: parseNumberish(event.target.value),
+                              }),
+                            )
                           }
                         />
                       </td>
@@ -6207,10 +7612,16 @@ export default function App(): JSX.Element {
                         <input
                           value={row.currency}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              currency: event.target.value.toUpperCase().trim(),
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                currency: event.target.value
+                                  .toUpperCase()
+                                  .trim(),
+                              }),
+                            )
                           }
                         />
                       </td>
@@ -6218,10 +7629,14 @@ export default function App(): JSX.Element {
                         <input
                           value={row.note ?? ""}
                           onChange={(event) =>
-                            updateImportReviewTransaction(row.portfolioId, row.id, (tx) => ({
-                              ...tx,
-                              note: event.target.value,
-                            }))
+                            updateImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                              (tx) => ({
+                                ...tx,
+                                note: event.target.value,
+                              }),
+                            )
                           }
                         />
                       </td>
@@ -6229,7 +7644,12 @@ export default function App(): JSX.Element {
                         <button
                           type="button"
                           className="text-btn danger"
-                          onClick={() => deleteImportReviewTransaction(row.portfolioId, row.id)}
+                          onClick={() =>
+                            deleteImportReviewTransaction(
+                              row.portfolioId,
+                              row.id,
+                            )
+                          }
                         >
                           {t("Delete", "刪除")}
                         </button>
@@ -6255,7 +7675,9 @@ export default function App(): JSX.Element {
                 )}
                 <textarea
                   value={importReviewFeedback}
-                  onChange={(event) => setImportReviewFeedback(event.target.value)}
+                  onChange={(event) =>
+                    setImportReviewFeedback(event.target.value)
+                  }
                   placeholder={t(
                     "Example: Column A is trade amount, not shares. Column B is total value in HKD.",
                     "例如：A 欄係交易總額唔係股數；B 欄係港幣總值。",
@@ -6267,7 +7689,9 @@ export default function App(): JSX.Element {
                   type="button"
                   className="secondary-btn"
                   onClick={() => void adjustImportReviewWithPrompt()}
-                  disabled={isImportReviewAdjusting || !importReviewFeedback.trim()}
+                  disabled={
+                    isImportReviewAdjusting || !importReviewFeedback.trim()
+                  }
                 >
                   {isImportReviewAdjusting
                     ? t("Adjusting...", "調整中...")
@@ -6276,13 +7700,19 @@ export default function App(): JSX.Element {
               </div>
             </div>
 
-            {importReviewError && <div className="error-text">{importReviewError}</div>}
+            {importReviewError && (
+              <div className="error-text">{importReviewError}</div>
+            )}
           </div>
         </div>
       )}
 
       {stockDetail && (
-        <div className="modal-backdrop" role="presentation" onClick={() => setSelectedStockDetailId(null)}>
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => setSelectedStockDetailId(null)}
+        >
           <div
             className="modal-card stock-detail-modal"
             role="dialog"
@@ -6300,9 +7730,15 @@ export default function App(): JSX.Element {
                   onClick={() => void refreshPortfolioQuotes("manual")}
                   disabled={isQuoteSyncing || !portfolioStockSymbolKey}
                 >
-                  {isQuoteSyncing ? t("Syncing...", "同步中...") : t("Check Stock Price", "查看股價")}
+                  {isQuoteSyncing
+                    ? t("Syncing...", "同步中...")
+                    : t("Check Stock Price", "查看股價")}
                 </button>
-                <button type="button" className="secondary-btn" onClick={() => setSelectedStockDetailId(null)}>
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => setSelectedStockDetailId(null)}
+                >
                   {t("Close", "關閉")}
                 </button>
               </div>
@@ -6315,7 +7751,12 @@ export default function App(): JSX.Element {
               </div>
               <div>
                 <span>{t("Live Price", "即時股價")}</span>
-                <strong>{displayNativeMoney(stockDetailLivePrice, stockDetail.currency)}</strong>
+                <strong>
+                  {displayNativeMoney(
+                    stockDetailLivePrice,
+                    stockDetail.currency,
+                  )}
+                </strong>
               </div>
               <div>
                 <span>{t("Quote Updated", "報價更新")}</span>
@@ -6331,37 +7772,66 @@ export default function App(): JSX.Element {
               </div>
               <div>
                 <span>{t("Market Value", "市值")}</span>
-                <strong>{displayMoney(stockDetailLiveMarketValue, stockDetail.currency)}</strong>
+                <strong>
+                  {displayMoney(
+                    stockDetailLiveMarketValue,
+                    stockDetail.currency,
+                  )}
+                </strong>
               </div>
               <div>
                 <span>{t("Total P/L", "總盈虧")}</span>
-                <strong className={stockDetail.totalProfit >= 0 ? "positive" : "negative"}>
+                <strong
+                  className={
+                    stockDetail.totalProfit >= 0 ? "positive" : "negative"
+                  }
+                >
                   {displayMoney(stockDetail.totalProfit, stockDetail.currency)}
                 </strong>
               </div>
               <div>
                 <span>{t("Realized P/L", "已實現盈虧")}</span>
-                <strong className={stockDetail.realizedProfit >= 0 ? "positive" : "negative"}>
-                  {displayMoney(stockDetail.realizedProfit, stockDetail.currency)}
+                <strong
+                  className={
+                    stockDetail.realizedProfit >= 0 ? "positive" : "negative"
+                  }
+                >
+                  {displayMoney(
+                    stockDetail.realizedProfit,
+                    stockDetail.currency,
+                  )}
                 </strong>
               </div>
               <div>
                 <span>{t("Dividend", "股息")}</span>
-                <strong>{displayMoney(stockDetail.totalDividend, stockDetail.currency)}</strong>
+                <strong>
+                  {displayMoney(
+                    stockDetail.totalDividend,
+                    stockDetail.currency,
+                  )}
+                </strong>
               </div>
               <div>
                 <span>{t("Total Fee", "總費用")}</span>
-                <strong>{displayMoney(stockDetail.totalFee, stockDetail.currency)}</strong>
+                <strong>
+                  {displayMoney(stockDetail.totalFee, stockDetail.currency)}
+                </strong>
               </div>
             </div>
 
-            <p className={`quote-sync-note ${quoteSyncError ? "error" : ""}`}>{quoteStatusText}</p>
+            <p className={`quote-sync-note ${quoteSyncError ? "error" : ""}`}>
+              {quoteStatusText}
+            </p>
 
             <section className="valuation-chart-panel">
               <div className="panel-head slim">
                 <h3>{t("Price + Profit + Trades", "股價 + 收益 + 交易點")}</h3>
-                <div className={`row-right ${stockDetailValuationChangePct >= 0 ? "positive" : "negative"}`}>
-                  <strong>{displayPercent(stockDetailValuationChangePct)}</strong>
+                <div
+                  className={`row-right ${stockDetailValuationChangePct >= 0 ? "positive" : "negative"}`}
+                >
+                  <strong>
+                    {displayPercent(stockDetailValuationChangePct)}
+                  </strong>
                 </div>
               </div>
               <div className="portfolio-switcher">
@@ -6411,7 +7881,9 @@ export default function App(): JSX.Element {
                   onClick={() => void refreshValuationChart("manual")}
                   disabled={isValuationSyncing}
                 >
-                  {isValuationSyncing ? t("Loading...", "載入中...") : t("Refresh Valuation", "更新估價圖")}
+                  {isValuationSyncing
+                    ? t("Loading...", "載入中...")
+                    : t("Refresh Valuation", "更新估價圖")}
                 </button>
               </div>
               <PriceChart
@@ -6420,11 +7892,19 @@ export default function App(): JSX.Element {
                 tradeMarkers={stockDetailTradeMarkers}
                 label={`${stockDetail.symbol} valuation + profit chart`}
                 valueLabel={t("Price", "價格")}
-                valueFormatter={(value) => displayNativeMoney(value, stockDetail.currency)}
+                valueFormatter={(value) =>
+                  displayNativeMoney(value, stockDetail.currency)
+                }
                 profitLabel={t("Profit", "收益")}
-                profitFormatter={(value) => displayMoney(value, stockDetail.currency)}
+                profitFormatter={(value) =>
+                  displayMoney(value, stockDetail.currency)
+                }
               />
-              <p className={`quote-sync-note ${valuationSyncError ? "error" : ""}`}>{valuationStatusText}</p>
+              <p
+                className={`quote-sync-note ${valuationSyncError ? "error" : ""}`}
+              >
+                {valuationStatusText}
+              </p>
             </section>
 
             <div className="table-scroll">
@@ -6447,8 +7927,17 @@ export default function App(): JSX.Element {
                       <td>{row.shares.toFixed(4)}</td>
                       <td>{displayMoney(row.price, row.currency)}</td>
                       <td>{displayMoney(row.fee, row.currency)}</td>
-                      <td className={getTransactionNetCashFlow(row) >= 0 ? "positive" : "negative"}>
-                        {displayMoney(getTransactionNetCashFlow(row), row.currency)}
+                      <td
+                        className={
+                          getTransactionNetCashFlow(row) >= 0
+                            ? "positive"
+                            : "negative"
+                        }
+                      >
+                        {displayMoney(
+                          getTransactionNetCashFlow(row),
+                          row.currency,
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -6467,9 +7956,22 @@ export default function App(): JSX.Element {
       )}
 
       {isTxModalOpen && (
-        <div className="modal-backdrop" role="presentation" onClick={closeTransactionModal}>
-          <div className="modal-card" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
-            <h3>{editingTransaction ? t("Edit Transaction", "編輯交易") : t("Add Transaction", "新增交易")}</h3>
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={closeTransactionModal}
+        >
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>
+              {editingTransaction
+                ? t("Edit Transaction", "編輯交易")
+                : t("Add Transaction", "新增交易")}
+            </h3>
 
             <div className="form-grid">
               <label>
@@ -6478,12 +7980,16 @@ export default function App(): JSX.Element {
                   value={draft.portfolioId}
                   onChange={(event) => {
                     const nextPortfolioId = event.target.value;
-                    const selectedPortfolio = entities.find((entity) => entity.id === nextPortfolioId);
+                    const selectedPortfolio = entities.find(
+                      (entity) => entity.id === nextPortfolioId,
+                    );
                     setDraft((prev) => ({
                       ...prev,
                       portfolioId: nextPortfolioId,
                       currency:
-                        getAutoCurrencyByDistrict(normalizeTransactionDistrict(prev.district)) ??
+                        getAutoCurrencyByDistrict(
+                          normalizeTransactionDistrict(prev.district),
+                        ) ??
                         normalizeCurrencyCode(selectedPortfolio?.currency) ??
                         prev.currency,
                     }));
@@ -6502,7 +8008,9 @@ export default function App(): JSX.Element {
                 <input
                   type="date"
                   value={draft.date}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, date: event.target.value }))}
+                  onChange={(event) =>
+                    setDraft((prev) => ({ ...prev, date: event.target.value }))
+                  }
                 />
               </label>
 
@@ -6510,9 +8018,19 @@ export default function App(): JSX.Element {
                 {t("Type", "類型")}
                 <select
                   value={draft.type}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, type: event.target.value as TxType }))}
+                  onChange={(event) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      type: event.target.value as TxType,
+                      symbol: allowsSymbolInput(event.target.value as TxType)
+                        ? prev.symbol
+                        : "",
+                    }))
+                  }
                 >
-                  {TRANSACTION_TYPE_OPTIONS.filter((item) => item.value !== "all").map((option) => (
+                  {TRANSACTION_TYPE_OPTIONS.filter(
+                    (item) => item.value !== "all",
+                  ).map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -6525,8 +8043,11 @@ export default function App(): JSX.Element {
                 <select
                   value={draft.district}
                   onChange={(event) => {
-                    const nextDistrict = normalizeTransactionDistrict(event.target.value);
-                    const autoCurrency = getAutoCurrencyByDistrict(nextDistrict);
+                    const nextDistrict = normalizeTransactionDistrict(
+                      event.target.value,
+                    );
+                    const autoCurrency =
+                      getAutoCurrencyByDistrict(nextDistrict);
                     setDraft((prev) => ({
                       ...prev,
                       district: nextDistrict,
@@ -6542,20 +8063,39 @@ export default function App(): JSX.Element {
                 </select>
               </label>
 
-              <label>
-                {t("Symbol", "代號")}
-                <input
-                  value={draft.symbol}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, symbol: event.target.value.toUpperCase() }))}
-                  placeholder={t("AAPL", "例如 AAPL")}
-                />
-              </label>
+              {allowsSymbolInput(draft.type) && (
+                <label>
+                  {t("Symbol", "代號")}
+                  <input
+                    value={draft.symbol}
+                    onChange={(event) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        symbol: event.target.value.toUpperCase(),
+                      }))
+                    }
+                    placeholder={
+                      draft.type === "FEE"
+                        ? t(
+                            "Optional: only for asset fee",
+                            "可留空（僅資產扣款手續費才填）",
+                          )
+                        : t("AAPL", "例如 AAPL")
+                    }
+                  />
+                </label>
+              )}
 
               <label>
                 {t("Shares / Amount", "股數 / 金額")}
                 <input
                   value={draft.shares}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, shares: event.target.value }))}
+                  onChange={(event) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      shares: event.target.value,
+                    }))
+                  }
                 />
               </label>
 
@@ -6563,7 +8103,9 @@ export default function App(): JSX.Element {
                 {t("Price", "價格")}
                 <input
                   value={draft.price}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, price: event.target.value }))}
+                  onChange={(event) =>
+                    setDraft((prev) => ({ ...prev, price: event.target.value }))
+                  }
                 />
               </label>
 
@@ -6571,7 +8113,9 @@ export default function App(): JSX.Element {
                 {t("Fee", "費用")}
                 <input
                   value={draft.fee}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, fee: event.target.value }))}
+                  onChange={(event) =>
+                    setDraft((prev) => ({ ...prev, fee: event.target.value }))
+                  }
                 />
               </label>
 
@@ -6579,9 +8123,18 @@ export default function App(): JSX.Element {
                 {t("Currency", "貨幣")}
                 <input
                   value={draft.currency}
-                  onChange={(event) => setDraft((prev) => ({ ...prev, currency: event.target.value.toUpperCase() }))}
-                  readOnly={normalizeTransactionDistrict(draft.district) !== "OTHER"}
-                  disabled={normalizeTransactionDistrict(draft.district) !== "OTHER"}
+                  onChange={(event) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      currency: event.target.value.toUpperCase(),
+                    }))
+                  }
+                  readOnly={
+                    normalizeTransactionDistrict(draft.district) !== "OTHER"
+                  }
+                  disabled={
+                    normalizeTransactionDistrict(draft.district) !== "OTHER"
+                  }
                 />
               </label>
             </div>
@@ -6590,18 +8143,30 @@ export default function App(): JSX.Element {
               {t("Note", "備註")}
               <input
                 value={draft.note}
-                onChange={(event) => setDraft((prev) => ({ ...prev, note: event.target.value }))}
+                onChange={(event) =>
+                  setDraft((prev) => ({ ...prev, note: event.target.value }))
+                }
                 placeholder={t("Optional", "可選")}
               />
             </label>
 
-            {transactionError && <div className="error-text">{transactionError}</div>}
+            {transactionError && (
+              <div className="error-text">{transactionError}</div>
+            )}
 
             <div className="modal-actions">
-              <button type="button" className="secondary-btn" onClick={closeTransactionModal}>
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={closeTransactionModal}
+              >
                 {t("Cancel", "取消")}
               </button>
-              <button type="button" className="primary-btn" onClick={saveTransaction}>
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={saveTransaction}
+              >
                 {t("Save", "儲存")}
               </button>
             </div>
@@ -6610,7 +8175,11 @@ export default function App(): JSX.Element {
       )}
 
       {pendingCashReview && (
-        <div className="modal-backdrop" role="presentation" onClick={closeCashReviewModal}>
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={closeCashReviewModal}
+        >
           <div
             className="modal-card cash-review-modal"
             role="dialog"
@@ -6628,11 +8197,21 @@ export default function App(): JSX.Element {
             <div className="cash-review-grid">
               <div className="cash-review-metric">
                 <span>{t("Current Balance", "目前餘額")}</span>
-                <strong>{displayMoney(pendingCashReview.cashBalance, pendingCashReview.currency)}</strong>
+                <strong>
+                  {displayMoney(
+                    pendingCashReview.cashBalance,
+                    pendingCashReview.currency,
+                  )}
+                </strong>
               </div>
               <div className="cash-review-metric">
                 <span>{t("Required Extra Cash", "所需額外現金")}</span>
-                <strong>{displayMoney(pendingCashReview.shortfall, pendingCashReview.currency)}</strong>
+                <strong>
+                  {displayMoney(
+                    pendingCashReview.shortfall,
+                    pendingCashReview.currency,
+                  )}
+                </strong>
               </div>
             </div>
 
@@ -6648,7 +8227,10 @@ export default function App(): JSX.Element {
                 onBlur={() => {
                   const normalized = Math.max(
                     0,
-                    Math.min(pendingCashReview.shortfall, parseNumberish(pendingCashAmount)),
+                    Math.min(
+                      pendingCashReview.shortfall,
+                      parseNumberish(pendingCashAmount),
+                    ),
                   );
                   setPendingCashAmount(normalized.toFixed(2));
                 }}
@@ -6663,10 +8245,18 @@ export default function App(): JSX.Element {
             </p>
 
             <div className="modal-actions">
-              <button type="button" className="secondary-btn" onClick={closeCashReviewModal}>
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={closeCashReviewModal}
+              >
                 {t("Back", "返回")}
               </button>
-              <button type="button" className="primary-btn" onClick={confirmPendingCashReview}>
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={confirmPendingCashReview}
+              >
                 {t("Confirm", "確認")}
               </button>
             </div>

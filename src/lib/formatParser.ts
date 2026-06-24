@@ -1,6 +1,12 @@
 import {
   EntityDataset,
   NormalizedTransaction,
+  StockerProAssetMeta,
+  StockerProCashAssetMeta,
+  StockerProEntityMeta,
+  StockerProPortfolioMeta,
+  StockerProPositionMeta,
+  StockerProTransactionMeta,
   TxType,
   UserType,
 } from "../types";
@@ -67,7 +73,9 @@ function parseDateLike(value: unknown): Date {
   return new Date();
 }
 
-function sortByDateAsc(items: NormalizedTransaction[]): NormalizedTransaction[] {
+function sortByDateAsc(
+  items: NormalizedTransaction[],
+): NormalizedTransaction[] {
   return [...items].sort((a, b) => a.date.getTime() - b.date.getTime());
 }
 
@@ -122,7 +130,9 @@ async function decompressBytes(
 
   const safeBuffer = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(safeBuffer).set(bytes);
-  const stream = new Blob([safeBuffer]).stream().pipeThrough(new DecompressionStream(format));
+  const stream = new Blob([safeBuffer])
+    .stream()
+    .pipeThrough(new DecompressionStream(format));
   const arrayBuffer = await new Response(stream).arrayBuffer();
   return new TextDecoder().decode(arrayBuffer);
 }
@@ -227,10 +237,15 @@ function isStockerProPayload(parsed: unknown): parsed is UnknownRecord {
   }
 
   // Stocker Pro payload should contain both portfolios and assetTransactions arrays.
-  return Array.isArray(root.portfolios) && Array.isArray(root.assetTransactions);
+  return (
+    Array.isArray(root.portfolios) && Array.isArray(root.assetTransactions)
+  );
 }
 
-function normalizeStockerXObject(item: UnknownRecord, index: number): EntityDataset {
+function normalizeStockerXObject(
+  item: UnknownRecord,
+  index: number,
+): EntityDataset {
   const name = String(item.name ?? `Stocker ${index + 1}`);
   const currency = String(item.currencyType ?? "USD");
 
@@ -251,7 +266,10 @@ function normalizeStockerXObject(item: UnknownRecord, index: number): EntityData
     const price = toNumber(stock.priceRaw ?? stock.price);
     const fee = toNumber(stock.feeRaw ?? stock.fee);
     const marketHint = toNumber(
-      stock.regularPriceRaw ?? stock.regularPrice ?? stock.priceRaw ?? stock.price,
+      stock.regularPriceRaw ??
+        stock.regularPrice ??
+        stock.priceRaw ??
+        stock.price,
     );
 
     const txType: TxType =
@@ -351,7 +369,18 @@ function normalizeStockerXObject(item: UnknownRecord, index: number): EntityData
 }
 
 function normalizeStockerProObject(data: UnknownRecord): EntityDataset[] {
-  const portfolios = Array.isArray(data.portfolios) ? (data.portfolios as UnknownRecord[]) : [];
+  const portfolios = Array.isArray(data.portfolios)
+    ? (data.portfolios as UnknownRecord[])
+    : [];
+  const assets = Array.isArray(data.assets)
+    ? (data.assets as UnknownRecord[])
+    : [];
+  const positions = Array.isArray(data.positions)
+    ? (data.positions as UnknownRecord[])
+    : [];
+  const cashAssets = Array.isArray(data.cashAssets)
+    ? (data.cashAssets as UnknownRecord[])
+    : [];
   const transactions = Array.isArray(data.assetTransactions)
     ? (data.assetTransactions as UnknownRecord[])
     : [];
@@ -359,25 +388,126 @@ function normalizeStockerProObject(data: UnknownRecord): EntityDataset[] {
     ? (data.manualMarketPrice as UnknownRecord[])
     : [];
 
+  const positionsByAssetId = new Map<number, StockerProPositionMeta[]>();
+  positions.forEach((raw) => {
+    const assetId = toNumber(raw.assetId);
+    if (!assetId) {
+      return;
+    }
+    const normalizedPosition: StockerProPositionMeta = {
+      id: toNumber(raw.id),
+      assetId,
+      type: raw.type == null ? null : String(raw.type),
+      cumulativeCost:
+        raw.cumulativeCost == null ? null : toNumber(raw.cumulativeCost),
+    };
+    if (!positionsByAssetId.has(assetId)) {
+      positionsByAssetId.set(assetId, []);
+    }
+    positionsByAssetId.get(assetId)!.push(normalizedPosition);
+  });
+
+  const assetsByPortfolioId = new Map<number, StockerProAssetMeta[]>();
+  assets.forEach((raw) => {
+    const portfolioId = toNumber(raw.portfolioId);
+    if (!portfolioId) {
+      return;
+    }
+    const normalized: StockerProAssetMeta = {
+      id: toNumber(raw.id),
+      currencyType: normalizeCurrency(raw.currencyType, "USD"),
+      assetType: raw.assetType == null ? null : String(raw.assetType),
+      symbol: normalizeSymbol(raw.symbol),
+      tags: raw.tags ?? null,
+      note: raw.note == null ? null : String(raw.note),
+      assetName: raw.assetName == null ? null : String(raw.assetName),
+      portfolioId,
+      region: raw.region == null ? null : String(raw.region),
+      displayOrder:
+        raw.displayOrder == null
+          ? null
+          : Math.trunc(toNumber(raw.displayOrder)),
+    };
+    if (!assetsByPortfolioId.has(portfolioId)) {
+      assetsByPortfolioId.set(portfolioId, []);
+    }
+    assetsByPortfolioId.get(portfolioId)!.push(normalized);
+  });
+
+  const cashAssetsByPortfolioId = new Map<number, StockerProCashAssetMeta[]>();
+  cashAssets.forEach((raw) => {
+    const portfolioId = toNumber(raw.portfolioId);
+    if (!portfolioId) {
+      return;
+    }
+    const normalized: StockerProCashAssetMeta = {
+      id: toNumber(raw.id),
+      currencyType: normalizeCurrency(raw.currencyType, "USD"),
+      portfolioId,
+    };
+    if (!cashAssetsByPortfolioId.has(portfolioId)) {
+      cashAssetsByPortfolioId.set(portfolioId, []);
+    }
+    cashAssetsByPortfolioId.get(portfolioId)!.push(normalized);
+  });
+
   return portfolios.map((portfolio, index) => {
-    const portfolioId = toNumber(portfolio.id);
-    const portfolioWebId = String(portfolio.webId ?? portfolio.id ?? `portfolio-${index + 1}`);
+    const portfolioId = toNumber(portfolio.id) || index + 1;
+    const portfolioIdText = String(portfolio.id ?? `${portfolioId}`);
     const name = String(portfolio.name ?? `Portfolio ${index + 1}`);
-    const currency = String(portfolio.displayCurrencyType ?? "USD");
+    const currency = normalizeCurrency(portfolio.displayCurrencyType, "USD");
     const latestPriceMap: Record<string, { price: number; date: number }> = {};
+    const metaByAssetSymbol: Record<string, StockerProAssetMeta> = {};
+    const metaByPositionId: Record<number, StockerProPositionMeta> = {};
+    const positionIdsByAssetId: Record<number, number[]> = {};
+    const metaByCashCurrency: Record<string, StockerProCashAssetMeta> = {};
+
+    (assetsByPortfolioId.get(portfolioId) ?? []).forEach((asset) => {
+      const key = `${asset.symbol}|${asset.currencyType}`;
+      metaByAssetSymbol[key] = asset;
+      const positionMetas = positionsByAssetId.get(asset.id) ?? [];
+      positionIdsByAssetId[asset.id] = positionMetas.map((item) => item.id);
+      positionMetas.forEach((positionMeta) => {
+        metaByPositionId[positionMeta.id] = positionMeta;
+      });
+    });
+    (cashAssetsByPortfolioId.get(portfolioId) ?? []).forEach((cashAsset) => {
+      metaByCashCurrency[cashAsset.currencyType] = cashAsset;
+    });
+
+    const portfolioMeta: StockerProPortfolioMeta = {
+      id: portfolioId,
+      webId:
+        portfolio.webId == null || String(portfolio.webId).trim() === ""
+          ? undefined
+          : String(portfolio.webId),
+      name,
+      tags: portfolio.tags ?? null,
+      note: portfolio.note == null ? null : String(portfolio.note),
+      displayCurrencyType: currency,
+      displayOrder:
+        portfolio.displayOrder == null
+          ? null
+          : Math.trunc(toNumber(portfolio.displayOrder)),
+    };
 
     const mappedTransactions: NormalizedTransaction[] = transactions
       .filter((tx) => toNumber(tx.portfolioId) === portfolioId)
       .map((tx, txIndex) => {
-        const typeText = String(tx.type ?? "").trim().toUpperCase();
+        const typeText = String(tx.type ?? "")
+          .trim()
+          .toUpperCase();
         const type: TxType = SUPPORTED_TX_TYPES.has(typeText as TxType)
           ? (typeText as TxType)
           : "CASH";
 
-        const txCurrency = String(tx.currencyType ?? currency);
+        const txCurrency = normalizeCurrency(tx.currencyType, currency);
         let symbol = normalizeSymbol(tx.symbol);
 
-        if (!symbol && ["CASH", "CASH_CONVERT", "FEE", "INTEREST"].includes(type)) {
+        if (
+          !symbol &&
+          ["CASH", "CASH_CONVERT", "FEE", "INTEREST"].includes(type)
+        ) {
           symbol = txCurrency;
         }
 
@@ -386,31 +516,52 @@ function normalizeStockerProObject(data: UnknownRecord): EntityDataset[] {
             toNumber(tx.day),
           ).padStart(2, "0")}T00:00:00`,
         );
-        const timeOfDay = Math.max(0, Math.min(86_399_999, Math.trunc(toNumber(tx.time))));
+        const timeOfDay = Math.max(
+          0,
+          Math.min(86_399_999, Math.trunc(toNumber(tx.time))),
+        );
         const date = new Date(dateBase.getTime() + timeOfDay);
         const price = decodeStored(tx._price);
         const shares = decodeStored(tx._numberOfShares);
         const fee = decodeStored(tx._fee);
 
-        if (symbol && tx.assetType === "STOCK" && (type === "BUY" || type === "SELL")) {
+        if (
+          symbol &&
+          tx.assetType === "STOCK" &&
+          (type === "BUY" || type === "SELL")
+        ) {
           pushLatestPrice(latestPriceMap, symbol, price, date);
         }
 
         const rawWebTxId = String(tx.webTxId ?? "").trim();
-        const normalizedTxId = rawWebTxId || createTransactionId("sp", [
-          portfolioWebId,
-          txIndex,
-          tx.id ?? "",
-          tx.symbol ?? "",
-          tx.year ?? "",
-          tx.month ?? "",
-          tx.day ?? "",
-          tx.time ?? "",
-          type,
-          shares,
-          price,
-          fee,
-        ]);
+        const normalizedTxId =
+          rawWebTxId ||
+          createTransactionId("sp", [
+            portfolioIdText,
+            txIndex,
+            tx.id ?? "",
+            tx.symbol ?? "",
+            tx.year ?? "",
+            tx.month ?? "",
+            tx.day ?? "",
+            tx.time ?? "",
+            type,
+            shares,
+            price,
+            fee,
+          ]);
+        const txMeta: StockerProTransactionMeta = {
+          id: tx.id == null ? undefined : toNumber(tx.id),
+          webTxId: rawWebTxId || undefined,
+          assetType: tx.assetType == null ? null : String(tx.assetType),
+          positionId: tx.positionId == null ? null : toNumber(tx.positionId),
+          portfolioId,
+          region: tx.region == null ? null : String(tx.region),
+          tags: tx.tags ?? null,
+          isAutoDividend:
+            tx.isAutoDividend == null ? null : Boolean(tx.isAutoDividend),
+          exDividendDate: tx.exDividendDate ?? null,
+        };
 
         return {
           id: normalizedTxId,
@@ -422,6 +573,7 @@ function normalizeStockerProObject(data: UnknownRecord): EntityDataset[] {
           fee,
           currency: txCurrency,
           note: String(tx.note ?? ""),
+          stockerProMeta: txMeta,
         };
       });
 
@@ -430,18 +582,26 @@ function normalizeStockerProObject(data: UnknownRecord): EntityDataset[] {
       .forEach((priceItem) => {
         const symbol = normalizeSymbol(priceItem.symbol);
         const directPrice = toNumber(priceItem.marketPrice);
-        const price = directPrice > 0
-          ? directPrice
-          : decodeStored(priceItem._price ?? priceItem.price);
+        const price =
+          directPrice > 0
+            ? directPrice
+            : decodeStored(priceItem._price ?? priceItem.price);
         pushLatestPrice(latestPriceMap, symbol, price, new Date());
       });
 
     return {
-      id: portfolioWebId,
+      id: portfolioIdText,
       name,
       currency,
       transactions: sortByDateAsc(mappedTransactions),
       latestPriceBySymbol: unwrapLatestPriceMap(latestPriceMap),
+      stockerProMeta: {
+        portfolio: portfolioMeta,
+        assetsBySymbol: metaByAssetSymbol,
+        positionsById: metaByPositionId,
+        positionIdsByAssetId,
+        cashAssetsByCurrency: metaByCashCurrency,
+      } as StockerProEntityMeta,
     };
   });
 }
@@ -483,7 +643,10 @@ function normalizeAiTransaction(
     ? (typeText as TxType)
     : "CASH";
 
-  const currency = normalizeCurrency(tx.currency ?? tx.currencyType, portfolioCurrency);
+  const currency = normalizeCurrency(
+    tx.currency ?? tx.currencyType,
+    portfolioCurrency,
+  );
   let symbol = normalizeSymbol(tx.symbol ?? tx.ticker ?? tx.assetSymbol);
   if (!symbol && ["CASH", "CASH_CONVERT", "FEE", "INTEREST"].includes(type)) {
     symbol = currency;
@@ -494,9 +657,17 @@ function normalizeAiTransaction(
 
   const date = parseDateLike(tx.date ?? tx.datetime ?? tx.time ?? tx.timestamp);
   const shares = toNumber(
-    tx.shares ?? tx.quantity ?? tx.units ?? tx.size ?? tx.numberOfShares ?? tx.amount ?? 0,
+    tx.shares ??
+      tx.quantity ??
+      tx.units ??
+      tx.size ??
+      tx.numberOfShares ??
+      tx.amount ??
+      0,
   );
-  const price = toNumber(tx.price ?? tx.unitPrice ?? tx.avgPrice ?? tx.costPrice ?? 0);
+  const price = toNumber(
+    tx.price ?? tx.unitPrice ?? tx.avgPrice ?? tx.costPrice ?? 0,
+  );
   const fee = toNumber(tx.fee ?? tx.commission ?? tx.serviceFee ?? 0);
   const note = String(tx.note ?? tx.memo ?? tx.remark ?? "").trim();
 
@@ -505,7 +676,16 @@ function normalizeAiTransaction(
   }
 
   return {
-    id: createTransactionId("ai", [portfolioId, txIndex, symbol, type, date.toISOString(), shares, price, fee]),
+    id: createTransactionId("ai", [
+      portfolioId,
+      txIndex,
+      symbol,
+      type,
+      date.toISOString(),
+      shares,
+      price,
+      fee,
+    ]),
     date,
     symbol,
     type,
@@ -517,7 +697,9 @@ function normalizeAiTransaction(
   };
 }
 
-export function normalizeAiPayloadToEntities(payload: unknown): EntityDataset[] {
+export function normalizeAiPayloadToEntities(
+  payload: unknown,
+): EntityDataset[] {
   const root = asRecord(payload);
   if (!root) {
     return [];
@@ -534,12 +716,20 @@ export function normalizeAiPayloadToEntities(payload: unknown): EntityDataset[] 
 
       const id = String(portfolio.id ?? `ai-portfolio-${index + 1}`);
       const name = String(portfolio.name ?? `AI Portfolio ${index + 1}`);
-      const currency = normalizeCurrency(portfolio.currency ?? portfolio.currencyType, "USD");
-      const latestPriceMap: Record<string, { price: number; date: number }> = {};
-      const txRows = Array.isArray(portfolio.transactions) ? portfolio.transactions : [];
+      const currency = normalizeCurrency(
+        portfolio.currency ?? portfolio.currencyType,
+        "USD",
+      );
+      const latestPriceMap: Record<string, { price: number; date: number }> =
+        {};
+      const txRows = Array.isArray(portfolio.transactions)
+        ? portfolio.transactions
+        : [];
 
       const mappedTransactions = txRows
-        .map((txRaw, txIndex) => normalizeAiTransaction(txRaw, currency, id, txIndex, latestPriceMap))
+        .map((txRaw, txIndex) =>
+          normalizeAiTransaction(txRaw, currency, id, txIndex, latestPriceMap),
+        )
         .filter((tx): tx is NormalizedTransaction => Boolean(tx));
 
       return {
@@ -553,95 +743,240 @@ export function normalizeAiPayloadToEntities(payload: unknown): EntityDataset[] 
     .filter((entity): entity is EntityDataset => Boolean(entity));
 }
 
-function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
-  const portfolioIdByEntityId = new Map<string, number>();
-  const usedPortfolioIds = new Set<number>();
-  const assetIdByPortfolioAndSymbol = new Map<string, number>();
-  let nextAssetId = 1;
-  const portfolios = entities.map((entity, index) => {
-    const seed = entity.id || `portfolio-${index + 1}`;
-    let numericId = stablePositiveIntFromText(seed, index + 1);
-    while (usedPortfolioIds.has(numericId)) {
-      numericId += 1;
-      if (numericId > 2_000_000_000) {
-        numericId = 1;
-      }
+function isCashLikeType(
+  type: TxType,
+  symbol?: string,
+  currency?: string,
+): boolean {
+  if (type === "CASH" || type === "CASH_CONVERT" || type === "INTEREST") {
+    return true;
+  }
+  if (type !== "FEE") {
+    return false;
+  }
+  const normalizedSymbol = normalizeSymbol(symbol ?? "");
+  const normalizedCurrency = normalizeCurrency(currency ?? "", "USD");
+  if (!normalizedSymbol) {
+    return true;
+  }
+  return normalizedSymbol === normalizedCurrency;
+}
+
+function calculatePositionCumulativeCost(
+  transactions: NormalizedTransaction[],
+): number {
+  let cost = 0;
+  let virtualCash: number | null = null;
+  for (const tx of sortByDateAsc(transactions)) {
+    if (!["BUY", "SELL", "DIVIDEND_CASH"].includes(tx.type)) {
+      continue;
     }
-    usedPortfolioIds.add(numericId);
-    portfolioIdByEntityId.set(entity.id, numericId);
-    return {
-      id: numericId,
-      webId: entity.id,
-      name: entity.name,
-      tags: null,
-      note: null,
-      displayCurrencyType: normalizeCurrency(entity.currency, "USD"),
-      displayOrder: index,
-    };
+    const total = tx.shares * tx.price + tx.fee;
+    if (tx.type === "BUY") {
+      if (virtualCash === null) {
+        cost = total;
+        virtualCash = 0;
+      } else {
+        const diff = virtualCash - total;
+        if (diff < 0) {
+          virtualCash = 0;
+          cost -= diff;
+        } else {
+          virtualCash -= total;
+        }
+      }
+    } else {
+      virtualCash = (virtualCash ?? 0) + total;
+    }
+  }
+  return Number(cost.toFixed(8));
+}
+
+function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
+  const portfolios: UnknownRecord[] = [];
+  const cashAssetRecords = new Map<number, UnknownRecord>();
+  const assetRecords = new Map<number, UnknownRecord>();
+  const positionRecords = new Map<number, UnknownRecord>();
+  const assetTransactions: UnknownRecord[] = [];
+  const usedPortfolioIds = new Set<number>();
+  const usedTransactionIds = new Set<number>();
+
+  let nextPortfolioId = 1;
+  let nextCashAssetId = 1;
+  let nextAssetId = 1;
+  let nextPositionId = 1;
+  let nextTransactionId = 1;
+
+  entities.forEach((entity) => {
+    const meta = entity.stockerProMeta;
+    if (meta?.portfolio.id) {
+      nextPortfolioId = Math.max(nextPortfolioId, meta.portfolio.id + 1);
+    }
+    Object.values(meta?.cashAssetsByCurrency ?? {}).forEach((cashAsset) => {
+      nextCashAssetId = Math.max(nextCashAssetId, cashAsset.id + 1);
+    });
+    Object.values(meta?.assetsBySymbol ?? {}).forEach((asset) => {
+      nextAssetId = Math.max(nextAssetId, asset.id + 1);
+    });
+    Object.values(meta?.positionsById ?? {}).forEach((position) => {
+      nextPositionId = Math.max(nextPositionId, position.id + 1);
+    });
+    entity.transactions.forEach((tx) => {
+      if (tx.stockerProMeta?.id) {
+        nextTransactionId = Math.max(
+          nextTransactionId,
+          tx.stockerProMeta.id + 1,
+        );
+      }
+    });
   });
 
-  let transactionId = 1;
-  let cashAssetId = 1;
-  const assetTransactions: UnknownRecord[] = [];
-  const cashAssets: UnknownRecord[] = [];
-  const assets: UnknownRecord[] = [];
-  const positions: UnknownRecord[] = [];
-  const cashAssetKeySet = new Set<string>();
-  const assetKeySet = new Set<string>();
-  entities.forEach((entity) => {
-    const portfolioId = portfolioIdByEntityId.get(entity.id) ?? 1;
-    const sorted = sortByDateAsc(entity.transactions);
+  entities.forEach((entity, index) => {
+    const meta = entity.stockerProMeta;
+    let portfolioId = meta?.portfolio.id || toNumber(entity.id) || index + 1;
+    while (!portfolioId || usedPortfolioIds.has(portfolioId)) {
+      portfolioId = nextPortfolioId;
+      nextPortfolioId += 1;
+    }
+    usedPortfolioIds.add(portfolioId);
+    nextPortfolioId = Math.max(nextPortfolioId, portfolioId + 1);
     const portfolioCurrency = normalizeCurrency(entity.currency, "USD");
 
-    const ensureCashAsset = (currency: string): void => {
-      const key = `${portfolioId}|${currency}`;
-      if (cashAssetKeySet.has(key)) {
-        return;
+    const rawDisplayOrder = meta?.portfolio.displayOrder;
+    const portfolioRecord: UnknownRecord = {
+      id: portfolioId,
+      name: entity.name,
+      tags: meta?.portfolio.tags ?? null,
+      note:
+        meta?.portfolio.note === null
+          ? null
+          : String(meta?.portfolio.note ?? ""),
+      displayCurrencyType: portfolioCurrency,
+      displayOrder:
+        rawDisplayOrder == null ? null : Math.trunc(toNumber(rawDisplayOrder)),
+    };
+    portfolios.push(portfolioRecord);
+
+    const assetByKey = new Map<string, StockerProAssetMeta>();
+    const positionIdsByAssetId = new Map<number, number[]>();
+    Object.values(meta?.assetsBySymbol ?? {}).forEach((asset) => {
+      const key = `${asset.symbol}|${normalizeCurrency(asset.currencyType, portfolioCurrency)}`;
+      assetByKey.set(key, asset);
+      assetRecords.set(asset.id, {
+        id: asset.id,
+        currencyType: normalizeCurrency(asset.currencyType, portfolioCurrency),
+        assetType: asset.assetType ?? "STOCK",
+        symbol: asset.symbol,
+        tags: asset.tags ?? null,
+        note: asset.note === null ? null : String(asset.note ?? ""),
+        assetName: asset.assetName ?? null,
+        portfolioId,
+        region: asset.region ?? "OTHERS",
+        displayOrder: asset.displayOrder,
+      });
+    });
+    Object.entries(meta?.positionIdsByAssetId ?? {}).forEach(
+      ([assetIdText, positionIds]) => {
+        const assetId = toNumber(assetIdText);
+        positionIdsByAssetId.set(assetId, [...positionIds]);
+      },
+    );
+    Object.values(meta?.positionsById ?? {}).forEach((position) => {
+      positionRecords.set(position.id, {
+        id: position.id,
+        assetId: position.assetId,
+        type: position.type ?? "LONG",
+        cumulativeCost: position.cumulativeCost,
+      });
+      if (!positionIdsByAssetId.has(position.assetId)) {
+        positionIdsByAssetId.set(position.assetId, []);
       }
-      cashAssetKeySet.add(key);
-      cashAssets.push({
-        id: cashAssetId,
-        currencyType: currency,
+      const ids = positionIdsByAssetId.get(position.assetId)!;
+      if (!ids.includes(position.id)) {
+        ids.push(position.id);
+      }
+    });
+
+    const cashByCurrency = new Map<string, StockerProCashAssetMeta>();
+    Object.values(meta?.cashAssetsByCurrency ?? {}).forEach((cashAsset) => {
+      cashByCurrency.set(
+        normalizeCurrency(cashAsset.currencyType, portfolioCurrency),
+        cashAsset,
+      );
+      cashAssetRecords.set(cashAsset.id, {
+        id: cashAsset.id,
+        currencyType: normalizeCurrency(
+          cashAsset.currencyType,
+          portfolioCurrency,
+        ),
         portfolioId,
       });
-      cashAssetId += 1;
+    });
+
+    const ensureCashAsset = (currency: string): void => {
+      const normalizedCurrency = normalizeCurrency(currency, portfolioCurrency);
+      if (cashByCurrency.has(normalizedCurrency)) {
+        return;
+      }
+      const created: StockerProCashAssetMeta = {
+        id: nextCashAssetId,
+        currencyType: normalizedCurrency,
+        portfolioId,
+      };
+      nextCashAssetId += 1;
+      cashByCurrency.set(normalizedCurrency, created);
+      cashAssetRecords.set(created.id, {
+        id: created.id,
+        currencyType: created.currencyType,
+        portfolioId: created.portfolioId,
+      });
     };
 
     const ensureStockAsset = (
       symbol: string,
       currency: string,
-      region: string,
-    ): number => {
-      const key = `${portfolioId}|${symbol}`;
-      const existing = assetIdByPortfolioAndSymbol.get(key);
+      region: string | null | undefined,
+    ): StockerProAssetMeta => {
+      const normalizedSymbol = normalizeSymbol(symbol);
+      const normalizedCurrency = normalizeCurrency(currency, portfolioCurrency);
+      const key = `${normalizedSymbol}|${normalizedCurrency}`;
+      const existing = assetByKey.get(key);
       if (existing) {
         return existing;
       }
-      const id = nextAssetId;
-      nextAssetId += 1;
-      assetIdByPortfolioAndSymbol.set(key, id);
-      assetKeySet.add(key);
-      assets.push({
-        id,
-        currencyType: currency,
+      const created: StockerProAssetMeta = {
+        id: nextAssetId,
+        currencyType: normalizedCurrency,
         assetType: "STOCK",
-        symbol,
+        symbol: normalizedSymbol,
         tags: null,
-        note: null,
-        assetName: symbol,
+        note: "",
+        assetName: null,
         portfolioId,
-        region,
-        displayOrder: assets.length,
+        region: region ?? "OTHERS",
+        displayOrder: null,
+      };
+      nextAssetId += 1;
+      assetByKey.set(key, created);
+      assetRecords.set(created.id, {
+        id: created.id,
+        currencyType: created.currencyType,
+        assetType: created.assetType,
+        symbol: created.symbol,
+        tags: created.tags,
+        note: created.note,
+        assetName: created.assetName,
+        portfolioId: created.portfolioId,
+        region: created.region,
+        displayOrder: created.displayOrder,
       });
-      positions.push({
-        id,
-        assetId: id,
-        type: "LONG",
-        cumulativeCost: null,
-      });
-      return id;
+      return created;
     };
 
+    const positionTxBuckets = new Map<number, NormalizedTransaction[]>();
+    const positionShares = new Map<number, number>();
+
+    const sorted = sortByDateAsc(entity.transactions);
     ensureCashAsset(portfolioCurrency);
 
     sorted.forEach((tx) => {
@@ -652,21 +987,93 @@ function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
         date.getSeconds() * 1_000 +
         date.getMilliseconds();
       const type: TxType = SUPPORTED_TX_TYPES.has(tx.type) ? tx.type : "CASH";
-      const currency = normalizeCurrency(tx.currency, normalizeCurrency(entity.currency, "USD"));
+      const currency = normalizeCurrency(tx.currency, portfolioCurrency);
       const symbol = normalizeSymbol(tx.symbol) || currency;
-      const isCashType = type === "CASH" || type === "CASH_CONVERT" || type === "INTEREST";
-      const region = "OTHERS";
+      const isCashType = isCashLikeType(type, symbol, currency);
+      const txMeta = tx.stockerProMeta;
 
       ensureCashAsset(currency);
-      if (!isCashType) {
-        ensureStockAsset(symbol, currency, region);
+
+      let assetType = txMeta?.assetType;
+      let region = txMeta?.region;
+      let positionId = txMeta?.positionId ?? null;
+      if (assetType === undefined) {
+        assetType = isCashType ? "CASH" : "STOCK";
       }
 
+      if (!isCashType) {
+        const asset = ensureStockAsset(symbol, currency, region);
+        if (region === undefined) {
+          region = asset.region ?? "OTHERS";
+        }
+        assetType = assetType || "STOCK";
+
+        if (!positionIdsByAssetId.has(asset.id)) {
+          positionIdsByAssetId.set(asset.id, []);
+        }
+
+        const knownPositionIds = positionIdsByAssetId.get(asset.id)!;
+        if (positionId != null && !knownPositionIds.includes(positionId)) {
+          knownPositionIds.push(positionId);
+        }
+
+        let selectedPositionId = positionId;
+        if (selectedPositionId == null) {
+          const activePositionId = knownPositionIds.find(
+            (id) => (positionShares.get(id) ?? 0) > 0,
+          );
+          if (activePositionId != null) {
+            selectedPositionId = activePositionId;
+          } else {
+            selectedPositionId = nextPositionId;
+            nextPositionId += 1;
+            knownPositionIds.push(selectedPositionId);
+            positionRecords.set(selectedPositionId, {
+              id: selectedPositionId,
+              assetId: asset.id,
+              type: "LONG",
+              cumulativeCost: null,
+            });
+          }
+        }
+        positionId = selectedPositionId;
+
+        if (!positionRecords.has(positionId)) {
+          positionRecords.set(positionId, {
+            id: positionId,
+            assetId: asset.id,
+            type: "LONG",
+            cumulativeCost: null,
+          });
+        }
+
+        const existingShares = positionShares.get(positionId) ?? 0;
+        if (type === "BUY" || type === "DIVIDEND_SHARE") {
+          positionShares.set(positionId, existingShares + tx.shares);
+        } else if (type === "SELL") {
+          positionShares.set(positionId, existingShares - tx.shares);
+        } else {
+          positionShares.set(positionId, existingShares);
+        }
+
+        if (!positionTxBuckets.has(positionId)) {
+          positionTxBuckets.set(positionId, []);
+        }
+        positionTxBuckets.get(positionId)!.push(tx);
+      }
+
+      let txId = txMeta?.id ?? nextTransactionId;
+      while (usedTransactionIds.has(txId)) {
+        txId += 1;
+      }
+      usedTransactionIds.add(txId);
+      nextTransactionId = Math.max(nextTransactionId, txId + 1);
+
       assetTransactions.push({
-        id: transactionId,
-        webTxId: tx.id,
+        id: txId,
+        webTxId: txMeta?.webTxId ?? tx.id,
         currencyType: currency,
-        assetType: isCashType ? "CASH" : "STOCK",
+        assetType,
         symbol,
         year: date.getFullYear(),
         month: date.getMonth() + 1,
@@ -676,18 +1083,34 @@ function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
         _numberOfShares: encodeStored(tx.shares),
         _price: encodeStored(tx.price),
         _fee: encodeStored(tx.fee),
-        tags: null,
+        tags: txMeta?.tags ?? null,
         note: tx.note ?? "",
-        positionId: null,
+        positionId,
         portfolioId,
-        region,
-        isAutoDividend: null,
-        exDividendDate: null,
+        region: region ?? null,
+        isAutoDividend: txMeta?.isAutoDividend ?? null,
+        exDividendDate: txMeta?.exDividendDate ?? null,
       });
+    });
 
-      transactionId += 1;
+    positionTxBuckets.forEach((bucket, positionId) => {
+      const current = positionRecords.get(positionId) ?? { id: positionId };
+      positionRecords.set(positionId, {
+        ...current,
+        cumulativeCost: calculatePositionCumulativeCost(bucket),
+      });
     });
   });
+
+  const cashAssets = [...cashAssetRecords.values()].sort(
+    (a, b) => toNumber(a.id) - toNumber(b.id),
+  );
+  const assets = [...assetRecords.values()].sort(
+    (a, b) => toNumber(a.id) - toNumber(b.id),
+  );
+  const positions = [...positionRecords.values()].sort(
+    (a, b) => toNumber(a.id) - toNumber(b.id),
+  );
 
   let marketPriceId = 1;
   const manualMarketPrice: UnknownRecord[] = [];
@@ -729,11 +1152,18 @@ function buildStockerXExportObject(entities: EntityDataset[]): UnknownRecord[] {
     const fees: UnknownRecord[] = [];
 
     sortByDateAsc(entity.transactions).forEach((tx) => {
-      const currency = normalizeCurrency(tx.currency, normalizeCurrency(entity.currency, "USD"));
+      const currency = normalizeCurrency(
+        tx.currency,
+        normalizeCurrency(entity.currency, "USD"),
+      );
       const symbol = normalizeSymbol(tx.symbol) || currency;
       const isoDate = tx.date.toISOString();
 
-      if (tx.type === "BUY" || tx.type === "SELL" || tx.type === "DIVIDEND_SHARE") {
+      if (
+        tx.type === "BUY" ||
+        tx.type === "SELL" ||
+        tx.type === "DIVIDEND_SHARE"
+      ) {
         stocks.push({
           stockSymbol: symbol,
           date: isoDate,
@@ -791,14 +1221,23 @@ export interface DualFormatRecords {
   stockerXJson: string;
 }
 
-export function buildDualFormatRecords(entities: EntityDataset[]): DualFormatRecords {
+export function buildDualFormatRecords(
+  entities: EntityDataset[],
+): DualFormatRecords {
   return {
-    stockerProJson: JSON.stringify(buildStockerProExportObject(entities), null, 2),
+    stockerProJson: JSON.stringify(
+      buildStockerProExportObject(entities),
+      null,
+      2,
+    ),
     stockerXJson: JSON.stringify(buildStockerXExportObject(entities), null, 2),
   };
 }
 
-export async function parseInputByType(raw: string, type: UserType): Promise<EntityDataset[]> {
+export async function parseInputByType(
+  raw: string,
+  type: UserType,
+): Promise<EntityDataset[]> {
   if (type === "new") {
     return [
       {
@@ -817,11 +1256,14 @@ export async function parseInputByType(raw: string, type: UserType): Promise<Ent
     if (!isStockerXPayload(parsed)) {
       throw new Error("Invalid StockerX format.");
     }
-    return parsed.map((item, index) => normalizeStockerXObject(item as UnknownRecord, index));
+    return parsed.map((item, index) =>
+      normalizeStockerXObject(item as UnknownRecord, index),
+    );
   }
 
   const decoded = await decodeRawPayload(raw, ["deflate", "gzip"]);
   const parsed = JSON.parse(decoded);
+  console.log("[cloud:pull] parsed:", parsed);
   if (!isStockerProPayload(parsed)) {
     throw new Error("Invalid Stocker Pro format.");
   }
