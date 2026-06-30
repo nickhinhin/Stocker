@@ -620,6 +620,108 @@ function normalizeCurrency(value: unknown, fallback = "USD"): string {
   return normalized || fallback;
 }
 
+function dedupeCurrencyTypes(currencyTypes: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  currencyTypes.forEach((currencyType) => {
+    const normalized = normalizeCurrency(currencyType, "");
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  });
+  return output;
+}
+
+function collectNextPortfolioMetaId(entities: EntityDataset[]): number {
+  let nextPortfolioMetaId = 1;
+  entities.forEach((entity, index) => {
+    const metaId = Math.trunc(toNumber(entity.stockerProMeta?.portfolio.id));
+    if (metaId > 0) {
+      nextPortfolioMetaId = Math.max(nextPortfolioMetaId, metaId + 1);
+      return;
+    }
+    const fallbackId = Math.trunc(toNumber(entity.id));
+    if (fallbackId > 0) {
+      nextPortfolioMetaId = Math.max(nextPortfolioMetaId, fallbackId + 1);
+      return;
+    }
+    nextPortfolioMetaId = Math.max(nextPortfolioMetaId, index + 2);
+  });
+  return nextPortfolioMetaId;
+}
+
+function collectNextCashAssetId(entities: EntityDataset[]): number {
+  let nextCashAssetId = 1;
+  entities.forEach((entity) => {
+    Object.values(entity.stockerProMeta?.cashAssetsByCurrency ?? {}).forEach(
+      (cashAsset) => {
+        const cashAssetId = Math.trunc(toNumber(cashAsset.id));
+        if (cashAssetId > 0) {
+          nextCashAssetId = Math.max(nextCashAssetId, cashAssetId + 1);
+        }
+      },
+    );
+  });
+  return nextCashAssetId;
+}
+
+interface BuildPortfolioEntityInput {
+  id: string;
+  name: string;
+  currencyTypes: string[];
+  existingEntities: EntityDataset[];
+}
+
+export function buildPortfolioEntityWithMeta(
+  input: BuildPortfolioEntityInput,
+): EntityDataset {
+  const nextPortfolioMetaId = collectNextPortfolioMetaId(input.existingEntities);
+  const requestedId = input.id.trim();
+  // Keep entity.id aligned with persisted portfolio.id to avoid cloud merge loops.
+  const portfolioId = requestedId || String(nextPortfolioMetaId);
+  const portfolioName = input.name.trim() || "Portfolio";
+  const uniqueCurrencyTypes = dedupeCurrencyTypes(input.currencyTypes);
+  const currencies =
+    uniqueCurrencyTypes.length > 0 ? uniqueCurrencyTypes : ["USD"];
+  const displayCurrencyType = currencies[0];
+  let nextCashAssetId = collectNextCashAssetId(input.existingEntities);
+
+  const cashAssetsByCurrency: Record<string, StockerProCashAssetMeta> = {};
+  currencies.forEach((currencyType) => {
+    cashAssetsByCurrency[currencyType] = {
+      id: nextCashAssetId,
+      currencyType,
+      portfolioId: nextPortfolioMetaId,
+    };
+    nextCashAssetId += 1;
+  });
+
+  return {
+    id: portfolioId,
+    name: portfolioName,
+    currency: displayCurrencyType,
+    transactions: [],
+    latestPriceBySymbol: {},
+    stockerProMeta: {
+      portfolio: {
+        id: nextPortfolioMetaId,
+        webId: requestedId || undefined,
+        name: portfolioName,
+        tags: null,
+        note: "",
+        displayCurrencyType,
+        displayOrder: null,
+      },
+      assetsBySymbol: {},
+      positionsById: {},
+      positionIdsByAssetId: {},
+      cashAssetsByCurrency,
+    },
+  };
+}
+
 function encodeStored(value: number): number {
   return Math.round(toNumber(value) * 100_000_000_000_000);
 }
@@ -790,6 +892,303 @@ function calculatePositionCumulativeCost(
     }
   }
   return Number(cost.toFixed(8));
+}
+
+const POSITION_ZERO_EPSILON = 1e-8;
+
+function isPositionFlat(shares: number): boolean {
+  return Math.abs(shares) <= POSITION_ZERO_EPSILON;
+}
+
+function sortTransactionsForPositionReassign(
+  transactions: NormalizedTransaction[],
+): NormalizedTransaction[] {
+  return [...transactions].sort((left, right) => {
+    const byDate = left.date.getTime() - right.date.getTime();
+    if (byDate !== 0) {
+      return byDate;
+    }
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function resolvePortfolioMetaId(
+  entity: EntityDataset,
+  meta: StockerProEntityMeta | undefined,
+): number {
+  const preferredId = Math.trunc(meta?.portfolio.id ?? toNumber(entity.id));
+  if (preferredId > 0) {
+    return preferredId;
+  }
+  return stablePositiveIntFromText(entity.id || entity.name, 1);
+}
+
+export function reassignEntityPositions(entity: EntityDataset): EntityDataset {
+  const previousMeta = entity.stockerProMeta;
+  const portfolioId = resolvePortfolioMetaId(entity, previousMeta);
+  const portfolioCurrency = normalizeCurrency(entity.currency, "USD");
+
+  const assetsBySymbol: Record<string, StockerProAssetMeta> =
+    Object.fromEntries(
+      Object.entries(previousMeta?.assetsBySymbol ?? {}).map(([key, value]) => [
+        key,
+        {
+          ...value,
+          symbol: normalizeSymbol(value.symbol),
+          currencyType: normalizeCurrency(
+            value.currencyType,
+            portfolioCurrency,
+          ),
+        },
+      ]),
+    );
+  const cashAssetsByCurrency: Record<string, StockerProCashAssetMeta> = {
+    ...(previousMeta?.cashAssetsByCurrency ?? {}),
+  };
+
+  let nextAssetId = 1;
+  Object.values(assetsBySymbol).forEach((asset) => {
+    nextAssetId = Math.max(nextAssetId, Math.trunc(toNumber(asset.id)) + 1);
+  });
+  Object.values(previousMeta?.positionsById ?? {}).forEach((position) => {
+    nextAssetId = Math.max(
+      nextAssetId,
+      Math.trunc(toNumber(position.assetId)) + 1,
+    );
+  });
+
+  let nextPositionId = 1;
+  Object.values(previousMeta?.positionsById ?? {}).forEach((position) => {
+    nextPositionId = Math.max(
+      nextPositionId,
+      Math.trunc(toNumber(position.id)) + 1,
+    );
+  });
+
+  const sortedTransactions = sortTransactionsForPositionReassign(
+    entity.transactions,
+  );
+  const positionIdsByAssetId = new Map<number, number[]>();
+  const positionsById = new Map<number, StockerProPositionMeta>();
+  const positionStateByAsset = new Map<
+    string,
+    { positionId: number | null; shares: number }
+  >();
+
+  const ensureAsset = (
+    symbol: string,
+    currency: string,
+    region: string | null | undefined,
+  ): StockerProAssetMeta => {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    const normalizedCurrency = normalizeCurrency(currency, portfolioCurrency);
+    const key = `${normalizedSymbol}|${normalizedCurrency}`;
+    const existing = assetsBySymbol[key];
+    if (existing) {
+      return existing;
+    }
+
+    const created: StockerProAssetMeta = {
+      id: nextAssetId,
+      currencyType: normalizedCurrency,
+      assetType: "STOCK",
+      symbol: normalizedSymbol,
+      tags: null,
+      note: "",
+      assetName: null,
+      portfolioId,
+      region: region ?? "OTHERS",
+      displayOrder: null,
+    };
+    nextAssetId += 1;
+    assetsBySymbol[key] = created;
+    return created;
+  };
+
+  const ensurePosition = (
+    assetId: number,
+    requestedType: "LONG" | "SHORT",
+    state: { positionId: number | null; shares: number },
+  ): number => {
+    if (state.positionId != null) {
+      return state.positionId;
+    }
+    const createdPositionId = nextPositionId;
+    nextPositionId += 1;
+    state.positionId = createdPositionId;
+    state.shares = 0;
+
+    const currentIds = positionIdsByAssetId.get(assetId) ?? [];
+    currentIds.push(createdPositionId);
+    positionIdsByAssetId.set(assetId, currentIds);
+
+    positionsById.set(createdPositionId, {
+      id: createdPositionId,
+      assetId,
+      type: requestedType,
+      cumulativeCost: null,
+    });
+
+    return createdPositionId;
+  };
+
+  const reassignedTransactions = sortedTransactions.map((tx) => {
+    const normalizedCurrency = normalizeCurrency(
+      tx.currency,
+      portfolioCurrency,
+    );
+    const normalizedSymbol = normalizeSymbol(tx.symbol) || normalizedCurrency;
+    const txMeta = tx.stockerProMeta;
+    const cashLike = isCashLikeType(
+      tx.type,
+      normalizedSymbol,
+      normalizedCurrency,
+    );
+
+    if (cashLike) {
+      if (!txMeta) {
+        return tx;
+      }
+      return {
+        ...tx,
+        stockerProMeta: {
+          ...txMeta,
+          portfolioId,
+          positionId: null,
+        },
+      };
+    }
+
+    const asset = ensureAsset(
+      normalizedSymbol,
+      normalizedCurrency,
+      txMeta?.region,
+    );
+    const assetKey = `${asset.symbol}|${asset.currencyType}`;
+    const state = positionStateByAsset.get(assetKey) ?? {
+      positionId: null,
+      shares: 0,
+    };
+    positionStateByAsset.set(assetKey, state);
+
+    let assignedPositionId: number;
+    switch (tx.type) {
+      case "BUY":
+      case "DIVIDEND_SHARE": {
+        assignedPositionId = ensurePosition(asset.id, "LONG", state);
+        state.shares += tx.shares;
+        break;
+      }
+      case "SELL": {
+        assignedPositionId = ensurePosition(asset.id, "SHORT", state);
+        state.shares -= tx.shares;
+        break;
+      }
+      default: {
+        assignedPositionId = ensurePosition(asset.id, "LONG", state);
+        break;
+      }
+    }
+
+    if (isPositionFlat(state.shares)) {
+      state.positionId = null;
+      state.shares = 0;
+    }
+
+    const nextTxMeta: StockerProTransactionMeta = {
+      ...(txMeta ?? { portfolioId }),
+      portfolioId,
+      assetType: txMeta?.assetType ?? "STOCK",
+      region: txMeta?.region ?? asset.region ?? "OTHERS",
+      positionId: assignedPositionId,
+    };
+
+    return {
+      ...tx,
+      symbol: normalizedSymbol,
+      currency: normalizedCurrency,
+      stockerProMeta: nextTxMeta,
+    };
+  });
+
+  const finalPositionTxBuckets = new Map<number, NormalizedTransaction[]>();
+  reassignedTransactions.forEach((tx) => {
+    const positionId = tx.stockerProMeta?.positionId;
+    if (positionId == null) {
+      return;
+    }
+    const bucket = finalPositionTxBuckets.get(positionId) ?? [];
+    bucket.push(tx);
+    finalPositionTxBuckets.set(positionId, bucket);
+  });
+
+  const nextPositionsById = new Map<number, StockerProPositionMeta>();
+  const nextPositionIdsByAssetId = new Map<number, number[]>();
+  finalPositionTxBuckets.forEach((bucket, positionId) => {
+    // Drop positions that have no attached transactions.
+    if (bucket.length <= 0) {
+      return;
+    }
+    const previous = positionsById.get(positionId);
+    if (!previous) {
+      return;
+    }
+    const nextPosition: StockerProPositionMeta = {
+      ...previous,
+      cumulativeCost: calculatePositionCumulativeCost(bucket),
+    };
+    nextPositionsById.set(positionId, nextPosition);
+    const currentIds = nextPositionIdsByAssetId.get(nextPosition.assetId) ?? [];
+    currentIds.push(positionId);
+    nextPositionIdsByAssetId.set(nextPosition.assetId, currentIds);
+  });
+
+  const activeAssetIds = new Set<number>(nextPositionIdsByAssetId.keys());
+  const nextAssetsBySymbol: Record<string, StockerProAssetMeta> =
+    Object.fromEntries(
+      Object.entries(assetsBySymbol).filter(([, asset]) =>
+        activeAssetIds.has(asset.id),
+      ),
+    );
+
+  const nextMeta: StockerProEntityMeta = {
+    portfolio: previousMeta?.portfolio
+      ? {
+          ...previousMeta.portfolio,
+          id: portfolioId,
+          displayCurrencyType: normalizeCurrency(
+            previousMeta.portfolio.displayCurrencyType,
+            portfolioCurrency,
+          ),
+        }
+      : {
+          id: portfolioId,
+          webId: undefined,
+          name: entity.name,
+          tags: null,
+          note: "",
+          displayCurrencyType: portfolioCurrency,
+          displayOrder: null,
+        },
+    assetsBySymbol: nextAssetsBySymbol,
+    positionsById: Object.fromEntries(nextPositionsById.entries()) as Record<
+      number,
+      StockerProPositionMeta
+    >,
+    positionIdsByAssetId: Object.fromEntries(
+      [...nextPositionIdsByAssetId.entries()].map(([assetId, ids]) => [
+        assetId,
+        [...ids],
+      ]),
+    ) as Record<number, number[]>,
+    cashAssetsByCurrency,
+  };
+
+  return {
+    ...entity,
+    transactions: reassignedTransactions,
+    stockerProMeta: nextMeta,
+  };
 }
 
 function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
@@ -1099,6 +1498,35 @@ function buildStockerProExportObject(entities: EntityDataset[]): UnknownRecord {
         ...current,
         cumulativeCost: calculatePositionCumulativeCost(bucket),
       });
+    });
+
+    const activePositionIds = new Set<number>(positionTxBuckets.keys());
+    const entityPositionIds = new Set<number>();
+    positionIdsByAssetId.forEach((ids) => {
+      ids.forEach((id) => entityPositionIds.add(id));
+    });
+    entityPositionIds.forEach((positionId) => {
+      if (!activePositionIds.has(positionId)) {
+        positionRecords.delete(positionId);
+      }
+    });
+
+    const activeAssetIds = new Set<number>();
+    activePositionIds.forEach((positionId) => {
+      const position = positionRecords.get(positionId);
+      if (!position) {
+        return;
+      }
+      activeAssetIds.add(toNumber(position.assetId));
+    });
+    const entityAssetIds = new Set<number>();
+    assetByKey.forEach((asset) => {
+      entityAssetIds.add(toNumber(asset.id));
+    });
+    entityAssetIds.forEach((assetId) => {
+      if (!activeAssetIds.has(assetId)) {
+        assetRecords.delete(assetId);
+      }
     });
   });
 

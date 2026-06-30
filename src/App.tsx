@@ -64,9 +64,11 @@ import {
   googleProvider,
 } from "./lib/firebaseClient";
 import {
+  buildPortfolioEntityWithMeta,
   buildDualFormatRecords,
   normalizeAiPayloadToEntities,
   parseInputByType,
+  reassignEntityPositions,
 } from "./lib/formatParser";
 import {
   fetchLocalStockData,
@@ -132,6 +134,11 @@ interface TransactionDraft {
   fee: string;
   currency: string;
   note: string;
+}
+
+interface NewPortfolioDraft {
+  name: string;
+  currencyType: string;
 }
 
 interface WebSettings {
@@ -2523,6 +2530,52 @@ function buildDefaultDraft(
   };
 }
 
+function buildDefaultNewPortfolioDraft(
+  defaultCurrency: string,
+): NewPortfolioDraft {
+  return {
+    name: "",
+    currencyType: normalizeCurrencyCode(defaultCurrency) || "USD",
+  };
+}
+
+function cascadeDeletePortfolioEntity(entity: EntityDataset): EntityDataset {
+  if (!entity.stockerProMeta) {
+    return {
+      ...entity,
+      transactions: [],
+      latestPriceBySymbol: {},
+    };
+  }
+
+  // 1) Delete assets. 2) Delete positions attached to deleted assets.
+  const afterAssetAndPositionDelete: EntityDataset = {
+    ...entity,
+    stockerProMeta: {
+      ...entity.stockerProMeta,
+      assetsBySymbol: {},
+      positionsById: {},
+      positionIdsByAssetId: {},
+    },
+  };
+
+  // 3) Delete cash assets.
+  const afterCashDelete: EntityDataset = {
+    ...afterAssetAndPositionDelete,
+    stockerProMeta: {
+      ...afterAssetAndPositionDelete.stockerProMeta!,
+      cashAssetsByCurrency: {},
+    },
+  };
+
+  // 4) Delete activities.
+  return {
+    ...afterCashDelete,
+    transactions: [],
+    latestPriceBySymbol: {},
+  };
+}
+
 export default function App(): JSX.Element {
   const [screen, setScreen] = useState<Screen>("choose");
   const [activeTab, setActiveTab] = useState<DashboardTab>("dashboard");
@@ -2554,6 +2607,11 @@ export default function App(): JSX.Element {
   const [draft, setDraft] = useState<TransactionDraft>(
     buildDefaultDraft("", "USD"),
   );
+  const [isNewPortfolioModalOpen, setNewPortfolioModalOpen] = useState(false);
+  const [newPortfolioDraft, setNewPortfolioDraft] = useState<NewPortfolioDraft>(
+    buildDefaultNewPortfolioDraft(DEFAULT_SETTINGS.defaultCurrency),
+  );
+  const [newPortfolioError, setNewPortfolioError] = useState("");
   const [transactionError, setTransactionError] = useState("");
   const [pendingCashReview, setPendingCashReview] =
     useState<PendingCashReview | null>(null);
@@ -2746,6 +2804,10 @@ export default function App(): JSX.Element {
               serializeEntitiesForCloudSync(mergedEntities);
             syncTrace("persist:merged", buildSyncSummary(mergedEntities));
             const { stockerProJson } = buildDualFormatRecords(mergedEntities);
+            console.log(
+              "[cloud:push] payload to write:",
+              JSON.parse(stockerProJson),
+            );
             const compressed =
               await compressStringToDeflateBase64(stockerProJson);
             const payload: Record<string, unknown> = {
@@ -2959,6 +3021,32 @@ export default function App(): JSX.Element {
       }
     }
   }, [persistCloudData]);
+
+  const queueCloudPersistForEntities = useCallback(
+    (nextEntities: EntityDataset[]): void => {
+      if (
+        !authUser ||
+        isAuthLoading ||
+        !isCloudReady ||
+        cloudHydratingRef.current ||
+        screen !== "dashboard"
+      ) {
+        return;
+      }
+      const serialized = serializeEntitiesForCloudSync(nextEntities);
+      if (!serialized.trim() || serialized === lastCloudSerializedRef.current) {
+        return;
+      }
+      cloudPersistQueueRef.current = {
+        user: authUser,
+        entities: nextEntities,
+        serialized,
+      };
+      syncTrace("persist:queued:portfolio-mutation", buildSyncSummary(nextEntities));
+      void drainCloudPersistQueue();
+    },
+    [authUser, drainCloudPersistQueue, isAuthLoading, isCloudReady, screen],
+  );
 
   const openLoginFlow = (): void => {
     if (hasAcceptedBetaRisk) {
@@ -3213,38 +3301,8 @@ export default function App(): JSX.Element {
   }, [entities, screen]);
 
   useEffect(() => {
-    if (
-      !authUser ||
-      isAuthLoading ||
-      !isCloudReady ||
-      cloudHydratingRef.current
-    ) {
-      return;
-    }
-    if (screen !== "dashboard") {
-      return;
-    }
-
-    const serialized = serializeEntitiesForCloudSync(entities);
-    if (!serialized.trim() || serialized === lastCloudSerializedRef.current) {
-      return;
-    }
-
-    cloudPersistQueueRef.current = {
-      user: authUser,
-      entities,
-      serialized,
-    };
-    syncTrace("persist:queued", buildSyncSummary(entities));
-    void drainCloudPersistQueue();
-  }, [
-    authUser,
-    drainCloudPersistQueue,
-    entities,
-    isAuthLoading,
-    isCloudReady,
-    screen,
-  ]);
+    queueCloudPersistForEntities(entities);
+  }, [entities, queueCloudPersistForEntities]);
 
   const filteredEntities = useMemo(() => {
     if (selectedPortfolioId === "all") {
@@ -4814,16 +4872,84 @@ export default function App(): JSX.Element {
 
   const applyImportedEntities = useCallback(
     (parsed: EntityDataset[]): void => {
-      setEntities(parsed);
-      setSelectedPortfolioIdWithTrace(
-        ALL_PORTFOLIO_ID,
-        "import:applyImportedEntities",
-      );
+      if (parsed.length === 0) {
+        return;
+      }
+
+      const previousEntities = [...entities];
+      const usedPortfolioIds = new Set(previousEntities.map((entity) => entity.id));
+      const createdPortfolioIds: string[] = [];
+      let nextEntities = [...previousEntities];
+
+      try {
+        parsed.forEach((incomingEntity, index) => {
+          const nextPortfolioId = buildSafePortfolioId(
+            incomingEntity.id,
+            `portfolio-import-${index + 1}`,
+            usedPortfolioIds,
+          );
+          const baseCurrency =
+            normalizeCurrencyCode(incomingEntity.currency) || "USD";
+          const currencyTypes = [
+            baseCurrency,
+            ...Object.keys(
+              incomingEntity.stockerProMeta?.cashAssetsByCurrency ?? {},
+            ),
+            ...incomingEntity.transactions.map(
+              (tx) => normalizeCurrencyCode(tx.currency) || baseCurrency,
+            ),
+          ];
+          const createdPortfolio = buildPortfolioEntityWithMeta({
+            id: nextPortfolioId,
+            name: incomingEntity.name,
+            currencyTypes,
+            existingEntities: nextEntities,
+          });
+          createdPortfolioIds.push(nextPortfolioId);
+
+          const normalizedTransactions = sortTransactionsByDateAsc(
+            incomingEntity.transactions.map((tx, txIndex) => ({
+              ...tx,
+              id: tx.id || `imp-${nextPortfolioId}-${txIndex + 1}`,
+              date: Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date(),
+              currency: normalizeCurrencyCode(tx.currency) || baseCurrency,
+              symbol: tx.symbol.trim().toUpperCase(),
+            })),
+          );
+
+          const hydratedPortfolio = reassignEntityPositions({
+            ...createdPortfolio,
+            currency: baseCurrency,
+            transactions: normalizedTransactions,
+            latestPriceBySymbol: buildLatestPriceBySymbol(normalizedTransactions),
+          });
+
+          nextEntities = [...nextEntities, hydratedPortfolio];
+        });
+
+        setEntities(nextEntities);
+      } catch (error) {
+        const rollbackSet = new Set(createdPortfolioIds);
+        const rolledBackEntities = nextEntities.filter(
+          (entity) => !rollbackSet.has(entity.id),
+        );
+        const fallbackEntities =
+          rolledBackEntities.length > 0 ? rolledBackEntities : previousEntities;
+        setEntities(fallbackEntities);
+        setErrorMessage(
+          error instanceof Error
+            ? error.message
+            : t("Import failed and has been rolled back.", "匯入失敗，已回滾新增組合。"),
+        );
+        return;
+      }
+
+      setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "import:applyImportedEntities");
       setSelectedStockId("");
       setSelectedRange("1Y");
       setScreen("dashboard");
     },
-    [setSelectedPortfolioIdWithTrace],
+    [entities, setSelectedPortfolioIdWithTrace, t],
   );
 
   const openImportReview = useCallback(
@@ -5516,19 +5642,30 @@ export default function App(): JSX.Element {
           ? entity.transactions.filter((tx) => tx.id !== editingTransactionId)
           : entity.transactions;
 
-        const nextTransactions =
-          entity.id === portfolioId
-            ? sortTransactionsByDateAsc([
-                ...withoutOriginal,
-                ...(autoCashTopUp ? [autoCashTopUp] : []),
-                transaction,
-              ])
-            : withoutOriginal;
+        if (entity.id !== portfolioId) {
+          return {
+            ...entity,
+            transactions: withoutOriginal,
+            latestPriceBySymbol: buildLatestPriceBySymbol(withoutOriginal),
+          };
+        }
 
-        return {
+        const nextTransactions = sortTransactionsByDateAsc([
+          ...withoutOriginal,
+          ...(autoCashTopUp ? [autoCashTopUp] : []),
+          transaction,
+        ]);
+        const reassignedEntity = reassignEntityPositions({
           ...entity,
           transactions: nextTransactions,
           latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+        });
+
+        return {
+          ...reassignedEntity,
+          latestPriceBySymbol: buildLatestPriceBySymbol(
+            reassignedEntity.transactions,
+          ),
         };
       });
     });
@@ -5605,6 +5742,11 @@ export default function App(): JSX.Element {
       fee: parseNumberish(draft.fee),
       currency,
       note: draft.note.trim(),
+      stockerProMeta: editingTransaction?.stockerProMeta
+        ? {
+            ...editingTransaction.stockerProMeta,
+          }
+        : undefined,
     };
 
     const editingTransactionId = editingTransaction?.id ?? null;
@@ -5666,40 +5808,80 @@ export default function App(): JSX.Element {
         const nextTransactions = entity.transactions.filter(
           (tx) => tx.id !== row.id,
         );
-        return {
+        const reassignedEntity = reassignEntityPositions({
           ...entity,
           transactions: nextTransactions,
           latestPriceBySymbol: buildLatestPriceBySymbol(nextTransactions),
+        });
+        return {
+          ...reassignedEntity,
+          latestPriceBySymbol: buildLatestPriceBySymbol(
+            reassignedEntity.transactions,
+          ),
         };
       }),
     );
   };
 
+  const applyPortfolioMutation = useCallback(
+    (
+      updater: (previous: EntityDataset[]) => EntityDataset[],
+      options: {
+        selectedPortfolioId?: string;
+        selectionReason?: string;
+      } = {},
+    ): void => {
+      const nextEntities = updater(entities);
+      if (nextEntities === entities) {
+        return;
+      }
+      setEntities(nextEntities);
+      if (options.selectedPortfolioId) {
+        setSelectedPortfolioIdWithTrace(
+          options.selectedPortfolioId,
+          options.selectionReason ?? "portfolio:mutation",
+        );
+      }
+    },
+    [entities, setSelectedPortfolioIdWithTrace],
+  );
+
+  const openCreatePortfolioModal = (): void => {
+    setNewPortfolioDraft(
+      buildDefaultNewPortfolioDraft(settings.defaultCurrency || "USD"),
+    );
+    setNewPortfolioError("");
+    setNewPortfolioModalOpen(true);
+  };
+
+  const closeCreatePortfolioModal = (): void => {
+    setNewPortfolioModalOpen(false);
+    setNewPortfolioError("");
+  };
+
   const createPortfolio = (): void => {
-    const name = window.prompt(t("Portfolio name", "投資組合名稱"));
-    if (!name || !name.trim()) {
+    const name = newPortfolioDraft.name.trim();
+    if (!name) {
+      setNewPortfolioError(t("Portfolio name is required.", "請輸入投資組合名稱。"));
       return;
     }
-
-    const currencyInput =
-      window.prompt(
-        t("Portfolio currency (e.g. USD)", "組合貨幣（例如 USD）"),
-        settings.defaultCurrency,
-      ) ?? settings.defaultCurrency;
-    const currency = currencyInput.trim().toUpperCase() || "USD";
-    const id = `portfolio-${Date.now()}`;
-
-    setEntities((previous) => [
-      ...previous,
+    const currencyType =
+      normalizeCurrencyCode(newPortfolioDraft.currencyType) || "USD";
+    const nextPortfolio = buildPortfolioEntityWithMeta({
+      id: "",
+      name,
+      currencyTypes: [currencyType],
+      existingEntities: entities,
+    });
+    const createdPortfolioId = nextPortfolio.id;
+    applyPortfolioMutation(
+      () => [...entities, nextPortfolio],
       {
-        id,
-        name: name.trim(),
-        currency,
-        transactions: [],
-        latestPriceBySymbol: {},
+        selectedPortfolioId: createdPortfolioId,
+        selectionReason: "portfolio:create",
       },
-    ]);
-    setSelectedPortfolioIdWithTrace(id, "portfolio:create");
+    );
+    closeCreatePortfolioModal();
   };
 
   const renamePortfolio = (): void => {
@@ -5720,15 +5902,26 @@ export default function App(): JSX.Element {
       return;
     }
 
-    setEntities((previous) =>
-      previous.map((entity) =>
-        entity.id === selectedPortfolioId
-          ? {
-              ...entity,
-              name: nextName.trim(),
-            }
-          : entity,
-      ),
+    const normalizedName = nextName.trim();
+    applyPortfolioMutation((previous) =>
+      previous.map((entity) => {
+        if (entity.id !== selectedPortfolioId) {
+          return entity;
+        }
+        return {
+          ...entity,
+          name: normalizedName,
+          stockerProMeta: entity.stockerProMeta
+            ? {
+                ...entity.stockerProMeta,
+                portfolio: {
+                  ...entity.stockerProMeta.portfolio,
+                  name: normalizedName,
+                },
+              }
+            : entity.stockerProMeta,
+        };
+      }),
     );
   };
 
@@ -5752,7 +5945,24 @@ export default function App(): JSX.Element {
       return;
     }
 
-    setEntities((previous) =>
+    const cascadedEntity = cascadeDeletePortfolioEntity(target);
+    if (
+      Object.keys(cascadedEntity.stockerProMeta?.assetsBySymbol ?? {}).length > 0 ||
+      Object.keys(cascadedEntity.stockerProMeta?.positionsById ?? {}).length > 0 ||
+      Object.keys(cascadedEntity.stockerProMeta?.cashAssetsByCurrency ?? {})
+        .length > 0 ||
+      cascadedEntity.transactions.length > 0
+    ) {
+      setErrorMessage(
+        t(
+          "Failed to cascade-delete portfolio dependencies.",
+          "刪除組合關聯資料失敗，已中止刪除。",
+        ),
+      );
+      return;
+    }
+
+    applyPortfolioMutation((previous) =>
       previous.filter((entity) => entity.id !== selectedPortfolioId),
     );
     setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "portfolio:delete");
@@ -7023,7 +7233,7 @@ export default function App(): JSX.Element {
                   <button
                     type="button"
                     className="primary-btn"
-                    onClick={createPortfolio}
+                    onClick={openCreatePortfolioModal}
                   >
                     {t("New Portfolio", "新增組合")}
                   </button>
@@ -7088,6 +7298,7 @@ export default function App(): JSX.Element {
                 </div>
               </section>
 
+              {false && (
               <section className="table-panel">
                 <div className="panel-head slim">
                   <h3>{t("Import / Export", "匯入 / 匯出")}</h3>
@@ -7193,6 +7404,7 @@ export default function App(): JSX.Element {
                   )}
                 </p>
               </section>
+              )}
             </section>
           )}
 
@@ -7950,6 +8162,78 @@ export default function App(): JSX.Element {
                   )}
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isNewPortfolioModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={closeCreatePortfolioModal}
+        >
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>{t("New Portfolio", "新增組合")}</h3>
+            <div className="form-grid">
+              <label>
+                {t("Portfolio name", "投資組合名稱")}
+                <input
+                  value={newPortfolioDraft.name}
+                  onChange={(event) =>
+                    setNewPortfolioDraft((previous) => ({
+                      ...previous,
+                      name: event.target.value,
+                    }))
+                  }
+                  placeholder={t("Required", "必填")}
+                  autoFocus
+                />
+              </label>
+              <label>
+                {t("Display currency", "顯示幣別")}
+                <select
+                  value={newPortfolioDraft.currencyType}
+                  onChange={(event) =>
+                    setNewPortfolioDraft((previous) => ({
+                      ...previous,
+                      currencyType: event.target.value,
+                    }))
+                  }
+                >
+                  {[...new Set(displayCurrencyOptions)]
+                    .filter((currency) => currency !== "AUTO")
+                    .map((currency) => (
+                      <option key={currency} value={currency}>
+                        {currency}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            </div>
+            {newPortfolioError && (
+              <div className="error-text">{newPortfolioError}</div>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={closeCreatePortfolioModal}
+              >
+                {t("Cancel", "取消")}
+              </button>
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={createPortfolio}
+              >
+                {t("Create", "建立")}
+              </button>
             </div>
           </div>
         </div>
