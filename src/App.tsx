@@ -10,7 +10,15 @@ import {
   onSnapshot,
   runTransaction,
   serverTimestamp,
+  setDoc,
 } from "firebase/firestore";
+import {
+  deleteObject,
+  getDownloadURL,
+  ref as storageRef,
+  type StorageReference,
+  uploadBytes,
+} from "firebase/storage";
 import { deflate, inflate } from "pako";
 import {
   ChangeEvent,
@@ -21,6 +29,7 @@ import {
   useRef,
   useState,
 } from "react";
+import Dropzone from "shadcn-dropzone";
 import stockerWordmark from "./assets/stocker-wordmark.png";
 import AreaChart from "./components/AreaChart";
 import BarChart from "./components/BarChart";
@@ -60,12 +69,13 @@ import {
 import {
   firebaseAuth,
   firebaseDatabaseCollection,
+  firebaseStorage,
   firestoreDb,
   googleProvider,
 } from "./lib/firebaseClient";
 import {
-  buildPortfolioEntityWithMeta,
   buildDualFormatRecords,
+  buildPortfolioEntityWithMeta,
   normalizeAiPayloadToEntities,
   parseInputByType,
   reassignEntityPositions,
@@ -140,6 +150,28 @@ interface NewPortfolioDraft {
   name: string;
   currencyType: string;
 }
+
+interface IssueReportImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+interface IssueReportImageRecord {
+  downloadUrl: string;
+  storagePath: string;
+  fileName: string;
+  contentType: string;
+  size: number;
+}
+
+const ISSUE_REPORT_MAX_IMAGES = 5;
+const ISSUE_REPORT_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const ISSUE_REPORT_ACCEPTED_IMAGES = {
+  "image/jpeg": [".jpg", ".jpeg"],
+  "image/png": [".png"],
+  "image/webp": [".webp"],
+};
 
 interface WebSettings {
   language: Locale;
@@ -2576,6 +2608,14 @@ function cascadeDeletePortfolioEntity(entity: EntityDataset): EntityDataset {
   };
 }
 
+function sanitizeStorageFileName(fileName: string): string {
+  const normalized = fileName
+    .normalize("NFKD")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized.slice(0, 120) || "image";
+}
+
 export default function App(): JSX.Element {
   const [screen, setScreen] = useState<Screen>("choose");
   const [activeTab, setActiveTab] = useState<DashboardTab>("dashboard");
@@ -2665,6 +2705,14 @@ export default function App(): JSX.Element {
   const [hasAcceptedBetaRisk, setHasAcceptedBetaRisk] = useState(false);
   const [showBetaConsentModal, setShowBetaConsentModal] = useState(false);
   const [betaConsentChecked, setBetaConsentChecked] = useState(false);
+  const [isIssueReportOpen, setIssueReportOpen] = useState(false);
+  const [issueContactEmail, setIssueContactEmail] = useState("");
+  const [issueDescription, setIssueDescription] = useState("");
+  const [issueTestingConsent, setIssueTestingConsent] = useState(false);
+  const [issueImages, setIssueImages] = useState<IssueReportImage[]>([]);
+  const [issueReportError, setIssueReportError] = useState("");
+  const [issueReportSuccess, setIssueReportSuccess] = useState("");
+  const [isIssueReportSubmitting, setIssueReportSubmitting] = useState(false);
   const [isCloudLoading, setCloudLoading] = useState(false);
   const [isCloudSaving, setCloudSaving] = useState(false);
   const [cloudStatusMessage, setCloudStatusMessage] = useState("");
@@ -2686,6 +2734,7 @@ export default function App(): JSX.Element {
   const lastCloudSerializedRef = useRef("");
   const latestCloudUpdatedAtMsRef = useRef(0);
   const cloudPersistInFlightRef = useRef(false);
+  const issueImagesRef = useRef<IssueReportImage[]>([]);
   const cloudPersistQueueRef = useRef<{
     user: User;
     entities: EntityDataset[];
@@ -2698,6 +2747,19 @@ export default function App(): JSX.Element {
     (en: string, zh: string): string => (isZh ? zh : en),
     [isZh],
   );
+  useEffect(() => {
+    issueImagesRef.current = issueImages;
+  }, [issueImages]);
+
+  useEffect(
+    () => () => {
+      issueImagesRef.current.forEach((image) =>
+        URL.revokeObjectURL(image.previewUrl),
+      );
+    },
+    [],
+  );
+
   const rangeTitle = (preset: ChartRangePreset): string =>
     isZh ? TIME_RANGE_TITLES_ZH[preset] : TIME_RANGE_TITLES[preset];
   const dateFilterLabel = (
@@ -3042,7 +3104,10 @@ export default function App(): JSX.Element {
         entities: nextEntities,
         serialized,
       };
-      syncTrace("persist:queued:portfolio-mutation", buildSyncSummary(nextEntities));
+      syncTrace(
+        "persist:queued:portfolio-mutation",
+        buildSyncSummary(nextEntities),
+      );
       void drainCloudPersistQueue();
     },
     [authUser, drainCloudPersistQueue, isAuthLoading, isCloudReady, screen],
@@ -4877,7 +4942,9 @@ export default function App(): JSX.Element {
       }
 
       const previousEntities = [...entities];
-      const usedPortfolioIds = new Set(previousEntities.map((entity) => entity.id));
+      const usedPortfolioIds = new Set(
+        previousEntities.map((entity) => entity.id),
+      );
       const createdPortfolioIds: string[] = [];
       let nextEntities = [...previousEntities];
 
@@ -4911,7 +4978,9 @@ export default function App(): JSX.Element {
             incomingEntity.transactions.map((tx, txIndex) => ({
               ...tx,
               id: tx.id || `imp-${nextPortfolioId}-${txIndex + 1}`,
-              date: Number.isFinite(tx.date.getTime()) ? new Date(tx.date) : new Date(),
+              date: Number.isFinite(tx.date.getTime())
+                ? new Date(tx.date)
+                : new Date(),
               currency: normalizeCurrencyCode(tx.currency) || baseCurrency,
               symbol: tx.symbol.trim().toUpperCase(),
             })),
@@ -4921,7 +4990,9 @@ export default function App(): JSX.Element {
             ...createdPortfolio,
             currency: baseCurrency,
             transactions: normalizedTransactions,
-            latestPriceBySymbol: buildLatestPriceBySymbol(normalizedTransactions),
+            latestPriceBySymbol: buildLatestPriceBySymbol(
+              normalizedTransactions,
+            ),
           });
 
           nextEntities = [...nextEntities, hydratedPortfolio];
@@ -4939,12 +5010,18 @@ export default function App(): JSX.Element {
         setErrorMessage(
           error instanceof Error
             ? error.message
-            : t("Import failed and has been rolled back.", "匯入失敗，已回滾新增組合。"),
+            : t(
+                "Import failed and has been rolled back.",
+                "匯入失敗，已回滾新增組合。",
+              ),
         );
         return;
       }
 
-      setSelectedPortfolioIdWithTrace(ALL_PORTFOLIO_ID, "import:applyImportedEntities");
+      setSelectedPortfolioIdWithTrace(
+        ALL_PORTFOLIO_ID,
+        "import:applyImportedEntities",
+      );
       setSelectedStockId("");
       setSelectedRange("1Y");
       setScreen("dashboard");
@@ -5862,7 +5939,9 @@ export default function App(): JSX.Element {
   const createPortfolio = (): void => {
     const name = newPortfolioDraft.name.trim();
     if (!name) {
-      setNewPortfolioError(t("Portfolio name is required.", "請輸入投資組合名稱。"));
+      setNewPortfolioError(
+        t("Portfolio name is required.", "請輸入投資組合名稱。"),
+      );
       return;
     }
     const currencyType =
@@ -5874,13 +5953,10 @@ export default function App(): JSX.Element {
       existingEntities: entities,
     });
     const createdPortfolioId = nextPortfolio.id;
-    applyPortfolioMutation(
-      () => [...entities, nextPortfolio],
-      {
-        selectedPortfolioId: createdPortfolioId,
-        selectionReason: "portfolio:create",
-      },
-    );
+    applyPortfolioMutation(() => [...entities, nextPortfolio], {
+      selectedPortfolioId: createdPortfolioId,
+      selectionReason: "portfolio:create",
+    });
     closeCreatePortfolioModal();
   };
 
@@ -5947,8 +6023,10 @@ export default function App(): JSX.Element {
 
     const cascadedEntity = cascadeDeletePortfolioEntity(target);
     if (
-      Object.keys(cascadedEntity.stockerProMeta?.assetsBySymbol ?? {}).length > 0 ||
-      Object.keys(cascadedEntity.stockerProMeta?.positionsById ?? {}).length > 0 ||
+      Object.keys(cascadedEntity.stockerProMeta?.assetsBySymbol ?? {}).length >
+        0 ||
+      Object.keys(cascadedEntity.stockerProMeta?.positionsById ?? {}).length >
+        0 ||
       Object.keys(cascadedEntity.stockerProMeta?.cashAssetsByCurrency ?? {})
         .length > 0 ||
       cascadedEntity.transactions.length > 0
@@ -6043,6 +6121,204 @@ export default function App(): JSX.Element {
   const resetSettings = (): void => {
     setSettings(DEFAULT_SETTINGS);
     setDataImportType(DEFAULT_SETTINGS.defaultImportType);
+  };
+
+  const clearIssueImages = (): void => {
+    setIssueImages((currentImages) => {
+      currentImages.forEach((image) => URL.revokeObjectURL(image.previewUrl));
+      return [];
+    });
+  };
+
+  const openIssueReport = (): void => {
+    clearIssueImages();
+    setIssueContactEmail(authUser?.email ?? "");
+    setIssueDescription("");
+    setIssueTestingConsent(false);
+    setIssueReportError("");
+    setIssueReportSuccess("");
+    setIssueReportOpen(true);
+  };
+
+  const closeIssueReport = (): void => {
+    if (isIssueReportSubmitting) {
+      return;
+    }
+    clearIssueImages();
+    setIssueReportOpen(false);
+    setIssueReportError("");
+    setIssueReportSuccess("");
+  };
+
+  const addIssueImages = (
+    acceptedFiles: File[],
+    rejectedCount: number,
+  ): void => {
+    setIssueReportError("");
+    setIssueImages((currentImages) => {
+      const availableSlots = Math.max(
+        0,
+        ISSUE_REPORT_MAX_IMAGES - currentImages.length,
+      );
+      const existingKeys = new Set(
+        currentImages.map(
+          ({ file }) => `${file.name}:${file.size}:${file.lastModified}`,
+        ),
+      );
+      const uniqueFiles = acceptedFiles.filter(
+        (file) =>
+          !existingKeys.has(`${file.name}:${file.size}:${file.lastModified}`),
+      );
+      const filesToAdd = uniqueFiles.slice(0, availableSlots);
+      const nextImages = filesToAdd.map((file) => ({
+        id: `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`,
+        file,
+        previewUrl: URL.createObjectURL(file),
+      }));
+
+      if (
+        rejectedCount > 0 ||
+        uniqueFiles.length > availableSlots ||
+        acceptedFiles.length !== uniqueFiles.length
+      ) {
+        setIssueReportError(
+          t(
+            `Some images were not added. Use up to ${ISSUE_REPORT_MAX_IMAGES} JPEG, PNG, or WebP files under 5 MiB each.`,
+            `部分圖片未能加入。最多可上傳 ${ISSUE_REPORT_MAX_IMAGES} 張 JPEG、PNG 或 WebP 圖片，每張須小於 5 MiB。`,
+          ),
+        );
+      }
+
+      return [...currentImages, ...nextImages];
+    });
+  };
+
+  const removeIssueImage = (imageId: string): void => {
+    setIssueImages((currentImages) =>
+      currentImages.filter((image) => {
+        if (image.id === imageId) {
+          URL.revokeObjectURL(image.previewUrl);
+          return false;
+        }
+        return true;
+      }),
+    );
+    setIssueReportError("");
+  };
+
+  const submitIssueReport = async (): Promise<void> => {
+    const reportUser = authUser;
+    const email = issueContactEmail.trim();
+    const description = issueDescription.trim();
+    setIssueReportError("");
+    setIssueReportSuccess("");
+
+    if (!reportUser) {
+      setIssueReportError(
+        t("Sign in before submitting a report.", "請先登入再送出問題回報。"),
+      );
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setIssueReportError(
+        t("Enter a valid contact email.", "請輸入有效的聯絡電郵。"),
+      );
+      return;
+    }
+    if (!description) {
+      setIssueReportError(
+        t("Describe the issue before submitting.", "請先描述問題再送出。"),
+      );
+      return;
+    }
+    if (!issueTestingConsent) {
+      setIssueReportError(
+        t(
+          "You must agree to the testing-data consent before submitting.",
+          "送出前必須同意測試資料使用條款。",
+        ),
+      );
+      return;
+    }
+
+    setIssueReportSubmitting(true);
+    const creationTimestamp = Date.now();
+    const uploadedReferences: StorageReference[] = [];
+
+    try {
+      const imageRecords: IssueReportImageRecord[] = [];
+      for (const [index, image] of issueImages.entries()) {
+        const safeFileName = sanitizeStorageFileName(image.file.name);
+        const path = `web-issue-reports/${reportUser.uid}/${creationTimestamp}/${index + 1}-${safeFileName}`;
+        const imageReference = storageRef(firebaseStorage, path);
+        await uploadBytes(imageReference, image.file, {
+          contentType: image.file.type,
+          customMetadata: {
+            originalFileName: image.file.name.slice(0, 200),
+          },
+        });
+        uploadedReferences.push(imageReference);
+        imageRecords.push({
+          downloadUrl: await getDownloadURL(imageReference),
+          storagePath: path,
+          fileName: image.file.name,
+          contentType: image.file.type,
+          size: image.file.size,
+        });
+      }
+
+      const userDataReference = doc(
+        firestoreDb,
+        firebaseDatabaseCollection,
+        reportUser.uid,
+      );
+      const userDataSnapshot = await getDoc(userDataReference);
+      const userDataValue = userDataSnapshot.data()?.data;
+      const userData = typeof userDataValue === "string" ? userDataValue : null;
+
+      const reportReference = doc(
+        firestoreDb,
+        "web-issue-reports",
+        reportUser.uid,
+        "reports",
+        String(creationTimestamp),
+      );
+      await setDoc(reportReference, {
+        userId: reportUser.uid,
+        contactEmail: email,
+        description,
+        agreedToTesting: true,
+        data: userData,
+        images: imageRecords,
+        clientCreatedAt: creationTimestamp,
+        createdAt: serverTimestamp(),
+        status: "new",
+      });
+
+      clearIssueImages();
+      setIssueDescription("");
+      setIssueTestingConsent(false);
+      setIssueReportSuccess(
+        t(
+          "Your issue report was submitted. Thank you.",
+          "問題回報已送出，多謝你的協助。",
+        ),
+      );
+    } catch (error) {
+      await Promise.allSettled(
+        uploadedReferences.map((imageReference) =>
+          deleteObject(imageReference),
+        ),
+      );
+      setIssueReportError(
+        t(
+          `Unable to submit the report: ${(error as Error).message}`,
+          `未能送出問題回報：${(error as Error).message}`,
+        ),
+      );
+    } finally {
+      setIssueReportSubmitting(false);
+    }
   };
 
   const changeTab = (tab: DashboardTab): void => {
@@ -7299,111 +7575,111 @@ export default function App(): JSX.Element {
               </section>
 
               {false && (
-              <section className="table-panel">
-                <div className="panel-head slim">
-                  <h3>{t("Import / Export", "匯入 / 匯出")}</h3>
-                </div>
+                <section className="table-panel">
+                  <div className="panel-head slim">
+                    <h3>{t("Import / Export", "匯入 / 匯出")}</h3>
+                  </div>
 
-                <div className="data-tools">
-                  <label>
-                    {t("Import Type", "匯入類型")}
-                    <select
-                      value={dataImportType}
-                      onChange={(event) => {
-                        const nextType = event.target.value as UserType;
-                        setDataImportType(nextType);
-                        updateSetting("defaultImportType", nextType);
+                  <div className="data-tools">
+                    <label>
+                      {t("Import Type", "匯入類型")}
+                      <select
+                        value={dataImportType}
+                        onChange={(event) => {
+                          const nextType = event.target.value as UserType;
+                          setDataImportType(nextType);
+                          updateSetting("defaultImportType", nextType);
+                        }}
+                      >
+                        <option value="stockerx">StockerX</option>
+                        <option value="stockerpro">Stocker Pro</option>
+                      </select>
+                    </label>
+                    <label
+                      className={`upload-box compact ${isDataUploadDragOver ? "drag-over" : ""}`}
+                      onDragOver={onDataUploadDragOver}
+                      onDragLeave={onDataUploadDragLeave}
+                      onDrop={(event) => {
+                        void onDataUploadDrop(event);
                       }}
                     >
-                      <option value="stockerx">StockerX</option>
-                      <option value="stockerpro">Stocker Pro</option>
-                    </select>
-                  </label>
-                  <label
-                    className={`upload-box compact ${isDataUploadDragOver ? "drag-over" : ""}`}
-                    onDragOver={onDataUploadDragOver}
-                    onDragLeave={onDataUploadDragLeave}
-                    onDrop={(event) => {
-                      void onDataUploadDrop(event);
-                    }}
-                  >
-                    <input
-                      type="file"
-                      onChange={onDataImportFileChange}
-                      accept="*/*"
-                      multiple
-                    />
-                    <span>
-                      {loading
-                        ? t("Importing...", "正在匯入...")
-                        : t("Import and Replace Data", "匯入並覆蓋資料")}
-                    </span>
-                    <small>
-                      {t(
-                        "Supports multi-file drag and drop.",
-                        "支援多檔拖放匯入。",
-                      )}
-                    </small>
-                  </label>
+                      <input
+                        type="file"
+                        onChange={onDataImportFileChange}
+                        accept="*/*"
+                        multiple
+                      />
+                      <span>
+                        {loading
+                          ? t("Importing...", "正在匯入...")
+                          : t("Import and Replace Data", "匯入並覆蓋資料")}
+                      </span>
+                      <small>
+                        {t(
+                          "Supports multi-file drag and drop.",
+                          "支援多檔拖放匯入。",
+                        )}
+                      </small>
+                    </label>
 
-                  <button
-                    type="button"
-                    className="secondary-btn"
-                    onClick={exportWebJson}
-                    disabled={entities.length === 0}
-                  >
-                    {t("Export Web JSON", "匯出 Web JSON")}
-                  </button>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={exportWebJson}
+                      disabled={entities.length === 0}
+                    >
+                      {t("Export Web JSON", "匯出 Web JSON")}
+                    </button>
 
-                  <button
-                    type="button"
-                    className="secondary-btn"
-                    onClick={exportStockerProJson}
-                    disabled={!dualFormatRecords}
-                  >
-                    {t("Export Stocker Pro JSON", "匯出 Stocker Pro JSON")}
-                  </button>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={exportStockerProJson}
+                      disabled={!dualFormatRecords}
+                    >
+                      {t("Export Stocker Pro JSON", "匯出 Stocker Pro JSON")}
+                    </button>
 
-                  <button
-                    type="button"
-                    className="secondary-btn"
-                    onClick={exportStockerXJson}
-                    disabled={!dualFormatRecords}
-                  >
-                    {t("Export StockerX JSON", "匯出 StockerX JSON")}
-                  </button>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={exportStockerXJson}
+                      disabled={!dualFormatRecords}
+                    >
+                      {t("Export StockerX JSON", "匯出 StockerX JSON")}
+                    </button>
 
-                  <button
-                    type="button"
-                    className="secondary-btn"
-                    onClick={() => setScreen("choose")}
-                  >
-                    {t("Re-open Entry Setup", "重新打開入口設定")}
-                  </button>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={() => setScreen("choose")}
+                    >
+                      {t("Re-open Entry Setup", "重新打開入口設定")}
+                    </button>
 
-                  <button
-                    type="button"
-                    className="secondary-btn danger"
-                    onClick={clearAllData}
-                    disabled={entities.length === 0}
-                  >
-                    {t("Clear All Data", "清除全部資料")}
-                  </button>
-                </div>
+                    <button
+                      type="button"
+                      className="secondary-btn danger"
+                      onClick={clearAllData}
+                      disabled={entities.length === 0}
+                    >
+                      {t("Clear All Data", "清除全部資料")}
+                    </button>
+                  </div>
 
-                {errorMessage && (
-                  <div className="error-text">{errorMessage}</div>
-                )}
-                {importStatusMessage && (
-                  <div className="success-text">{importStatusMessage}</div>
-                )}
-                <p className="settings-hint">
-                  {t(
-                    "Each client can upload up to 20 files per month. AI normalization fallback is also quota-protected server-side.",
-                    "每個客戶端每月最多可上傳 20 個檔案，AI 轉換備援亦有伺服器配額保護。",
+                  {errorMessage && (
+                    <div className="error-text">{errorMessage}</div>
                   )}
-                </p>
-              </section>
+                  {importStatusMessage && (
+                    <div className="success-text">{importStatusMessage}</div>
+                  )}
+                  <p className="settings-hint">
+                    {t(
+                      "Each client can upload up to 20 files per month. AI normalization fallback is also quota-protected server-side.",
+                      "每個客戶端每月最多可上傳 20 個檔案，AI 轉換備援亦有伺服器配額保護。",
+                    )}
+                  </p>
+                </section>
               )}
             </section>
           )}
@@ -7596,6 +7872,214 @@ export default function App(): JSX.Element {
             </section>
           )}
         </main>
+      )}
+
+      <footer className="app-footer">
+        <button type="button" className="footer-link" onClick={openIssueReport}>
+          {t("Report an issue", "回報問題")}
+        </button>
+      </footer>
+
+      {isIssueReportOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={closeIssueReport}
+        >
+          <div
+            className="modal-card issue-report-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="issue-report-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 id="issue-report-title">{t("Report an issue", "回報問題")}</h3>
+            <div className="issue-report-intro">
+              <p>
+                {t(
+                  "Please include enough detail for us to reproduce and investigate the issue:",
+                  "請提供足夠資料，讓我們可以重現及調查問題：",
+                )}
+              </p>
+              <ul>
+                <li>{t("What is the issue?", "發生了什麼問題？")}</li>
+                <li>{t("How did you trigger it?", "你如何觸發這個問題？")}</li>
+                <li>
+                  {t("What result did you expect?", "你預期會有什麼結果？")}
+                </li>
+              </ul>
+            </div>
+
+            {issueReportSuccess ? (
+              <>
+                <div
+                  className="success-text issue-report-success"
+                  role="status"
+                >
+                  {issueReportSuccess}
+                </div>
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={closeIssueReport}
+                  >
+                    {t("Close", "關閉")}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitIssueReport();
+                }}
+              >
+                <label className="full-width issue-report-field">
+                  {t("Contact email", "聯絡電郵")}
+                  <input
+                    type="email"
+                    value={issueContactEmail}
+                    maxLength={254}
+                    autoComplete="email"
+                    disabled={isIssueReportSubmitting}
+                    onChange={(event) =>
+                      setIssueContactEmail(event.target.value)
+                    }
+                  />
+                </label>
+
+                <label className="full-width issue-report-field">
+                  {t("Issue details", "問題詳情")}
+                  <textarea
+                    value={issueDescription}
+                    maxLength={5000}
+                    disabled={isIssueReportSubmitting}
+                    placeholder={t(
+                      "Tell us what happened, how to reproduce it, and what you expected.",
+                      "請說明發生了什麼、如何重現，以及你預期的結果。",
+                    )}
+                    onChange={(event) =>
+                      setIssueDescription(event.target.value)
+                    }
+                  />
+                </label>
+
+                <div className="issue-report-field">
+                  <span className="issue-report-label">
+                    {t("Images (optional)", "圖片（可選）")}
+                  </span>
+                  <Dropzone
+                    accept={ISSUE_REPORT_ACCEPTED_IMAGES}
+                    maxFiles={ISSUE_REPORT_MAX_IMAGES}
+                    maxSize={ISSUE_REPORT_MAX_IMAGE_BYTES}
+                    multiple
+                    disabled={
+                      isIssueReportSubmitting ||
+                      issueImages.length >= ISSUE_REPORT_MAX_IMAGES
+                    }
+                    showFilesList={false}
+                    showErrorMessage={false}
+                    containerClassName="issue-dropzone-container"
+                    dropZoneClassName="issue-dropzone"
+                    onDrop={(acceptedFiles, fileRejections) =>
+                      addIssueImages(acceptedFiles, fileRejections.length)
+                    }
+                  >
+                    {(dropzone) => (
+                      <div className="issue-dropzone-content">
+                        <strong>
+                          {dropzone.isDragAccept
+                            ? t("Drop images here", "將圖片放到這裡")
+                            : t(
+                                "Drag images here or click to browse",
+                                "拖放圖片到這裡，或按一下選擇檔案",
+                              )}
+                        </strong>
+                        <span>
+                          {t(
+                            `JPEG, PNG or WebP · up to ${ISSUE_REPORT_MAX_IMAGES} images · 5 MiB each`,
+                            `JPEG、PNG 或 WebP · 最多 ${ISSUE_REPORT_MAX_IMAGES} 張 · 每張 5 MiB`,
+                          )}
+                        </span>
+                      </div>
+                    )}
+                  </Dropzone>
+                </div>
+
+                {issueImages.length > 0 && (
+                  <div className="issue-image-grid">
+                    {issueImages.map((image) => (
+                      <div className="issue-image-card" key={image.id}>
+                        <img src={image.previewUrl} alt={image.file.name} />
+                        <div className="issue-image-meta">
+                          <span title={image.file.name}>{image.file.name}</span>
+                          <small>
+                            {(image.file.size / (1024 * 1024)).toFixed(2)} MiB
+                          </small>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label={t(
+                            `Remove ${image.file.name}`,
+                            `移除 ${image.file.name}`,
+                          )}
+                          disabled={isIssueReportSubmitting}
+                          onClick={() => removeIssueImage(image.id)}
+                        >
+                          {t("Remove", "移除")}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <label className="issue-testing-consent">
+                  <input
+                    type="checkbox"
+                    checked={issueTestingConsent}
+                    disabled={isIssueReportSubmitting}
+                    onChange={(event) =>
+                      setIssueTestingConsent(event.target.checked)
+                    }
+                  />
+                  <span>
+                    {t(
+                      "I agree that the submitted description, images, and relevant account identifier may be used to reproduce and test this issue.",
+                      "我同意所提交的描述、圖片及相關帳戶資料將會用於重現及測試此問題。",
+                    )}
+                  </span>
+                </label>
+
+                {issueReportError && (
+                  <div className="error-text" role="alert">
+                    {issueReportError}
+                  </div>
+                )}
+
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    disabled={isIssueReportSubmitting}
+                    onClick={closeIssueReport}
+                  >
+                    {t("Cancel", "取消")}
+                  </button>
+                  <button
+                    type="submit"
+                    className="primary-btn"
+                    disabled={isIssueReportSubmitting}
+                  >
+                    {isIssueReportSubmitting
+                      ? t("Submitting...", "正在送出...")
+                      : t("Submit report", "送出回報")}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
       )}
 
       {isImportReviewOpen && (

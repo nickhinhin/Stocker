@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   --bg: #f4f6f8;
   --surface: #ffffff;
@@ -24,7 +28,11 @@ body,
 body {
   background:
     radial-gradient(circle at 8% 0%, rgba(30, 112, 173, 0.16), transparent 32%),
-    radial-gradient(circle at 90% 6%, rgba(31, 143, 107, 0.15), transparent 34%),
+    radial-gradient(
+      circle at 90% 6%,
+      rgba(31, 143, 107, 0.15),
+      transparent 34%
+    ),
     linear-gradient(180deg, #f8fafc 0%, var(--bg) 28%);
   color: var(--text);
   font-family: "Manrope", "SF Pro Display", "Segoe UI", sans-serif;
@@ -35,6 +43,8 @@ body {
   margin: 0 auto;
   min-height: 100vh;
   padding: 18px 20px 26px;
+  display: flex;
+  flex-direction: column;
 }
 
 .auth-screen {
@@ -199,7 +209,10 @@ body {
   align-items: center;
   justify-content: center;
   box-shadow: 0 1px 0 rgba(148, 163, 184, 0.15);
-  transition: background-color 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+  transition:
+    background-color 0.18s ease,
+    border-color 0.18s ease,
+    transform 0.18s ease;
 }
 
 .header-tool-btn:hover {
@@ -300,7 +313,9 @@ body {
   border-radius: 14px;
   padding: 18px;
   cursor: pointer;
-  transition: transform 0.2s ease, border-color 0.2s ease;
+  transition:
+    transform 0.2s ease,
+    border-color 0.2s ease;
 }
 
 .entry-card:hover {
@@ -329,7 +344,10 @@ body {
   background: var(--surface);
   display: block;
   cursor: pointer;
-  transition: border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
+  transition:
+    border-color 0.18s ease,
+    background-color 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
 .upload-box input {
@@ -918,7 +936,10 @@ body {
 
 .pie-legend-head {
   display: grid;
-  grid-template-columns: 10px minmax(56px, 1fr) minmax(0, 130px) minmax(58px, 74px);
+  grid-template-columns: 10px minmax(56px, 1fr) minmax(0, 130px) minmax(
+      58px,
+      74px
+    );
   gap: 10px;
   align-items: center;
   padding: 0 6px 5px;
@@ -940,7 +961,10 @@ body {
 
 .pie-legend-row {
   display: grid;
-  grid-template-columns: 10px minmax(56px, 1fr) minmax(0, 130px) minmax(58px, 74px);
+  grid-template-columns: 10px minmax(56px, 1fr) minmax(0, 130px) minmax(
+      58px,
+      74px
+    );
   gap: 10px;
   align-items: center;
   font-size: 12px;
@@ -1321,6 +1345,195 @@ body {
 
 .modal-card h3 {
   margin: 0 0 12px;
+}
+
+.app-footer {
+  margin-top: auto;
+  padding: 24px 0 2px;
+  text-align: center;
+}
+
+.footer-link {
+  border: 0;
+  background: transparent;
+  color: #526274;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.footer-link:hover {
+  color: #1f6f8f;
+}
+
+.issue-report-modal {
+  width: min(720px, 100%);
+  max-height: min(92vh, 900px);
+  overflow-y: auto;
+}
+
+.issue-report-intro {
+  border: 1px solid #dfe8f1;
+  border-radius: 10px;
+  background: #f7fafc;
+  color: #526274;
+  padding: 11px 13px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.issue-report-intro p {
+  margin: 0;
+}
+
+.issue-report-intro ul {
+  margin: 7px 0 0;
+  padding-left: 20px;
+}
+
+.issue-report-field {
+  margin-top: 12px;
+}
+
+.issue-report-label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.issue-report-field textarea {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  border: 1px solid #d8dfe7;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #233041;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.issue-dropzone-container {
+  width: 100%;
+}
+
+.issue-dropzone {
+  min-height: 116px;
+  height: auto;
+  border-color: #b8c7d6;
+  background: #fbfcfe;
+  color: #35465a;
+  padding: 18px;
+}
+
+.issue-dropzone:hover {
+  border-color: #5f8da8;
+  background: #f1f7fa;
+}
+
+.issue-dropzone-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  text-align: center;
+}
+
+.issue-dropzone-content strong {
+  font-size: 14px;
+}
+
+.issue-dropzone-content span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.issue-image-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.issue-image-card {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  border: 1px solid #e0e6ed;
+  border-radius: 9px;
+  background: #fff;
+  padding: 7px;
+}
+
+.issue-image-card img {
+  width: 54px;
+  height: 44px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.issue-image-meta {
+  min-width: 0;
+}
+
+.issue-image-meta span,
+.issue-image-meta small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-image-meta span {
+  color: #2c3a4b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.issue-image-meta small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.issue-image-card button {
+  border: 0;
+  background: transparent;
+  color: #b83232;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px;
+}
+
+.issue-testing-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 13px;
+  color: #465568;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.issue-testing-consent input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+.issue-report-success {
+  border: 1px solid #b9dfd3;
+  border-radius: 9px;
+  background: #f0faf7;
+  padding: 12px;
 }
 
 .import-review-modal {
@@ -1802,6 +2015,14 @@ body {
 }
 
 @media (max-width: 640px) {
+  .issue-image-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .issue-report-modal {
+    max-height: 94vh;
+  }
+
   .cash-review-grid {
     grid-template-columns: 1fr;
   }
